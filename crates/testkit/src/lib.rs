@@ -308,6 +308,7 @@ pub struct FakeI2pStreamProvider {
     requested: Mutex<Vec<I2pEndpoint>>,
     outcomes: Mutex<VecDeque<Result<FaultScript, ProviderError>>>,
     peers: Mutex<VecDeque<ScriptedStream>>,
+    controllers: Mutex<VecDeque<FaultController>>,
     peer_ready: Notify,
 }
 impl FakeI2pStreamProvider {
@@ -343,6 +344,21 @@ impl FakeI2pStreamProvider {
                 .pop_front()
             {
                 return peer;
+            }
+            self.peer_ready.notified().await;
+        }
+    }
+    /// Fault controller for the connection handed out by the matching
+    /// [`Self::take_peer`], used to inspect captured writes.
+    pub async fn take_controller(&self) -> FaultController {
+        loop {
+            if let Some(controller) = self
+                .controllers
+                .lock()
+                .expect("provider lock poisoned")
+                .pop_front()
+            {
+                return controller;
             }
             self.peer_ready.notified().await;
         }
@@ -403,13 +419,18 @@ impl I2pStreamProvider for FakeI2pStreamProvider {
             .expect("provider lock poisoned")
             .pop_front()
             .unwrap_or(Err(ProviderError::Unavailable))?;
-        let (client, peer, _) = ScriptedStream::pair(script);
+        let (client, peer, controller) = ScriptedStream::pair(script);
         {
             let mut peers = self.peers.lock().expect("provider lock poisoned");
             if peers.len() >= MAX_PROVIDER_QUEUE {
                 return Err(ProviderError::Failed);
             }
             peers.push_back(peer);
+            let mut controllers = self.controllers.lock().expect("provider lock poisoned");
+            if controllers.len() >= MAX_PROVIDER_QUEUE {
+                return Err(ProviderError::Failed);
+            }
+            controllers.push_back(controller);
         }
         self.peer_ready.notify_one();
         Ok(Box::new(client))

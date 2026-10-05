@@ -1,11 +1,31 @@
-//! Single-network registration owner. Network I/O is injected through the I2P provider.
-use i2pr_irc_core::{
-    Casemapping, ConnectionGeneration, I2pEndpoint, I2pStreamProvider, LocalAcceptor, ProviderError,
+//! Persistent single-network upstream owner with zero-or-one attached local client.
+//!
+//! `NetworkSupervisor` owns upstream registration, liveness, and observed IRC state
+//! across connection generations. `LocalAcceptor` supplies at most one disposable
+//! downstream view at a time; client attachment is never a precondition for the
+//! upstream session and client detach never ends the upstream generation.
+pub mod downstream;
+pub mod state;
+
+use crate::downstream::{
+    DownstreamContext, DownstreamDisposition, DownstreamSession, SessionWriter,
 };
-use i2pr_irc_wire::{LineDecoder, Message};
+use crate::state::{LineOutcome, NetworkState};
+use i2pr_irc_core::{
+    ByteStream, ClientId, ConnectionGeneration, I2pEndpoint, I2pStreamProvider, LocalAcceptor,
+    ProviderError,
+};
+use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fmt,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use thiserror::Error;
@@ -14,23 +34,27 @@ use tokio::{
     sync::mpsc,
     sync::watch,
     task::JoinSet,
-    time::{Instant, timeout},
+    time::{Instant, MissedTickBehavior, timeout},
 };
 use zeroize::{Zeroize, Zeroizing};
+
+pub use crate::state::{
+    MAX_CHANNEL_NAME_BYTES, MAX_CHANNELS, MAX_ISUPPORT_TOKENS, MAX_MEMBERS_PER_CHANNEL,
+    MAX_TOTAL_MEMBERS,
+};
 
 pub const NORMAL_QUEUE_CAPACITY: usize = 64;
 pub const CONTROL_QUEUE_CAPACITY: usize = 8;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(180);
 pub const CAP_SASL_TIMEOUT: Duration = Duration::from_secs(90);
-pub const MAX_CHANNELS: usize = 128;
-pub const MAX_MEMBERS_PER_CHANNEL: usize = 2048;
-pub const MAX_TOTAL_MEMBERS: usize = 8192;
-pub const MAX_ISUPPORT_TOKENS: usize = 128;
-pub const MAX_CHANNEL_NAME_BYTES: usize = 200;
 pub const MAX_CREDENTIAL_BYTES: usize = 1024;
-pub const MAX_DOWNSTREAM_LINE: usize = 8703;
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(60);
+pub const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+/// Delay before retrying a failed local attach. A local accept failure never
+/// affects the upstream generation, so it must not spin.
+pub const LOCAL_ATTACH_RETRY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -90,6 +114,8 @@ pub struct UpstreamConfig {
     pub desired_channels: Vec<String>,
 }
 impl UpstreamConfig {
+    /// Conservative pre-connection validation. Live channel-type interpretation
+    /// uses the server-advertised `CHANTYPES` set instead.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         let token = |value: &str, max: usize| {
             !value.is_empty()
@@ -111,7 +137,7 @@ impl UpstreamConfig {
         for channel in &self.desired_channels {
             if channel.len() > MAX_CHANNEL_NAME_BYTES
                 || channel.len() < 2
-                || !matches!(channel.as_bytes()[0], b'#' | b'&')
+                || !state::ChanTypes::default().is_channel(channel)
                 || channel.bytes().any(|b| {
                     b.is_ascii_whitespace() || matches!(b, b',' | b':' | 0 | b'\r' | b'\n')
                 })
@@ -131,6 +157,9 @@ impl UpstreamConfig {
         Ok(())
     }
 }
+
+/// Diagnostic projection of the network owner. It never carries message payloads,
+/// endpoints, or credentials.
 #[derive(Clone, Debug, Default)]
 pub struct NetworkSnapshot {
     pub phase: Option<Phase>,
@@ -144,9 +173,24 @@ pub struct NetworkSnapshot {
     pub downstream_normal_queue_depth: usize,
     pub downstream_control_queue_depth: usize,
     pub downstream_attached: bool,
+    /// Cumulative attached clients observed by this supervisor.
+    pub downstream_session_total: u64,
+    /// Cumulative finished downstream sessions, including every detach reason.
+    pub downstream_detach_total: u64,
+    /// Disposition class of the most recent downstream session end.
+    pub downstream_last_disposition: Option<&'static str>,
     pub upstream_events_seen: u64,
     pub last_error: Option<&'static str>,
 }
+
+type AcceptFuture<'a, A> = Pin<
+    Box<
+        dyn Future<Output = Result<(ClientId, <A as LocalAcceptor>::Stream), ProviderError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 pub struct NetworkSupervisor<P> {
     provider: P,
     config: UpstreamConfig,
@@ -175,11 +219,17 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
             }
         });
     }
+    fn publish_state(&self, state: &NetworkState) {
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.nick = Some(state.nick.clone());
+            snapshot.channels = state.joined_channels();
+        });
+    }
 
-    /// Own one local session and one upstream generation until stop. Each failed
+    /// Owns one upstream Network across client attachment changes. Each failed
     /// generation is discarded before bounded reconnect backoff; user traffic is
-    /// never retained for replay. The actor itself owns all stream halves.
-    pub async fn serve<A: LocalAcceptor>(
+    /// never retained for replay. Local client detach never ends a generation.
+    pub async fn serve<A: LocalAcceptor + 'static>(
         &self,
         acceptor: &A,
         mut stop: watch::Receiver<bool>,
@@ -212,62 +262,75 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
             let result = match connection {
                 Ok(upstream) => {
                     self.set_phase(Phase::Registering, Some(ConnectionGeneration(generation)));
-                    let (_client_id, client) = tokio::select! {
-                        _ = stopped(&mut stop) => { self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation))); return Ok(()) },
-                        result = acceptor.accept() => result?,
-                    };
                     let online_started = Instant::now();
                     let result = self
                         .run_generation(
                             upstream,
-                            client,
                             ConnectionGeneration(generation),
+                            acceptor,
                             &mut stop,
                         )
                         .await;
                     if online_started.elapsed() >= Duration::from_secs(300) {
                         backoff.stable_online();
                     }
-                    if result.is_ok() {
-                        self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation)));
-                        return Ok(());
+                    match result {
+                        Ok(()) | Err(RuntimeError::Stopped) => {
+                            self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation)));
+                            return Ok(());
+                        }
+                        Err(RuntimeError::Registration) => {
+                            self.snapshot.send_modify(|state| {
+                                state.phase = Some(Phase::Stopped);
+                                state.downstream_attached = false;
+                                state.last_error = Some("registration rejected");
+                            });
+                            return Err(RuntimeError::Registration);
+                        }
+                        Err(error) => Err(error),
                     }
-                    result
                 }
-                Err(e) => Err(e),
+                Err(error) => Err(error),
             };
-            if matches!(result, Err(RuntimeError::Registration)) {
-                self.snapshot.send_modify(|state| {
-                    state.phase = Some(Phase::Stopped);
-                    state.downstream_attached = false;
-                    state.last_error = Some("registration rejected");
-                });
-                return Err(RuntimeError::Registration);
-            }
             let delay = backoff.next_delay(generation.wrapping_mul(0x9e3779b97f4a7c15));
             self.snapshot.send_modify(|state| {
                 state.phase = Some(Phase::Backoff);
                 state.downstream_attached = false;
                 state.reconnect_attempt = backoff.attempt;
                 state.current_backoff_ms = Some(delay.as_millis().min(u64::MAX as u128) as u64);
-                state.last_error = result.as_ref().err().map(error_class);
+                state.last_error = Some(error_class(&result));
             });
             tokio::select! { _ = stopped(&mut stop) => { self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation))); return Ok(()) }, _ = tokio::time::sleep(delay) => {} }
         }
     }
 
-    async fn run_generation<
-        S: i2pr_irc_core::ByteStream + 'static,
-        D: i2pr_irc_core::ByteStream + 'static,
-    >(
+    /// Runs one upstream generation. Registration, liveness, observed state, and
+    /// the single upstream writer task are owned here for the whole generation.
+    /// The downstream attachment owner is zero-or-one and is data, not control.
+    async fn run_generation<'a, S, A>(
         &self,
         upstream: S,
-        downstream: D,
-        _generation: ConnectionGeneration,
+        generation: ConnectionGeneration,
+        acceptor: &'a A,
         stop: &mut watch::Receiver<bool>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), RuntimeError>
+    where
+        S: ByteStream + 'static,
+        A: LocalAcceptor + 'a,
+        A::Stream: 'static,
+    {
         let (mut ur, mut uw) = tokio::io::split(upstream);
-        let (mut dr, dw) = tokio::io::split(downstream);
+        let mut state = NetworkState::new(&self.config.nick, &self.config.desired_channels);
+        // One decoder spans registration and the online phase so a line that
+        // arrives in the same read as `001` is not lost.
+        let mut udec = LineDecoder::default();
+        let mut ubuf = [0u8; 2048];
+        let mut welcomed = false;
+        let mut cap_finished = false;
+        let mut offered = BTreeSet::new();
+        let mut sasl_plain_offered = false;
+        let mut requested = false;
+        let mut sasl_active = false;
         let registration = async {
             send(&mut uw, "CAP LS 302\r\n").await?;
             send(
@@ -278,19 +341,11 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
                 ),
             )
             .await?;
-            let mut decoder = LineDecoder::default();
-            let mut buf = [0u8; 2048];
-            let mut welcomed = false;
-            let mut cap_finished = false;
-            let mut offered = BTreeSet::new();
-            let mut sasl_plain_offered = false;
-            let mut requested = false;
-            let mut sasl_active = false;
             while !(welcomed && cap_finished) {
                 let n = if cap_finished {
-                    ur.read(&mut buf).await?
+                    ur.read(&mut ubuf).await?
                 } else {
-                    tokio::time::timeout(CAP_SASL_TIMEOUT, ur.read(&mut buf))
+                    timeout(CAP_SASL_TIMEOUT, ur.read(&mut ubuf))
                         .await
                         .map_err(|_| RuntimeError::Timeout)?
                         .map_err(RuntimeError::Io)?
@@ -298,16 +353,19 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
                 if n == 0 {
                     return Err(RuntimeError::Protocol);
                 }
-                for line in decoder.push(&buf[..n]) {
-                    let msg = Message::parse(&line.map_err(|_| RuntimeError::Protocol)?)
+                for line in udec.push(&ubuf[..n]) {
+                    let bytes = line.map_err(|_| RuntimeError::Protocol)?;
+                    let message = Message::parse(&bytes).map_err(|_| RuntimeError::Protocol)?;
+                    message
+                        .validate_tag_budget(TagDirection::ServerOutput)
                         .map_err(|_| RuntimeError::Protocol)?;
-                    let cmd = String::from_utf8_lossy(&msg.command).to_ascii_uppercase();
-                    let params: Vec<String> = msg
+                    let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
+                    let params: Vec<String> = message
                         .params
                         .iter()
                         .map(|p| String::from_utf8_lossy(p).into_owned())
                         .collect();
-                    match cmd.as_str() {
+                    match command.as_str() {
                         "CAP" if params.iter().any(|p| p == "LS") => {
                             let capabilities = params.last().map(String::as_str).unwrap_or("");
                             offered.extend(capabilities.split_whitespace().map(|item| {
@@ -402,261 +460,346 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
                         "904" | "905" | "906" | "907" if sasl_active => {
                             return Err(RuntimeError::Registration);
                         }
-                        "PING" => {
-                            if let Some(token) = params.last() {
-                                send(&mut uw, &format!("PONG :{}\r\n", token)).await?;
-                            }
-                        }
                         "001" => welcomed = true,
                         "ERROR" | "464" | "465" | "451" => return Err(RuntimeError::Registration),
-                        _ => {}
+                        _ => match state.apply_line(&message) {
+                            LineOutcome::Quiet => {}
+                            LineOutcome::ReplyPong(token) => {
+                                send(&mut uw, &format!("PONG :{token}\r\n")).await?;
+                            }
+                            LineOutcome::Malformed => return Err(RuntimeError::Protocol),
+                        },
                     }
                 }
             }
+            // Desired state is re-sent only after a fresh registration, never
+            // carried across a generation boundary.
             for channel in self.config.desired_channels.iter().take(MAX_CHANNELS) {
-                send(&mut uw, &format!("JOIN {}\r\n", channel)).await?;
+                send(&mut uw, &format!("JOIN {channel}\r\n")).await?;
             }
+            state.mark_desired_joined();
             Ok::<(), RuntimeError>(())
         };
-        tokio::select! { _ = stopped(stop) => return Err(RuntimeError::Stopped), r = timeout(REGISTRATION_TIMEOUT, registration) => r.unwrap_or(Err(RuntimeError::Timeout)) }?;
-        self.snapshot.send_modify(|state| {
-            state.phase = Some(Phase::Online);
-            state.generation = Some(_generation);
-            state.nick = Some(self.config.nick.clone());
-            state.channels = self
-                .config
-                .desired_channels
-                .iter()
-                .take(MAX_CHANNELS)
-                .cloned()
-                .collect();
-            state.last_error = None;
-            state.current_backoff_ms = None;
-            state.downstream_attached = true;
+        tokio::select! {
+            _ = stopped(stop) => return Err(RuntimeError::Stopped),
+            result = timeout(REGISTRATION_TIMEOUT, registration) => result.unwrap_or(Err(RuntimeError::Timeout))?,
+        };
+        // The generation is online on its own: no local client is required.
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.phase = Some(Phase::Online);
+            snapshot.generation = Some(generation);
+            snapshot.downstream_attached = false;
+            snapshot.last_error = None;
+            snapshot.current_backoff_ms = None;
         });
-        let mut ubuf = [0u8; 2048];
-        let mut dbuf = [0u8; 2048];
-        let mut udec = LineDecoder::default();
-        let mut ddec = LineDecoder::default();
-        let mut nick = self.config.nick.clone();
-        let mut joined: BTreeSet<String> = BTreeSet::new();
-        let mut members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut topics: BTreeMap<String, String> = BTreeMap::new();
-        let mut channel_modes: BTreeMap<String, BTreeSet<char>> = BTreeMap::new();
-        let mut isupport: BTreeSet<String> = BTreeSet::new();
-        let mut casemapping = Casemapping::Rfc1459;
-        let mut client_ready = false;
-        let mut client_nick: Option<String> = None;
-        let mut client_user = false;
-        let mut probe = tokio::time::interval(Duration::from_secs(60));
-        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut awaiting_pong: Option<(Instant, String)> = None;
+        self.publish_state(&state);
+
         let (control_tx, mut control_rx) = mpsc::channel::<Vec<u8>>(CONTROL_QUEUE_CAPACITY);
         let (normal_tx, mut normal_rx) = mpsc::channel::<OutboundIntent>(NORMAL_QUEUE_CAPACITY);
-        let mut writer_tasks = JoinSet::new();
-        writer_tasks.spawn(async move {
-            loop {
-                let next = next_intent_frame(&mut control_rx, &mut normal_rx).await;
-                match next {
-                    Some(Err(bytes)) => write_frame(&mut uw, &bytes).await?,
-                    Some(Ok(intent)) if intent.generation == _generation => {
-                        write_frame(&mut uw, &intent.wire).await?
-                    }
-                    Some(Ok(_)) => continue,
-                    None => return Ok::<(), std::io::Error>(()),
-                }
-            }
-        });
-        let (client_control_tx, mut client_control_rx) =
-            mpsc::channel::<Vec<u8>>(CONTROL_QUEUE_CAPACITY);
-        let (client_normal_tx, mut client_normal_rx) =
-            mpsc::channel::<Vec<u8>>(NORMAL_QUEUE_CAPACITY);
-        writer_tasks.spawn(async move {
-            let mut dw = dw;
-            loop {
-                let next = next_queued_frame(&mut client_control_rx, &mut client_normal_rx).await;
-                match next {
-                    Some(bytes) => write_frame(&mut dw, &bytes).await?,
-                    None => return Ok::<(), std::io::Error>(()),
-                }
-            }
-        });
-        loop {
-            tokio::select! {
-                _ = stopped(stop) => {
-                    self.set_phase(Phase::Stopping, Some(_generation));
-                    let _ = control_tx.try_send(b"QUIT :Bouncer shutting down\r\n".to_vec());
-                    drop(control_tx); drop(normal_tx); drop(client_control_tx); drop(client_normal_tx);
-                    while let Some(result) = writer_tasks.join_next().await { result.map_err(|e| RuntimeError::Io(std::io::Error::other(e)))?.map_err(RuntimeError::Io)?; }
-                    return Ok(());
-                }
-                writer = writer_tasks.join_next() => {
-                    match writer { Some(Ok(Ok(()))) => return Err(RuntimeError::Protocol), Some(Ok(Err(e))) => return Err(RuntimeError::Io(e)), Some(Err(e)) => return Err(RuntimeError::Io(std::io::Error::other(e))), None => return Err(RuntimeError::Protocol) }
-                }
-                _ = probe.tick() => {
-                    if awaiting_pong.as_ref().is_some_and(|(since, _)| since.elapsed() >= Duration::from_secs(120)) { return Err(RuntimeError::Timeout); }
-                    if awaiting_pong.is_none() {
-                        let token = format!("bouncer-{}", _generation.0);
-                        queue_control(&control_tx, &format!("PING :{}\r\n", token))?;
-                        awaiting_pong = Some((Instant::now(), token));
+        // After a shutdown fence is raised, no user traffic reaches the stream.
+        let fence = Arc::new(AtomicBool::new(false));
+        let mut upstream_writer = JoinSet::new();
+        {
+            let fence = fence.clone();
+            upstream_writer.spawn(async move {
+                loop {
+                    let next = next_intent_frame(&mut control_rx, &mut normal_rx).await;
+                    match next {
+                        Some(Err(bytes)) => write_frame(&mut uw, &bytes).await?,
+                        Some(Ok(intent))
+                            if intent.generation == generation
+                                && !fence.load(Ordering::Acquire) =>
+                        {
+                            write_frame(&mut uw, &intent.wire).await?
+                        }
+                        Some(Ok(_)) => continue,
+                        None => return Ok::<(), std::io::Error>(()),
                     }
                 }
-                n = ur.read(&mut ubuf) => {
-                    let n = n.map_err(RuntimeError::Io)?; if n == 0 { return Err(RuntimeError::Protocol); }
-                    for line in udec.push(&ubuf[..n]) {
-                        let bytes = line.map_err(|_| RuntimeError::Protocol)?;
-                        let msg = Message::parse(&bytes).map_err(|_| RuntimeError::Protocol)?;
-                        msg.validate_tag_budget(i2pr_irc_wire::TagDirection::ServerOutput).map_err(|_| RuntimeError::Protocol)?;
-                        self.snapshot.send_modify(|state| state.upstream_events_seen = state.upstream_events_seen.saturating_add(1));
-                        let cmd = String::from_utf8_lossy(&msg.command).to_ascii_uppercase();
-                        if cmd == "PONG" && msg.params.last().zip(awaiting_pong.as_ref()).is_some_and(|(p, (_, expected))| p == expected.as_bytes()) { awaiting_pong = None; }
-                        if cmd == "PING" { let p = msg.params.last().ok_or(RuntimeError::Protocol)?; queue_control(&control_tx, &format!("PONG :{}\r\n", String::from_utf8_lossy(p)))?; }
-                        let source_nick = msg.prefix.as_deref().map(|p| p.split(|b| *b == b'!' || *b == b'@').next().unwrap_or(p)).map(String::from_utf8_lossy).map(|v| v.into_owned());
-                        match cmd.as_str() {
-                            "005" => for token in msg.params.iter().skip(1).filter_map(|v| std::str::from_utf8(v).ok()).flat_map(str::split_whitespace) {
-                                    if let Some(value) = token.strip_prefix("CASEMAPPING=") { casemapping = match value { "ascii" => Casemapping::Ascii, "strict-rfc1459" => Casemapping::StrictRfc1459, _ => Casemapping::Rfc1459 }; }
-                                    if token.len() <= 64 && token.bytes().all(|b| b.is_ascii_graphic()) && !matches!(token, "are" | "supported" | "by" | "this" | "server") && isupport.len() < MAX_ISUPPORT_TOKENS { isupport.insert(token.to_owned()); }
-                            },
-                            "JOIN" if !msg.params.is_empty() => {
-                                let channel = String::from_utf8_lossy(&msg.params[0]).into_owned();
-                                if let Some(source) = &source_nick {
-                                    if same_nick(source, &nick, casemapping) && channel.len() <= MAX_CHANNEL_NAME_BYTES && joined.len() < MAX_CHANNELS { joined.insert(channel.clone()); }
-                                    if members.len() < MAX_CHANNELS || members.contains_key(&channel) {
-                                        let total = members.values().map(BTreeSet::len).sum::<usize>();
-                                        let set = members.entry(channel).or_default();
-                                        if set.len() < MAX_MEMBERS_PER_CHANNEL && total < MAX_TOTAL_MEMBERS && !set.iter().any(|m| same_nick(member_nick(m), source, casemapping)) { set.insert(source.clone()); }
-                                    }
-                                }
-                            }
-                            "PART" if !msg.params.is_empty() => {
-                                let channel = String::from_utf8_lossy(&msg.params[0]).into_owned();
-                                if let Some(source) = &source_nick {
-                                    if let Some(set) = members.get_mut(&channel) { remove_member(set, source, casemapping); }
-                                    if same_nick(source, &nick, casemapping) { joined.remove(&channel); }
-                                }
-                            }
-                            "KICK" if msg.params.len() > 1 => {
-                                let channel = String::from_utf8_lossy(&msg.params[0]).into_owned(); let target = String::from_utf8_lossy(&msg.params[1]).into_owned();
-                                if let Some(set) = members.get_mut(&channel) { remove_member(set, &target, casemapping); }
-                                if same_nick(&target, &nick, casemapping) { joined.remove(&channel); }
-                            }
-                            "QUIT" => if let Some(source) = &source_nick { for set in members.values_mut() { remove_member(set, source, casemapping); } },
-                            "NICK" if !msg.params.is_empty() && valid_client_nick(&msg.params[0]) => {
-                                let replacement = String::from_utf8_lossy(&msg.params[0]).into_owned();
-                                if let Some(source) = &source_nick { for set in members.values_mut() { rename_member(set, source, &replacement, casemapping); } if same_nick(source, &nick, casemapping) { nick = replacement; } }
-                            }
-                            "353" if msg.params.len() >= 3 => {
-                                let channel = String::from_utf8_lossy(&msg.params[msg.params.len()-2]).into_owned();
-                                if members.len() < MAX_CHANNELS || members.contains_key(&channel) {
-                                    let names = msg.params.last().map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default();
-                                    let total = members.values().map(BTreeSet::len).sum::<usize>(); let set = members.entry(channel).or_default();
-                                    for name in names.split_whitespace().take(MAX_MEMBERS_PER_CHANNEL.saturating_sub(set.len()).min(MAX_TOTAL_MEMBERS.saturating_sub(total))) { if !set.iter().any(|m| same_nick(member_nick(m), member_nick(name), casemapping)) { set.insert(name.to_owned()); } }
-                                }
-                            }
-                            "332" if msg.params.len() >= 3 => { let channel = String::from_utf8_lossy(&msg.params[1]).into_owned(); if topics.len() < MAX_CHANNELS || topics.contains_key(&channel) { topics.insert(channel, String::from_utf8_lossy(msg.params.last().unwrap()).into_owned()); } }
-                            "TOPIC" if msg.params.len() >= 2 => { let channel = String::from_utf8_lossy(&msg.params[0]).into_owned(); if topics.len() < MAX_CHANNELS || topics.contains_key(&channel) { topics.insert(channel, String::from_utf8_lossy(msg.params.last().unwrap()).into_owned()); } }
-                            "MODE" if msg.params.len() >= 2 => {
-                                let channel = String::from_utf8_lossy(&msg.params[0]).into_owned();
-                                if (channel.starts_with('#') || channel.starts_with('&')) && (channel_modes.len() < MAX_CHANNELS || channel_modes.contains_key(&channel)) {
-                                    let set = channel_modes.entry(channel).or_default(); let mut adding = true;
-                                    for mode in String::from_utf8_lossy(&msg.params[1]).chars() { match mode { '+' => adding = true, '-' => adding = false, 'o' | 'v' | 'h' | 'a' | 'q' => {}, c if c.is_ascii_alphabetic() => if adding { set.insert(c); } else { set.remove(&c); }, _ => {} } }
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.snapshot.send_modify(|state| { state.nick = Some(nick.clone()); state.channels = joined.iter().cloned().collect(); });
-                        if client_ready {
-                            let outgoing = if msg.tags.is_empty() { bytes } else { let mut untagged = msg.clone(); untagged.tags.clear(); untagged.encode().map_err(|_| RuntimeError::Protocol)? };
-                            queue_bytes(&client_normal_tx, outgoing)?;
-                        }
-                    }
-                }
-                n = dr.read(&mut dbuf) => {
-                    let n = n.map_err(RuntimeError::Io)?; if n == 0 { return Ok(()); }
-                    for line in ddec.push(&dbuf[..n]) {
-                        let bytes = line.map_err(|_| RuntimeError::Protocol)?;
-                        let msg = Message::parse(&bytes).map_err(|_| RuntimeError::Protocol)?;
-                        let cmd = String::from_utf8_lossy(&msg.command).to_ascii_uppercase();
-                        if msg.prefix.is_some() || msg.validate_tag_budget(i2pr_irc_wire::TagDirection::ClientInput).is_err() { return Err(RuntimeError::Protocol); }
-                        if !client_ready {
-                            match cmd.as_str() {
-                                "CAP" => {
-                                    let subcommand = msg.params.first().map(|p| String::from_utf8_lossy(p).to_ascii_uppercase()).unwrap_or_default();
-                                    match subcommand.as_str() {
-                                        "LS" => queue_line(&client_normal_tx, &format!(":bouncer CAP {} LS :\r\n", client_nick.as_deref().unwrap_or("*")))?,
-                                        "REQ" => queue_line(&client_normal_tx, &format!(":bouncer CAP {} NAK :Unsupported capabilities\r\n", client_nick.as_deref().unwrap_or("*")))?,
-                                        "END" => {},
-                                        _ => queue_line(&client_normal_tx, ":bouncer 410 * CAP :Invalid CAP subcommand\r\n")?,
-                                    }
-                                }
-                                "NICK" => { if let Some(value) = msg.params.first() { if valid_client_nick(value) && same_nick(&String::from_utf8_lossy(value), &nick, casemapping) { client_nick = Some(String::from_utf8_lossy(value).into_owned()); } else { queue_line(&client_normal_tx, ":bouncer 433 * * :Nickname unavailable on this network\r\n")?; } } }
-                                "USER" => client_user = true,
-                                "PING" => if let Some(token) = msg.params.last() { queue_control(&client_control_tx, &format!(":bouncer PONG bouncer :{}\r\n", String::from_utf8_lossy(token)))?; },
-                                _ => queue_line(&client_normal_tx, ":bouncer 451 * :Register first\r\n")?,
-                            }
-                            if !client_ready && client_user && client_nick.is_some() {
-                                client_ready = true;
-                                let registered_nick = client_nick.as_deref().unwrap_or("*");
-                                queue_line(&client_normal_tx, &format!(":bouncer 001 {} :Welcome\r\n", registered_nick))?;
-                                for token in &isupport { queue_line(&client_normal_tx, &format!(":bouncer 005 {} {} :are supported by this server\r\n", registered_nick, token))?; }
-                                for c in &joined {
-                                    queue_line(&client_normal_tx, &format!(":{} JOIN {}\r\n", nick, c))?;
-                                    if let Some(topic) = topics.get(c) {
-                                        let prefix = format!(":bouncer 332 {} {} :", registered_nick, c);
-                                        let budget = i2pr_irc_wire::MAX_LINE_BYTES.saturating_sub(prefix.len() + 2);
-                                        let mut end = topic.len().min(budget);
-                                        while !topic.is_char_boundary(end) { end -= 1; }
-                                        queue_line(&client_normal_tx, &format!("{}{}\r\n", prefix, &topic[..end]))?;
-                                    }
-                                    if let Some(modes) = channel_modes.get(c) { let modes = modes.iter().collect::<String>(); if !modes.is_empty() { queue_line(&client_normal_tx, &format!(":bouncer 324 {} {} +{}\r\n", registered_nick, c, modes))?; } }
-                                    if let Some(names) = members.get(c) {
-                                        let list = names.iter().cloned().collect::<Vec<_>>().join(" ");
-                                        let prefix = format!(":bouncer 353 {} = {} :", registered_nick, c);
-                                        let budget = i2pr_irc_wire::MAX_LINE_BYTES.saturating_sub(prefix.len() + 2).max(1);
-                                        let mut start = 0;
-                                        while start < list.len() {
-                                            let mut end = (start + budget).min(list.len());
-                                            while !list.is_char_boundary(end) { end -= 1; }
-                                            queue_line(&client_normal_tx, &format!("{}{}\r\n", prefix, &list[start..end]))?;
-                                            start = end;
-                                        }
-                                    }
-                                    queue_line(&client_normal_tx, &format!(":bouncer 366 {} {} :End of NAMES list\r\n", registered_nick, c))?;
-                                }
-                            }
-                            continue;
-                        }
-                        match cmd.as_str() {
-                            "CAP" => {
-                                let subcommand = msg.params.first().map(|p| String::from_utf8_lossy(p).to_ascii_uppercase()).unwrap_or_default();
-                                match subcommand.as_str() {
-                                    "LS" => queue_line(&client_normal_tx, &format!(":bouncer CAP {} LS :\r\n", client_nick.as_deref().unwrap_or("*")))?,
-                                    "REQ" => queue_line(&client_normal_tx, &format!(":bouncer CAP {} NAK :Unsupported capabilities\r\n", client_nick.as_deref().unwrap_or("*")))?,
-                                    "END" => {},
-                                    _ => queue_line(&client_normal_tx, ":bouncer 410 * CAP :Invalid CAP subcommand\r\n")?,
-                                }
-                            }
-                            "PING" => { let p = msg.params.last().ok_or(RuntimeError::Protocol)?; queue_control(&client_control_tx, &format!(":bouncer PONG bouncer :{}\r\n", String::from_utf8_lossy(p)))?; }
-                            "PRIVMSG" | "NOTICE" | "JOIN" | "PART" | "NICK" | "TOPIC" | "MODE" => normal_tx.try_send(OutboundIntent { generation: _generation, class: IntentClass::NonReplayable, wire: msg.encode().map_err(|_| RuntimeError::Protocol)? }).map_err(|_| RuntimeError::QueueOverloaded)?,
-                            "WHOIS" | "WHO" | "NAMES" | "LIST" => normal_tx.try_send(OutboundIntent { generation: _generation, class: IntentClass::GenerationQuery, wire: msg.encode().map_err(|_| RuntimeError::Protocol)? }).map_err(|_| RuntimeError::QueueOverloaded)?,
-                            "QUIT" => return Ok(()),
-                            _ => queue_line(&client_normal_tx, &format!(":bouncer 421 {} * :Unsupported command\r\n", nick))?,
-                        }
-                    }
-                }
-            }
-            self.snapshot.send_modify(|state| {
-                state.upstream_normal_queue_depth = normal_tx.max_capacity() - normal_tx.capacity();
-                state.upstream_control_queue_depth =
-                    control_tx.max_capacity() - control_tx.capacity();
-                state.downstream_normal_queue_depth =
-                    client_normal_tx.max_capacity() - client_normal_tx.capacity();
-                state.downstream_control_queue_depth =
-                    client_control_tx.max_capacity() - client_control_tx.capacity();
             });
         }
+
+        let mut session: Option<DownstreamSession<A::Stream>> = None;
+        let mut session_writer: Option<SessionWriter> = None;
+        let mut accept_fut: Option<AcceptFuture<'_, A>> = None;
+        let mut accept_retry_at: Option<Instant> = None;
+        let mut probe = tokio::time::interval(LIVENESS_INTERVAL);
+        probe.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut awaiting_pong: Option<(Instant, String)> = None;
+        let mut dbuf = [0u8; 2048];
+        let outcome = loop {
+            // A pending retry delay keeps the acceptor unpolled, so a local accept
+            // failure cannot spin the owner.
+            if session.is_none() && accept_fut.is_none() && accept_retry_at.is_none() {
+                accept_fut = Some(Box::pin(acceptor.accept()));
+            }
+            let accept = next_accept::<A>(&mut accept_fut);
+            let retry = async {
+                match accept_retry_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let client_read = read_client(&mut session, &mut dbuf);
+            let client_exit = client_writer_exit(&mut session_writer);
+            tokio::select! {
+                _ = stopped(stop) => break Ok(()),
+                _ = retry => { accept_retry_at = None; }
+                accepted = accept => {
+                    accept_fut = None;
+                    match accepted {
+                        Some(Ok((client, stream))) => {
+                            let (read, write) = tokio::io::split(stream);
+                            let (client_control, client_normal, writer) = downstream::spawn_session_writer(write);
+                            session = Some(DownstreamSession::new(client, read, client_control, client_normal));
+                            session_writer = Some(writer);
+                            self.snapshot.send_modify(|snapshot| {
+                                snapshot.downstream_attached = true;
+                                snapshot.downstream_session_total = snapshot.downstream_session_total.saturating_add(1);
+                                snapshot.downstream_normal_queue_depth = 0;
+                                snapshot.downstream_control_queue_depth = 0;
+                            });
+                        }
+                        // A local accept failure never affects the upstream generation.
+                        Some(Err(_)) => {
+                            accept_retry_at = Some(Instant::now() + LOCAL_ATTACH_RETRY);
+                            self.snapshot.send_modify(|snapshot| snapshot.last_error = Some("accept"));
+                        }
+                        None => {}
+                    }
+                }
+                read = client_read => {
+                    let Some(result) = read else { continue };
+                    match result {
+                        Err(_) => self.detach_session(&mut session, &mut session_writer, DownstreamDisposition::ReadFailure).await,
+                        Ok(0) => self.detach_session(&mut session, &mut session_writer, DownstreamDisposition::Eof).await,
+                        Ok(count) => {
+                            let ingested = session.as_mut().map(|session| session.ingest(&dbuf[..count]));
+                            let lines = match ingested {
+                                Some(Ok(lines)) => lines,
+                                Some(Err(error)) => {
+                                    let disposition = DownstreamDisposition::from_error(&error);
+                                    self.detach_session(&mut session, &mut session_writer, disposition).await;
+                                    continue;
+                                }
+                                None => continue,
+                            };
+                            let context = DownstreamContext {
+                                generation,
+                                state: &state,
+                                upstream_control: &control_tx,
+                                upstream_normal: &normal_tx,
+                            };
+                            let mut disposition = DownstreamDisposition::Attached;
+                            for line in lines {
+                                let outcome = session.as_mut().map(|session| session.handle_line(&line, &context));
+                                match outcome {
+                                    Some(Ok(DownstreamDisposition::Attached)) => {}
+                                    Some(Ok(other)) => { disposition = other; break; }
+                                    Some(Err(error)) => { disposition = DownstreamDisposition::from_error(&error); break; }
+                                    None => break,
+                                }
+                            }
+                            if disposition != DownstreamDisposition::Attached {
+                                self.detach_session(&mut session, &mut session_writer, disposition).await;
+                            }
+                        }
+                    }
+                }
+                exited = client_exit => {
+                    let result = match exited { Some(result) => result, None => continue };
+                    let disposition = match result {
+                        Ok(()) => DownstreamDisposition::WriterFailure,
+                        Err(_) => DownstreamDisposition::WriterFailure,
+                    };
+                    self.detach_session(&mut session, &mut session_writer, disposition).await;
+                }
+                writer = upstream_writer.join_next() => {
+                    match writer {
+                        Some(Ok(Ok(()))) => break Err(RuntimeError::Protocol),
+                        Some(Ok(Err(error))) => break Err(RuntimeError::Io(error)),
+                        Some(Err(error)) => break Err(RuntimeError::Io(io::Error::other(error))),
+                        None => break Err(RuntimeError::Protocol),
+                    }
+                }
+                _ = probe.tick() => {
+                    if awaiting_pong.as_ref().is_some_and(|(since, _)| since.elapsed() >= LIVENESS_DEADLINE) {
+                        break Err(RuntimeError::Timeout);
+                    }
+                    if awaiting_pong.is_none() {
+                        let token = format!("bouncer-{}", generation.0);
+                        match queue_control(&control_tx, &format!("PING :{token}\r\n")) {
+                            Ok(()) => awaiting_pong = Some((Instant::now(), token)),
+                            Err(error) => break Err(error),
+                        }
+                    }
+                }
+                count = ur.read(&mut ubuf) => {
+                    let count = match count { Ok(count) => count, Err(error) => break Err(RuntimeError::Io(error)) };
+                    if count == 0 { break Err(RuntimeError::Protocol); }
+                    let mut failure = None;
+                    for line in udec.push(&ubuf[..count]) {
+                        let raw = match line { Ok(raw) => raw, Err(_) => { failure = Some(RuntimeError::Protocol); break } };
+                        let message = match Message::parse(&raw) { Ok(message) => message, Err(_) => { failure = Some(RuntimeError::Protocol); break } };
+                        if message.validate_tag_budget(TagDirection::ServerOutput).is_err() {
+                            failure = Some(RuntimeError::Protocol);
+                            break;
+                        }
+                        self.snapshot.send_modify(|snapshot| snapshot.upstream_events_seen = snapshot.upstream_events_seen.saturating_add(1));
+                        // Only a PONG that answers an outstanding probe satisfies
+                        // liveness; anything else is a protocol failure.
+                        if message.command.eq_ignore_ascii_case(b"PONG") {
+                            match awaiting_pong.as_ref().map(|(_, token)| token.clone()) {
+                                Some(expected)
+                                    if message
+                                        .params
+                                        .last()
+                                        .is_some_and(|token| *token == expected.as_bytes()) =>
+                                {
+                                    awaiting_pong = None;
+                                }
+                                _ => {
+                                    failure = Some(RuntimeError::Protocol);
+                                    break;
+                                }
+                            }
+                        }
+                        match apply_upstream_line(&mut state, session.as_ref(), &control_tx, raw, &message) {
+                            Ok(Some(disposition)) => {
+                                self.detach_session(&mut session, &mut session_writer, disposition).await;
+                            }
+                            Ok(None) => {}
+                            Err(error) => { failure = Some(error); break; }
+                        }
+                    }
+                    self.publish_state(&state);
+                    if let Some(error) = failure { break Err(error); }
+                }
+            }
+            let (downstream_normal, downstream_control) = session
+                .as_ref()
+                .map_or((0, 0), DownstreamSession::queue_depths);
+            self.snapshot.send_modify(|snapshot| {
+                snapshot.upstream_normal_queue_depth = NORMAL_QUEUE_CAPACITY - normal_tx.capacity();
+                snapshot.upstream_control_queue_depth =
+                    CONTROL_QUEUE_CAPACITY - control_tx.capacity();
+                snapshot.downstream_normal_queue_depth = downstream_normal;
+                snapshot.downstream_control_queue_depth = downstream_control;
+            });
+        };
+
+        // Deterministic teardown: every spawned task is owned here and either
+        // joined after the final upstream QUIT or deliberately aborted.
+        drop(session.take());
+        if let Some(writer) = session_writer.take() {
+            writer.shutdown().await;
+        }
+        match outcome {
+            Ok(()) => {
+                // Explicit stop is the only local action that deliberately sends
+                // upstream QUIT, and it is sent at most once.
+                fence.store(true, Ordering::Release);
+                let _ = control_tx.try_send(b"QUIT :Bouncer shutting down\r\n".to_vec());
+                drop(control_tx);
+                drop(normal_tx);
+                while let Some(result) = upstream_writer.join_next().await {
+                    // Shutdown is best effort; the QUIT is already queued first.
+                    let _ = result;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                drop(control_tx);
+                drop(normal_tx);
+                upstream_writer.abort_all();
+                while upstream_writer.join_next().await.is_some() {}
+                Err(error)
+            }
+        }
+    }
+
+    /// Ends one downstream session without touching the upstream generation.
+    async fn detach_session<D: ByteStream>(
+        &self,
+        session: &mut Option<DownstreamSession<D>>,
+        writer: &mut Option<SessionWriter>,
+        disposition: DownstreamDisposition,
+    ) {
+        let finished = session.take();
+        let owned_writer = writer.take();
+        drop(finished);
+        if let Some(owned_writer) = owned_writer {
+            owned_writer.shutdown().await;
+        }
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.downstream_attached = false;
+            snapshot.downstream_detach_total = snapshot.downstream_detach_total.saturating_add(1);
+            snapshot.downstream_last_disposition = Some(disposition.class());
+            snapshot.downstream_normal_queue_depth = 0;
+            snapshot.downstream_control_queue_depth = 0;
+        });
     }
 }
+
+/// Applies one upstream line to observed state and, when a client is registered,
+/// forwards it. Returns a disposition when only the client must detach.
+fn apply_upstream_line<D: ByteStream>(
+    state: &mut NetworkState,
+    session: Option<&DownstreamSession<D>>,
+    control_tx: &mpsc::Sender<Vec<u8>>,
+    raw: Vec<u8>,
+    message: &Message,
+) -> Result<Option<DownstreamDisposition>, RuntimeError> {
+    match state.apply_line(message) {
+        LineOutcome::Quiet => {}
+        LineOutcome::ReplyPong(token) => {
+            queue_control(control_tx, &format!("PONG :{token}\r\n"))?;
+        }
+        LineOutcome::Malformed => return Err(RuntimeError::Protocol),
+    }
+    let Some(session) = session.filter(|session| session.is_ready()) else {
+        return Ok(None);
+    };
+    // Message-tag semantics are not advertised downstream, so tags are removed.
+    let outgoing = if message.tags.is_empty() {
+        raw
+    } else {
+        let mut untagged = message.clone();
+        untagged.tags.clear();
+        untagged.encode().map_err(|_| RuntimeError::Protocol)?
+    };
+    match session.forward(outgoing) {
+        Ok(()) => Ok(None),
+        Err(error) => Ok(Some(DownstreamDisposition::from_error(&error))),
+    }
+}
+
+async fn next_accept<'a, A: LocalAcceptor>(
+    slot: &mut Option<AcceptFuture<'a, A>>,
+) -> Option<Result<(ClientId, A::Stream), ProviderError>> {
+    match slot {
+        Some(future) => Some(future.as_mut().await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn read_client<D: ByteStream>(
+    session: &mut Option<DownstreamSession<D>>,
+    buf: &mut [u8],
+) -> Option<io::Result<usize>> {
+    match session {
+        Some(session) => Some(session.read(buf).await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn client_writer_exit(session_writer: &mut Option<SessionWriter>) -> Option<io::Result<()>> {
+    match session_writer {
+        Some(writer) => Some(writer.wait().await),
+        None => std::future::pending().await,
+    }
+}
+
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     loop {
         if *stop.borrow() {
@@ -667,46 +810,21 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
         }
     }
 }
-fn error_class(error: &RuntimeError) -> &'static str {
+fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
     match error {
-        RuntimeError::Provider(_) => "provider",
-        RuntimeError::Timeout => "timeout",
-        RuntimeError::Protocol => "protocol",
-        RuntimeError::Registration => "registration",
-        RuntimeError::Io(_) => "io",
-        RuntimeError::Stopped => "stopped",
-        RuntimeError::InvalidConfig => "configuration",
-        RuntimeError::QueueOverloaded => "queue-overload",
-        RuntimeError::GenerationExhausted => "generation-exhausted",
+        Err(RuntimeError::Provider(_)) => "provider",
+        Err(RuntimeError::Timeout) => "timeout",
+        Err(RuntimeError::Protocol) => "protocol",
+        Err(RuntimeError::Registration) => "registration",
+        Err(RuntimeError::Io(_)) => "io",
+        Err(RuntimeError::Stopped) => "stopped",
+        Err(RuntimeError::InvalidConfig) => "configuration",
+        Err(RuntimeError::QueueOverloaded) => "queue-overload",
+        Err(RuntimeError::GenerationExhausted) => "generation-exhausted",
+        Ok(()) => "stopped",
     }
 }
-fn same_nick(left: &str, right: &str, casemapping: Casemapping) -> bool {
-    casemapping.fold(left.as_bytes()) == casemapping.fold(right.as_bytes())
-}
-fn member_nick(member: &str) -> &str {
-    member.trim_start_matches(['~', '&', '@', '%', '+'])
-}
-fn remove_member(members: &mut BTreeSet<String>, nick: &str, casemapping: Casemapping) {
-    if let Some(member) = members
-        .iter()
-        .find(|member| same_nick(member_nick(member), nick, casemapping))
-        .cloned()
-    {
-        members.remove(&member);
-    }
-}
-fn rename_member(members: &mut BTreeSet<String>, old: &str, new: &str, casemapping: Casemapping) {
-    if let Some(member) = members
-        .iter()
-        .find(|member| same_nick(member_nick(member), old, casemapping))
-        .cloned()
-    {
-        let prefix = &member[..member.len() - member_nick(&member).len()];
-        members.remove(&member);
-        members.insert(format!("{prefix}{new}"));
-    }
-}
-fn valid_client_nick(bytes: &[u8]) -> bool {
+pub(crate) fn valid_client_nick(bytes: &[u8]) -> bool {
     let special = |b: u8| {
         matches!(
             b,
@@ -728,20 +846,7 @@ fn queue_control(sender: &mpsc::Sender<Vec<u8>>, line: &str) -> Result<(), Runti
         .try_send(line.as_bytes().to_vec())
         .map_err(|_| RuntimeError::QueueOverloaded)
 }
-fn queue_line(sender: &mpsc::Sender<Vec<u8>>, line: &str) -> Result<(), RuntimeError> {
-    if line.len() > i2pr_irc_wire::MAX_LINE_BYTES || !line.ends_with("\r\n") {
-        return Err(RuntimeError::Protocol);
-    }
-    sender
-        .try_send(line.as_bytes().to_vec())
-        .map_err(|_| RuntimeError::QueueOverloaded)
-}
-fn queue_bytes(sender: &mpsc::Sender<Vec<u8>>, bytes: Vec<u8>) -> Result<(), RuntimeError> {
-    sender
-        .try_send(bytes)
-        .map_err(|_| RuntimeError::QueueOverloaded)
-}
-async fn next_queued_frame(
+pub(crate) async fn next_queued_frame(
     control: &mut mpsc::Receiver<Vec<u8>>,
     normal: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Option<Vec<u8>> {
@@ -753,31 +858,21 @@ async fn next_intent_frame(
 ) -> Option<Result<OutboundIntent, Vec<u8>>> {
     tokio::select! { biased; command = control.recv() => command.map(Err), command = normal.recv() => command.map(Ok) }
 }
-async fn send<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<(), std::io::Error> {
-    tokio::time::timeout(STREAM_WRITE_TIMEOUT, async {
-        w.write_all(s.as_bytes()).await?;
-        w.flush().await
-    })
-    .await
-    .unwrap_or_else(|_| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "bounded stream write timed out",
-        ))
-    })
+async fn send<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<(), io::Error> {
+    write_frame(w, s.as_bytes()).await
 }
-async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     bytes: &[u8],
-) -> Result<(), std::io::Error> {
-    tokio::time::timeout(STREAM_WRITE_TIMEOUT, async {
+) -> Result<(), io::Error> {
+    timeout(STREAM_WRITE_TIMEOUT, async {
         w.write_all(bytes).await?;
         w.flush().await
     })
     .await
     .unwrap_or_else(|_| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
             "bounded stream write timed out",
         ))
     })
@@ -826,13 +921,13 @@ impl Backoff {
         self.attempt = 0
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use i2pr_irc_core::{ClientId, I2pEndpoint};
-    use i2pr_irc_testkit::{FakeI2pStreamProvider, FakeLocalAcceptor, FaultScript};
+    use i2pr_irc_testkit::{FakeI2pStreamProvider, FakeLocalAcceptor, FaultScript, ScriptedStream};
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     struct SharedProvider(Arc<FakeI2pStreamProvider>);
     #[async_trait::async_trait]
@@ -846,22 +941,34 @@ mod tests {
     }
     struct SharedAcceptor(Arc<FakeLocalAcceptor>);
     impl LocalAcceptor for SharedAcceptor {
-        type Stream = i2pr_irc_testkit::ScriptedStream;
+        type Stream = ScriptedStream;
         async fn accept(&self) -> Result<(ClientId, Self::Stream), ProviderError> {
             self.0.accept().await
         }
     }
-    async fn read_until(stream: &mut i2pr_irc_testkit::ScriptedStream, needle: &[u8]) -> Vec<u8> {
+
+    fn config(desired: Vec<String>) -> UpstreamConfig {
+        UpstreamConfig {
+            endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
+            nick: "bot".into(),
+            username: "user".into(),
+            realname: "bouncer".into(),
+            sasl: None,
+            desired_channels: desired,
+        }
+    }
+
+    async fn read_until(stream: &mut ScriptedStream, needle: &[u8]) -> Vec<u8> {
         let mut all = Vec::new();
         let mut buf = [0; 256];
         let read = async {
-            while !all.windows(needle.len()).any(|w| w == needle) {
-                let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                all.extend_from_slice(&buf[..n]);
+            while !all.windows(needle.len()).any(|window| window == needle) {
+                let count = stream.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                all.extend_from_slice(&buf[..count]);
             }
         };
-        if tokio::time::timeout(Duration::from_secs(3), read)
+        if tokio::time::timeout(Duration::from_secs(5), read)
             .await
             .is_err()
         {
@@ -873,41 +980,116 @@ mod tests {
         }
         all
     }
+
+    /// Drives a supervisor through `001` so it reaches Online on generation one.
+    async fn online_upstream(
+        provider: &Arc<FakeI2pStreamProvider>,
+        supervisor_joined: &tokio::task::JoinHandle<Result<(), RuntimeError>>,
+    ) -> ScriptedStream {
+        let mut upstream = provider.take_peer().await;
+        let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        let _ = supervisor_joined;
+        upstream
+    }
+
+    /// Lets the owner and its writer task run before a bounded reader arms its own
+    /// timeout, so virtual time cannot outrun pending work.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_online(state: &mut watch::Receiver<NetworkSnapshot>) {
+        while state.borrow().phase != Some(Phase::Online) {
+            state.changed().await.unwrap();
+        }
+    }
+
+    /// Waits for one downstream session end observed after `since` detaches.
+    async fn wait_detach(
+        state: &mut watch::Receiver<NetworkSnapshot>,
+        since: u64,
+        class: &str,
+    ) -> NetworkSnapshot {
+        loop {
+            let current = state.borrow().clone();
+            if current.downstream_detach_total > since
+                && current.downstream_last_disposition == Some(class)
+                && current.phase == Some(Phase::Online)
+            {
+                return current;
+            }
+            state.changed().await.unwrap();
+        }
+    }
+
+    /// Waits until `sessions` clients have been attached in this generation.
+    async fn wait_attached(
+        state: &mut watch::Receiver<NetworkSnapshot>,
+        sessions: u64,
+    ) -> NetworkSnapshot {
+        loop {
+            let current = state.borrow().clone();
+            if current.downstream_attached
+                && current.downstream_session_total == sessions
+                && current.phase == Some(Phase::Online)
+            {
+                return current;
+            }
+            state.changed().await.unwrap();
+        }
+    }
+
+    /// Registers one client and returns every byte it received, waiting for the
+    /// last frame of its expected projection.
+    async fn register_client(client: &mut ScriptedStream, last_frame: &[u8]) -> String {
+        client
+            .write_all(b"CAP LS 302\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+            .await
+            .unwrap();
+        let projection = read_until(client, last_frame).await;
+        String::from_utf8_lossy(&projection).into_owned()
+    }
+
+    const WELCOME: &[u8] = b"001 bot :Welcome\r\n";
+    const END_OF_NAMES: &[u8] = b"366 bot #room :End of NAMES list\r\n";
+
     #[test]
     fn secret_debug_is_redacted() {
         assert!(!format!("{:?}", Secret::new("secret".into())).contains("secret"));
     }
+
     #[test]
     fn backoff_is_bounded() {
-        let mut b = Backoff {
+        let mut backoff = Backoff {
             attempt: 0,
             base: Duration::from_secs(1),
             cap: Duration::from_secs(5),
             jitter_percent: 20,
         };
         for _ in 0..20 {
-            assert!(b.next_delay(7) <= b.cap)
+            assert!(backoff.next_delay(7) <= backoff.cap);
         }
     }
+
     #[test]
     fn replay_class_is_explicit() {
-        let i = OutboundIntent {
+        let intent = OutboundIntent {
             generation: ConnectionGeneration(1),
             class: IntentClass::NonReplayable,
             wire: vec![],
         };
-        assert!(!i.survives_disconnect())
+        assert!(!intent.survives_disconnect());
     }
+
     #[test]
     fn network_configuration_rejects_injection_and_unbounded_channels() {
-        let valid = UpstreamConfig {
-            endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-            nick: "bot".into(),
-            username: "user".into(),
-            realname: "bouncer".into(),
-            sasl: None,
-            desired_channels: vec!["#room".into()],
-        };
+        let valid = config(vec!["#room".into()]);
         assert!(valid.validate().is_ok());
         let mut invalid = valid.clone();
         invalid.nick = "bot\r\nPRIVMSG".into();
@@ -915,26 +1097,34 @@ mod tests {
             invalid.validate(),
             Err(RuntimeError::InvalidConfig)
         ));
-        let mut invalid = valid;
+        let mut invalid = valid.clone();
         invalid.desired_channels = vec!["#ok".into(); MAX_CHANNELS + 1];
         assert!(matches!(
             invalid.validate(),
             Err(RuntimeError::InvalidConfig)
         ));
+        let mut invalid = valid;
+        invalid.desired_channels = vec!["notachannel".into()];
+        assert!(matches!(
+            invalid.validate(),
+            Err(RuntimeError::InvalidConfig)
+        ));
     }
+
     #[tokio::test]
     async fn control_queue_is_separate_and_normal_overflow_is_explicit() {
         let (normal, _normal_rx) = mpsc::channel(NORMAL_QUEUE_CAPACITY);
         let (control, _control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         for _ in 0..NORMAL_QUEUE_CAPACITY {
-            queue_line(&normal, "PRIVMSG #c :x\r\n").unwrap();
+            queue_control(&normal, "PRIVMSG #c :x\r\n").unwrap();
         }
         assert!(matches!(
-            queue_line(&normal, "PRIVMSG #c :overflow\r\n"),
+            queue_control(&normal, "PRIVMSG #c :overflow\r\n"),
             Err(RuntimeError::QueueOverloaded)
         ));
         queue_control(&control, "PONG :urgent\r\n").unwrap();
     }
+
     #[tokio::test]
     async fn ready_control_frame_precedes_normal_backlog() {
         let (control_tx, mut control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
@@ -957,6 +1147,570 @@ mod tests {
         );
     }
 
+    /// Core corrective evidence: upstream registration never waits for a client.
+    #[tokio::test]
+    async fn upstream_reaches_online_with_no_local_client() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        // No local client is ever queued for this scenario.
+        let local = Arc::new(FakeLocalAcceptor::default());
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#room".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = provider.take_peer().await;
+        let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        // Registration completes with no local client attached.
+        let registration = read_until(&mut upstream, b"JOIN #room\r\n").await;
+        assert!(String::from_utf8_lossy(&registration).contains("CAP END"));
+        wait_online(&mut state).await;
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
+        assert!(!state.borrow().downstream_attached);
+        assert_eq!(state.borrow().channels, vec!["#room".to_owned()]);
+        // Upstream liveness and state processing continue with zero clients.
+        upstream.write_all(b"PING :alive\r\n").await.unwrap();
+        let pong = read_until(&mut upstream, b"PONG :alive\r\n").await;
+        assert!(String::from_utf8_lossy(&pong).contains("PONG :alive"));
+        upstream
+            .write_all(b":bot!u@h JOIN #room\r\n:srv 332 bot #room :subject\r\n:srv 353 bot = #room :bot @Alice\r\n")
+            .await
+            .unwrap();
+        while state.borrow().upstream_events_seen < 3 {
+            state.changed().await.unwrap();
+        }
+        assert!(!state.borrow().downstream_attached);
+        // A local client attaches later to the same generation.
+        local
+            .queue_outcome(Ok((ClientId(1), FaultScript::default())))
+            .unwrap();
+        let mut client = local.take_peer().await;
+        let projection = register_client(&mut client, END_OF_NAMES).await;
+        assert!(
+            projection.contains("332 bot #room :subject"),
+            "{projection}"
+        );
+        assert!(
+            projection.contains("353 bot = #room :@Alice bot"),
+            "{projection}"
+        );
+        while !state.borrow().downstream_attached {
+            state.changed().await.unwrap();
+        }
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
+        assert_eq!(state.borrow().downstream_session_total, 1);
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn downstream_eof_detaches_only_and_keeps_the_generation() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(10), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        let since = state.borrow().downstream_detach_total;
+        client.shutdown().await.unwrap();
+        let detached = wait_detach(&mut state, since, "downstream-eof").await;
+        assert_eq!(detached.generation, Some(ConnectionGeneration(1)));
+        assert_eq!(detached.downstream_session_total, 1);
+        assert_eq!(detached.downstream_normal_queue_depth, 0);
+        // The same generation still serves upstream traffic.
+        upstream.write_all(b"PING :still-alive\r\n").await.unwrap();
+        let pong = read_until(&mut upstream, b"PONG :still-alive\r\n").await;
+        assert!(String::from_utf8_lossy(&pong).contains("PONG :still-alive"));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn downstream_quit_never_becomes_upstream_quit() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider
+            .queue_outcome(Ok(FaultScript {
+                capture_writes: true,
+                ..FaultScript::default()
+            }))
+            .unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(11), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let controller = provider.take_controller().await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        let since = state.borrow().downstream_detach_total;
+        client.write_all(b"QUIT :bye\r\n").await.unwrap();
+        let detached = wait_detach(&mut state, since, "local-detach").await;
+        assert_eq!(detached.generation, Some(ConnectionGeneration(1)));
+        upstream.write_all(b"PING :alive\r\n").await.unwrap();
+        read_until(&mut upstream, b"PONG :alive\r\n").await;
+        assert!(
+            !String::from_utf8_lossy(&controller.bytes_written(0)).contains("QUIT"),
+            "downstream QUIT must not reach upstream"
+        );
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_client_reattaches_the_same_generation_and_sees_detached_state() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        for client in [ClientId(20), ClientId(21)] {
+            local
+                .queue_outcome(Ok((client, FaultScript::default())))
+                .unwrap();
+        }
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#room".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #room\r\n").await;
+        let mut first = local.take_peer().await;
+        register_client(&mut first, WELCOME).await;
+        // State accumulates while no client is attached.
+        upstream
+            .write_all(b":bot!u@h JOIN #room\r\n:srv 005 bot PREFIX=(ov)@+ CHANMODES=beI,k,l,imnpst\r\n:srv 324 bot #room +kl key 42\r\n:srv 353 bot = #room :bot @Alice\r\n")
+            .await
+            .unwrap();
+        while state.borrow().upstream_events_seen < 4 {
+            state.changed().await.unwrap();
+        }
+        let since = state.borrow().downstream_detach_total;
+        first.shutdown().await.unwrap();
+        wait_detach(&mut state, since, "downstream-eof").await;
+        let mut second = local.take_peer().await;
+        let projection = register_client(&mut second, END_OF_NAMES).await;
+        assert!(projection.contains("005 bot PREFIX=(ov)@+"), "{projection}");
+        assert!(
+            projection.contains("324 bot #room +kl key 42"),
+            "{projection}"
+        );
+        assert!(
+            projection.contains("353 bot = #room :@Alice bot"),
+            "{projection}"
+        );
+        let attached = wait_attached(&mut state, 2).await;
+        assert_eq!(attached.generation, Some(ConnectionGeneration(1)));
+        assert_eq!(attached.downstream_session_total, 2);
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_attach_detach_cycles_stay_bounded() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        for cycle in 0..100 {
+            local
+                .queue_outcome(Ok((ClientId(1_000 + cycle), FaultScript::default())))
+                .unwrap();
+        }
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        for _cycle in 0..100u64 {
+            let since = state.borrow().downstream_detach_total;
+            let mut client = local.take_peer().await;
+            client
+                .write_all(b"NICK bot\r\nUSER bot 0 * :phone\r\n")
+                .await
+                .unwrap();
+            let _ = read_until(&mut client, b"001 bot :Welcome\r\n").await;
+            client.shutdown().await.unwrap();
+            let settled = wait_detach(&mut state, since, "downstream-eof").await;
+            assert_eq!(settled.generation, Some(ConnectionGeneration(1)));
+        }
+        let settled = state.borrow().clone();
+        assert_eq!(settled.generation, Some(ConnectionGeneration(1)));
+        assert_eq!(settled.downstream_session_total, 100);
+        assert_eq!(settled.downstream_detach_total, 100);
+        assert_eq!(settled.upstream_normal_queue_depth, 0);
+        assert_eq!(settled.downstream_normal_queue_depth, 0);
+        assert_eq!(settled.downstream_control_queue_depth, 0);
+        assert_eq!(provider.requested_endpoints().len(), 1);
+        upstream.write_all(b"PING :bounded\r\n").await.unwrap();
+        let pong = read_until(&mut upstream, b"PONG :bounded\r\n").await;
+        assert!(String::from_utf8_lossy(&pong).contains("PONG :bounded"));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn downstream_protocol_violation_detaches_only() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(30), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        // Client-supplied prefixes are rejected before any upstream routing.
+        let since = state.borrow().downstream_detach_total;
+        client.write_all(b":spoof PRIVMSG #a :x\r\n").await.unwrap();
+        let detached = wait_detach(&mut state, since, "downstream-protocol").await;
+        assert_eq!(detached.generation, Some(ConnectionGeneration(1)));
+        upstream.write_all(b"PING :alive\r\n").await.unwrap();
+        read_until(&mut upstream, b"PONG :alive\r\n").await;
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_detached_session_cannot_affect_the_next_client() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        for client in [ClientId(40), ClientId(41)] {
+            local
+                .queue_outcome(Ok((client, FaultScript::default())))
+                .unwrap();
+        }
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let controller = provider.take_controller().await;
+        let mut first = local.take_peer().await;
+        register_client(&mut first, WELCOME).await;
+        first
+            .write_all(b"PRIVMSG #room :first session\r\n")
+            .await
+            .unwrap();
+        let sent = read_until(&mut upstream, b"PRIVMSG #room :first session\r\n").await;
+        assert!(String::from_utf8_lossy(&sent).contains("first session"));
+        let since = state.borrow().downstream_detach_total;
+        first.shutdown().await.unwrap();
+        wait_detach(&mut state, since, "downstream-eof").await;
+        let mut second = local.take_peer().await;
+        let projection = register_client(&mut second, WELCOME).await;
+        assert!(!projection.contains("first session"), "{projection}");
+        assert!(
+            !String::from_utf8_lossy(&controller.bytes_written(0)).contains("QUIT"),
+            "local EOF must not emit upstream QUIT"
+        );
+        let attached = wait_attached(&mut state, 2).await;
+        assert_eq!(attached.generation, Some(ConnectionGeneration(1)));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_failure_while_detached_replaces_the_generation() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#room".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #room\r\n").await;
+        upstream.shutdown().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        let mut replacement = provider.take_peer().await;
+        let _ = read_until(&mut replacement, b"USER user 0 * :bouncer\r\n").await;
+        replacement
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        let replayed = read_until(&mut replacement, b"JOIN #room\r\n").await;
+        assert!(String::from_utf8_lossy(&replayed).contains("JOIN #room"));
+        wait_online(&mut state).await;
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(2)));
+        assert!(!state.borrow().downstream_attached);
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_failure_while_attached_terminates_that_client() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(50), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        upstream.shutdown().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        let mut replacement = provider.take_peer().await;
+        let _ = read_until(&mut replacement, b"USER user 0 * :bouncer\r\n").await;
+        // The attached client was terminated with its generation.
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        drop(client);
+        replacement
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        wait_online(&mut state).await;
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(2)));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_chat_is_not_replayed_into_replacement_generation() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        for client in [ClientId(60), ClientId(61)] {
+            local
+                .queue_outcome(Ok((client, FaultScript::default())))
+                .unwrap();
+        }
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#persistent".into()]),
+        )
+        .unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #persistent\r\n").await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        client
+            .write_all(b"PRIVMSG #room :possibly delivered\r\n")
+            .await
+            .unwrap();
+        let sent = read_until(&mut upstream, b"PRIVMSG #room :possibly delivered\r\n").await;
+        assert!(String::from_utf8_lossy(&sent).contains("possibly delivered"));
+        upstream.shutdown().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        let mut replacement = provider.take_peer().await;
+        let registered = read_until(&mut replacement, b"USER user 0 * :bouncer\r\n").await;
+        assert!(!String::from_utf8_lossy(&registered).contains("possibly delivered"));
+        replacement
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        let rejoin = read_until(&mut replacement, b"JOIN #persistent\r\n").await;
+        assert!(String::from_utf8_lossy(&rejoin).contains("JOIN #persistent"));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_deadline_reconnects_with_no_client_attached() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        settle().await;
+        let first = read_until(&mut upstream, b"PING :bouncer-1\r\n").await;
+        assert!(String::from_utf8_lossy(&first).contains("PING :bouncer-1"));
+        upstream
+            .write_all(b":srv PONG bot :bouncer-1\r\n")
+            .await
+            .unwrap();
+        settle().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        let _ = read_until(&mut upstream, b"PING :bouncer-1\r\n").await;
+        upstream
+            .write_all(b":srv PONG bot :bouncer-1\r\n")
+            .await
+            .unwrap();
+        settle().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        let _ = read_until(&mut upstream, b"PING :bouncer-1\r\n").await;
+        // The unanswered probe reaches its deadline and ends the generation.
+        tokio::time::advance(LIVENESS_DEADLINE + Duration::from_secs(2)).await;
+        settle().await;
+        let mut replacement = provider.take_peer().await;
+        let registered = read_until(&mut replacement, b"USER user 0 * :bouncer\r\n").await;
+        assert!(String::from_utf8_lossy(&registered).contains("CAP LS 302"));
+        while state.borrow().generation != Some(ConnectionGeneration(2)) {
+            state.changed().await.unwrap();
+        }
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_backlog_never_starves_upstream_control_traffic() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider
+            .queue_outcome(Ok(FaultScript {
+                // A small socket buffer stalls the upstream writer so the bounded
+                // normal queue actually fills, without deadlocking the handshake.
+                capacity: 256,
+                ..FaultScript::default()
+            }))
+            .unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(70), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        let since = state.borrow().downstream_detach_total;
+        for index in 0..NORMAL_QUEUE_CAPACITY * 2 {
+            client
+                .write_all(format!("PRIVMSG #room :flood {index}\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        upstream.write_all(b"PING :under-load\r\n").await.unwrap();
+        // The owner keeps serving control traffic while normal traffic is saturated.
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !seen
+            .windows(b"PONG :under-load\r\n".len())
+            .any(|window| window == b"PONG :under-load\r\n")
+        {
+            let mut buf = [0u8; 256];
+            let read = tokio::time::timeout_at(deadline, upstream.read(&mut buf)).await;
+            let Ok(Ok(count)) = read else {
+                break;
+            };
+            assert!(count > 0, "upstream stayed responsive");
+            seen.extend_from_slice(&buf[..count]);
+        }
+        assert!(
+            seen.windows(b"PONG :under-load\r\n".len())
+                .any(|window| window == b"PONG :under-load\r\n"),
+            "server PING must be answered while the normal queue is saturated"
+        );
+        assert_eq!(state.borrow().phase, Some(Phase::Online));
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
+        // The saturated backlog fails the client explicitly, not the generation.
+        wait_detach(&mut state, since, "downstream-overload").await;
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
+        // Drain the bounded upstream backlog so shutdown never waits on a stalled
+        // write; draining ends after a bounded idle window.
+        let idle = Duration::from_millis(200);
+        for _ in 0..512 {
+            let mut buf = [0u8; 256];
+            if !matches!(
+                tokio::time::timeout(idle, upstream.read(&mut buf)).await,
+                Ok(Ok(count)) if count > 0
+            ) {
+                break;
+            }
+        }
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_is_the_only_path_that_sends_upstream_quit() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider
+            .queue_outcome(Ok(FaultScript {
+                capture_writes: true,
+                ..FaultScript::default()
+            }))
+            .unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(80), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let _upstream = online_upstream(&provider, &task).await;
+        let controller = provider.take_controller().await;
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        let written = String::from_utf8_lossy(&controller.bytes_written(0)).into_owned();
+        assert_eq!(written.matches("QUIT").count(), 1, "{written}");
+        // The attached client is terminated by the supervisor stop.
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn single_client_vertical_registers_routes_and_answers_ping() {
         let provider = Arc::new(FakeI2pStreamProvider::default());
@@ -967,14 +1721,7 @@ mod tests {
             .unwrap();
         let supervisor = NetworkSupervisor::new(
             SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec!["#room".into()],
-            },
+            config(vec!["#room".into()]),
         )
         .unwrap();
         let mut state = supervisor.subscribe_snapshot();
@@ -982,7 +1729,6 @@ mod tests {
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
         let mut upstream = provider.take_peer().await;
-        let mut downstream = local.take_peer().await;
         let initial = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         assert!(String::from_utf8_lossy(&initial).contains("CAP LS 302\r\n"));
         upstream
@@ -997,20 +1743,17 @@ mod tests {
             .unwrap();
         let join = read_until(&mut upstream, b"JOIN #room\r\n").await;
         assert!(String::from_utf8_lossy(&join).contains("JOIN #room"));
-        while state.borrow().phase != Some(Phase::Online) {
-            state.changed().await.unwrap();
-        }
-        assert_eq!(state.borrow().phase, Some(Phase::Online));
-        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
         upstream.write_all(b":bot!u@h JOIN #room\r\n:srv 005 bot CASEMAPPING=rfc1459 CHANTYPES=#& :are supported by this server\r\n:srv 332 bot #room :subject\r\n:srv MODE #room +nt\r\n:srv 353 bot = #room :bot @Alice\r\n:srv 366 bot #room :End\r\n").await.unwrap();
         while state.borrow().upstream_events_seen < 6 {
             state.changed().await.unwrap();
         }
-        downstream
+        // The local client is accepted only after the generation is online.
+        let mut client = local.take_peer().await;
+        client
             .write_all(b"CAP LS 302\r\nCAP REQ :message-tags\r\nNICK mobile\r\nNICK bot\r\nUSER bot 0 * :phone\r\nCAP END\r\n")
             .await
             .unwrap();
-        let welcome = read_until(&mut downstream, b"366 bot #room :End of NAMES list\r\n").await;
+        let welcome = read_until(&mut client, b"366 bot #room :End of NAMES list\r\n").await;
         let projection = String::from_utf8_lossy(&welcome);
         assert!(projection.contains("001 bot"));
         assert!(projection.contains("CAP * NAK :Unsupported capabilities"));
@@ -1020,19 +1763,16 @@ mod tests {
         assert!(projection.contains("324 bot #room +nt"));
         assert!(projection.contains("353 bot = #room :@Alice bot"));
         assert!(!projection.contains("421 bot"));
-        downstream.write_all(b"WHOIS Alice\r\n").await.unwrap();
+        client.write_all(b"WHOIS Alice\r\n").await.unwrap();
         let query = read_until(&mut upstream, b"WHOIS Alice\r\n").await;
         assert!(String::from_utf8_lossy(&query).contains("WHOIS Alice"));
         upstream
             .write_all(b"@time=123 :srv NOTICE mobile :tagged\r\n")
             .await
             .unwrap();
-        let forwarded = read_until(&mut downstream, b"NOTICE mobile :tagged\r\n").await;
+        let forwarded = read_until(&mut client, b"NOTICE mobile :tagged\r\n").await;
         assert!(!String::from_utf8_lossy(&forwarded).contains("@time="));
-        downstream
-            .write_all(b"PRIVMSG #room :hello\r\n")
-            .await
-            .unwrap();
+        client.write_all(b"PRIVMSG #room :hello\r\n").await.unwrap();
         assert_eq!(
             Message::parse(b"PRIVMSG #room :hello\r\n")
                 .unwrap()
@@ -1040,12 +1780,7 @@ mod tests {
                 .unwrap(),
             b"PRIVMSG #room :hello\r\n"
         );
-        let chat = tokio::time::timeout(
-            Duration::from_secs(3),
-            read_until(&mut upstream, b"PRIVMSG #room :hello\r\n"),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("runtime ended: {}", task.is_finished()));
+        let chat = read_until(&mut upstream, b"PRIVMSG #room :hello\r\n").await;
         assert!(String::from_utf8_lossy(&chat).contains("PRIVMSG #room :hello"));
         upstream.write_all(b"PING :alive\r\n").await.unwrap();
         let pong = read_until(&mut upstream, b"PONG :alive\r\n").await;
@@ -1055,31 +1790,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isupport_values_reach_state_and_the_next_projection() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        for client in [ClientId(90), ClientId(91)] {
+            local
+                .queue_outcome(Ok((client, FaultScript::default())))
+                .unwrap();
+        }
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#room".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #room\r\n").await;
+        // `005` may arrive in the same read as the welcome and must not be lost.
+        upstream
+            .write_all(b":bot!u@h JOIN #room\r\n:srv 005 bot CASEMAPPING=rfc1459 PREFIX=(qaohv)~&@%+ CHANTYPES=#& CHANMODES=beI,k,l,imnpst :are supported by this server\r\n:srv 332 bot #room :subject\r\n:srv 324 bot #room +kl key 42\r\n:srv 353 bot = #room :bot @Alice ~Quiet\r\n")
+            .await
+            .unwrap();
+        while state.borrow().upstream_events_seen < 5 {
+            state.changed().await.unwrap();
+        }
+        let mut first = local.take_peer().await;
+        register_client(&mut first, END_OF_NAMES).await;
+        let since = state.borrow().downstream_detach_total;
+        first.shutdown().await.unwrap();
+        wait_detach(&mut state, since, "downstream-eof").await;
+        let mut second = local.take_peer().await;
+        let projection = register_client(&mut second, END_OF_NAMES).await;
+        assert!(projection.contains("PREFIX=(qaohv)~&@%+"), "{projection}");
+        assert!(
+            projection.contains("324 bot #room +kl key 42"),
+            "{projection}"
+        );
+        assert!(
+            projection.contains("353 bot = #room :@Alice bot ~Quiet"),
+            "{projection}"
+        );
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn configured_sasl_plain_completes_without_secret_diagnostics() {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let local = Arc::new(FakeLocalAcceptor::default());
-        local
-            .queue_outcome(Ok((ClientId(2), FaultScript::default())))
-            .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: Some(("alice".into(), Secret::new("swordfish".into()))),
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
+        let mut with_sasl = config(vec![]);
+        with_sasl.sasl = Some(("alice".into(), Secret::new("swordfish".into())));
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), with_sasl).unwrap();
         assert!(!format!("{:?}", supervisor.config.sasl).contains("swordfish"));
         let (stop_tx, stop_rx) = watch::channel(false);
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
         let mut upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
         let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         upstream
             .write_all(b":srv CAP * LS * :message-tags\r\n:srv CAP * LS :sasl=PLAIN\r\n")
@@ -1096,7 +1868,7 @@ mod tests {
         upstream.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
         let raw = "\0alice\0swordfish";
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
-        let payload = format!("AUTHENTICATE {}\r\n", encoded);
+        let payload = format!("AUTHENTICATE {encoded}\r\n");
         let response = read_until(&mut upstream, payload.as_bytes()).await;
         assert!(String::from_utf8_lossy(&response).contains(&payload));
         upstream
@@ -1114,26 +1886,14 @@ mod tests {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let local = Arc::new(FakeLocalAcceptor::default());
-        local
-            .queue_outcome(Ok((ClientId(3), FaultScript::default())))
-            .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: Some(("alice".into(), Secret::new("swordfish".into()))),
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
+        let mut with_sasl = config(vec![]);
+        with_sasl.sasl = Some(("alice".into(), Secret::new("swordfish".into())));
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), with_sasl).unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
         let mut upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
         let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         upstream
             .write_all(b":srv CAP * LS :message-tags\r\n")
@@ -1147,127 +1907,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn missing_matching_pong_reconnects_on_virtual_time() {
-        let provider = Arc::new(FakeI2pStreamProvider::default());
-        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
-        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
-        let local = Arc::new(FakeLocalAcceptor::default());
-        local
-            .queue_outcome(Ok((ClientId(10), FaultScript::default())))
-            .unwrap();
-        local
-            .queue_outcome(Ok((ClientId(11), FaultScript::default())))
-            .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let acceptor = SharedAcceptor(local.clone());
-        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
-        let mut upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
-        let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
-        upstream
-            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
-            .await
-            .unwrap();
-        let ping1 = read_until(&mut upstream, b"PING :bouncer-1\r\n").await;
-        assert!(String::from_utf8_lossy(&ping1).contains("PING :bouncer-1"));
-        upstream
-            .write_all(b":srv PONG bot :bouncer-1\r\n")
-            .await
-            .unwrap();
-        tokio::time::advance(Duration::from_secs(60)).await;
-        let _ = read_until(&mut upstream, b"PING :bouncer-1\r\n").await;
-        upstream
-            .write_all(b":srv PONG bot :bouncer-1\r\n")
-            .await
-            .unwrap();
-        tokio::time::advance(Duration::from_secs(60)).await;
-        let _ = read_until(&mut upstream, b"PING :bouncer-1\r\n").await;
-        tokio::time::advance(Duration::from_secs(120)).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        let mut second_upstream = provider.take_peer().await;
-        let _second_downstream = local.take_peer().await;
-        let initial = read_until(&mut second_upstream, b"USER user 0 * :bouncer\r\n").await;
-        assert!(String::from_utf8_lossy(&initial).contains("CAP LS 302"));
-        stop_tx.send(true).unwrap();
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ambiguous_chat_is_not_replayed_into_replacement_generation() {
-        let provider = Arc::new(FakeI2pStreamProvider::default());
-        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
-        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
-        let local = Arc::new(FakeLocalAcceptor::default());
-        for id in [ClientId(20), ClientId(21)] {
-            local
-                .queue_outcome(Ok((id, FaultScript::default())))
-                .unwrap();
-        }
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec!["#persistent".into()],
-            },
-        )
-        .unwrap();
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let acceptor = SharedAcceptor(local.clone());
-        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
-        let mut upstream = provider.take_peer().await;
-        let mut downstream = local.take_peer().await;
-        let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
-        upstream
-            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
-            .await
-            .unwrap();
-        let first_join = read_until(&mut upstream, b"JOIN #persistent\r\n").await;
-        assert!(String::from_utf8_lossy(&first_join).contains("JOIN #persistent"));
-        downstream
-            .write_all(b"NICK bot\r\nUSER bot 0 * :phone\r\n")
-            .await
-            .unwrap();
-        let _ = read_until(&mut downstream, b"001 bot :Welcome\r\n").await;
-        downstream
-            .write_all(b"PRIVMSG #room :possibly delivered\r\n")
-            .await
-            .unwrap();
-        let sent = read_until(&mut upstream, b"PRIVMSG #room :possibly delivered\r\n").await;
-        assert!(String::from_utf8_lossy(&sent).contains("possibly delivered"));
-        upstream.shutdown().await.unwrap();
-        tokio::time::advance(Duration::from_secs(2)).await;
-        let mut replacement = provider.take_peer().await;
-        let _replacement_client = local.take_peer().await;
-        let registered = read_until(&mut replacement, b"USER user 0 * :bouncer\r\n").await;
-        assert!(!String::from_utf8_lossy(&registered).contains("possibly delivered"));
-        replacement
-            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
-            .await
-            .unwrap();
-        let rejoin = read_until(&mut replacement, b"JOIN #persistent\r\n").await;
-        assert!(String::from_utf8_lossy(&rejoin).contains("JOIN #persistent"));
-        stop_tx.send(true).unwrap();
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn one_hundred_provider_failures_remain_bounded_and_recover() {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         for _ in 0..100 {
@@ -1278,20 +1917,10 @@ mod tests {
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let local = Arc::new(FakeLocalAcceptor::default());
         local
-            .queue_outcome(Ok((ClientId(30), FaultScript::default())))
+            .queue_outcome(Ok((ClientId(100), FaultScript::default())))
             .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
@@ -1301,8 +1930,15 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(provider.requested_endpoints().len(), 101);
-        let _upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
+        let mut upstream = provider.take_peer().await;
+        let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        // A local client can still attach after the failure storm.
+        let mut client = local.take_peer().await;
+        register_client(&mut client, WELCOME).await;
         stop_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
     }
@@ -1312,26 +1948,12 @@ mod tests {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let local = Arc::new(FakeLocalAcceptor::default());
-        local
-            .queue_outcome(Ok((ClientId(40), FaultScript::default())))
-            .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
         let mut upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
         let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         stop_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
@@ -1342,27 +1964,13 @@ mod tests {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let local = Arc::new(FakeLocalAcceptor::default());
-        local
-            .queue_outcome(Ok((ClientId(50), FaultScript::default())))
-            .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
         let state = supervisor.subscribe_snapshot();
         let (stop_tx, stop_rx) = watch::channel(false);
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
         let mut upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
         let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         tokio::time::advance(REGISTRATION_TIMEOUT + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
@@ -1377,27 +1985,13 @@ mod tests {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let local = Arc::new(FakeLocalAcceptor::default());
-        local
-            .queue_outcome(Ok((ClientId(51), FaultScript::default())))
-            .unwrap();
-        let supervisor = NetworkSupervisor::new(
-            SharedProvider(provider.clone()),
-            UpstreamConfig {
-                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
-                nick: "bot".into(),
-                username: "user".into(),
-                realname: "bouncer".into(),
-                sasl: None,
-                desired_channels: vec![],
-            },
-        )
-        .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
         let state = supervisor.subscribe_snapshot();
         let (stop_tx, stop_rx) = watch::channel(false);
         let acceptor = SharedAcceptor(local.clone());
         let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
         let mut upstream = provider.take_peer().await;
-        let _downstream = local.take_peer().await;
         let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         tokio::time::advance(CAP_SASL_TIMEOUT + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
