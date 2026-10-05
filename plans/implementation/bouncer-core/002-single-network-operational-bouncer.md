@@ -1,8 +1,8 @@
 # Bouncer Core Milestone 002 — Single-Network Operational Bouncer
 
-Status: ready
+Status: closed
 
-Repository baseline: 82a931a
+Repository baseline: 0c1f82d
 
 Source roadmap:
 
@@ -25,7 +25,9 @@ Hard dependency:
 
 - bouncer-core M001 was evidence-closed by `plans/closure/bouncer-core/003-status.md`.
 
-Current implementation status: remains blocked. The registration-only runtime slice is not an M002 implementation and does not change this dependency.
+Implementation commits: `c388316a6d9a2517d97c686f615e070c9ca326df`, `a9dc923ba97f0a2a3af01b1447e6e9af72cac07e`.
+
+Current implementation status: closed with evidence in `plans/closure/bouncer-core/002-status.md`.
 
 ## 1. Objective
 
@@ -47,7 +49,7 @@ The milestone is operational only through fake/test I2pStreamProvider and LocalA
 
 ## 2. Readiness decision
 
-M002 depended on contracts M001 had not implemented or closed:
+M002 originally depended on contracts M001 had not implemented or closed:
 
 - strict wire parser/encoder;
 - I2pEndpoint/I2pStreamProvider;
@@ -57,13 +59,11 @@ M002 depended on contracts M001 had not implemented or closed:
 - deterministic fault streams;
 - static network-boundary guards.
 
-Those contracts are now implemented and evidence-closed. This handoff is ready at baseline `82a931a`; the objective and scope below remain unchanged.
-
-Once M001 closes without a high-severity finding, this plan may be refreshed against the closure baseline and marked ready without changing its objective.
+Those contracts are now implemented and evidence-closed. This handoff became ready at baseline `82a931a`; implementation began from baseline `0c1f82d` without changing this plan's objective or scope.
 
 ## 3. Current implementation evidence
 
-At this planning baseline there is no bouncer runtime.
+At the refreshed M002 baseline, the runtime contained only a registration slice; it was not an operational bouncer. The delivered runtime now owns the injected upstream and one accepted local session through registration, online routing, liveness, reconnect, and stop.
 
 The canonical model already requires:
 
@@ -571,8 +571,6 @@ Stop instead of widening scope if:
 - full verification results;
 - residual findings and M003 readiness.
 
-## 16. Handoff notes
+## 16. Closure disposition
 
-This plan is intentionally written before M001 closes so its upstream requirements can pressure-test M001's interfaces, but implementation is blocked.
-
-When M001 closes, refresh the repository baseline and any exact type names before changing status to ready. Do not weaken M001's I2P-only boundary to simplify M002.
+M002 is closed by `plans/closure/bouncer-core/002-status.md`. The one-network/one-client injected-stream boundary remains intentional. M003's hard dependency is satisfied, so its implementation plan may now be researched and drafted against the closure baseline. Do not weaken M001's I2P-only boundary when preparing M003.

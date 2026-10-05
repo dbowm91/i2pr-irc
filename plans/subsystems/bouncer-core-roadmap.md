@@ -99,7 +99,7 @@ It does not require Proposal 170.
 
 ## 4. Current state
 
-M001 protocol/domain/fault foundations are implemented and evidence-closed. M002 single-network runtime work is active.
+M001 protocol/domain/fault foundations and M002 single-network operational bouncer are implemented and evidence-closed. M003 is eligible for planning; its implementation handoff has not yet been written.
 
 Canonical product/security direction and terminology are frozen. ADR-0001 establishes I2P-only upstream authority through I2pStreamProvider.
 
@@ -482,7 +482,7 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
 | M001 | closed | plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md | plans/closure/bouncer-core/003-status.md | — |
-| M002 | active | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | future | implementation and qualification in progress |
-| M003 | not started | future | future | M002 |
+| M002 | closed | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | plans/closure/bouncer-core/002-status.md | — |
+| M003 | planning eligible | future | future | Plan handoff required; M002 dependency satisfied |
 | M004 | not started | future | future | M003 |
 | M005 | not started | future | future | M004 |

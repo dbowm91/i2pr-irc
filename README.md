@@ -16,6 +16,6 @@ Planning authority begins at:
 
 ## Implementation state
 
-M001's bounded wire/domain/time/fault foundations are closed. M002 currently has an active one-network, one-local-client runtime over injected I2P and local stream capabilities, including CAP/SASL registration, bounded state and queues, liveness, reconnect, and no-replay handling. It is not yet a complete daemon or router integration; follow `plans/registry.md` for the active handoff and closure state. See [architecture/overview.md](architecture/overview.md) and the milestone records under `plans/closure/bouncer-core/`.
+M001's bounded wire/domain/time/fault foundations and M002's one-network, one-local-client runtime are closed. The runtime uses injected I2P and local stream capabilities, with CAP/SASL registration, bounded state and queues, liveness, reconnect, and no-replay handling. It is not a complete daemon or router integration. M003 is eligible for planning; follow `plans/registry.md` for current status. See [architecture/overview.md](architecture/overview.md) and the milestone records under `plans/closure/bouncer-core/`.
 
 Research lives under plans/research/. Subsystem roadmaps live under plans/subsystems/. Bounded implementation handoffs live under plans/implementation/, and evidence-based completion records live under plans/closure/.
