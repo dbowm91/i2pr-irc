@@ -26,14 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M002 closed | M001 and M002 are closed. M003's hard dependency is satisfied and planning may begin; M003-M005 implementation handoffs remain unplanned and sequenced. |
+| Bouncer core | active corrective | plans/subsystems/bouncer-core-roadmap.md | C001 / Corrective 004 ready | M001 is closed. M002 retains its historical closure, but post-closure lifecycle/state-fidelity defects are owned by plans/subsystems/bouncer-core-m002-lifecycle-corrective-addendum.md and Corrective 004. M003 is blocked until Corrective 004 closes. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
-| None | — | — | — | — |
+| Bouncer Core Corrective 004 — M002 Persistent Upstream Lifecycle and State Fidelity | ready | invariant + capability corrective | plans/subsystems/bouncer-core-m002-lifecycle-corrective-addendum.md | future plans/closure/bouncer-core/004-status.md |
 
 ## Recently closed implementation plans
 
@@ -45,11 +45,11 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| None | — | — | — |
+| M003 implementation handoff | planning blocked | Corrective 004 closure | Do not write/activate until the corrected owner/state model is evidence-closed |
 
 ## Unplanned later milestones
 
-These have roadmap authority but intentionally do not yet have implementation handoffs. M003 is now eligible for planning because M002 is closed; it is not implementation-ready until its bounded handoff is written and reviewed.
+These have roadmap authority but intentionally do not yet have implementation handoffs. M003 is no longer planning-eligible: historical M002 closure exposed a post-closure owner/state defect, and Corrective 004 is now a hard dependency.
 
 - Bouncer Core M003 — durable multi-network/multi-client/history;
 - Bouncer Core M004 — anonymity and adverse-network qualification;
@@ -85,4 +85,5 @@ Important retained conclusions:
 ## Immediate handoff
 
 M001's corrective qualification is closed in `plans/closure/bouncer-core/003-status.md`.
-M002 is closed in `plans/closure/bouncer-core/002-status.md`. M003 is eligible for planning; do not skip directly to router integration.
+M002 retains its historical closure in `plans/closure/bouncer-core/002-status.md`, but the current strict handoff is `plans/implementation/bouncer-core/004-m002-persistent-upstream-lifecycle-and-state-fidelity-corrective.md`.
+Implement Corrective 004 next. M003 remains blocked until its closure explicitly restores readiness; do not skip directly to persistence or router integration.
