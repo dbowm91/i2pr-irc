@@ -99,15 +99,13 @@ It does not require Proposal 170.
 
 ## 4. Current state
 
-The repository is planning-first with no production Rust code.
+M001 protocol/domain/fault foundations are implemented and evidence-closed. M002 single-network runtime work is active.
 
 Canonical product/security direction and terminology are frozen. ADR-0001 establishes I2P-only upstream authority through I2pStreamProvider.
 
 Research has identified ZNC as a mature feature-envelope reference and soju as the closer conceptual reference for persistent multi-network/multi-client/history behavior. Current IRCv3 specifications establish the need for explicit capability mediation, labeled-response routing, message-tag bounds, and draft-isolated history/read-marker behavior.
 
-No parser, runtime, store, dependency set, MSRV, schema, or user-visible capability is implemented yet.
-
-This is intentional: M001 freezes and tests the foundation before bouncer behavior is built on it.
+The runtime has a registration-only slice; it is not yet an operational bouncer. M001 froze and qualified the foundation before M002 behavior is built on it.
 
 ## 5. Target architecture
 
@@ -483,8 +481,8 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
-| M001 | corrective pass required | plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md | plans/closure/bouncer-core/001-status.md | incomplete fault/time/property evidence |
-| M002 | blocked | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | future | M001 |
+| M001 | closed | plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md | plans/closure/bouncer-core/003-status.md | — |
+| M002 | active | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | future | implementation and qualification in progress |
 | M003 | not started | future | future | M002 |
 | M004 | not started | future | future | M003 |
 | M005 | not started | future | future | M004 |

@@ -1,6 +1,8 @@
 # Bouncer Core Milestone 001 — Protocol, Domain, and Deterministic-Fault Foundation
 
-Status: corrective pass required
+Status: closed
+
+Closure record: `plans/closure/bouncer-core/003-status.md` (corrective qualification)
 
 Repository baseline: 7276d2f8f6ec62c3c8a9023b027bbdaf90528f02
 

@@ -1,8 +1,8 @@
 # Bouncer Core Milestone 002 — Single-Network Operational Bouncer
 
-Status: blocked
+Status: ready
 
-Repository baseline: 2228103181a60855ff6e76f024298b91aec1b940
+Repository baseline: 82a931a
 
 Source roadmap:
 
@@ -23,7 +23,7 @@ Primary class: capability
 
 Hard dependency:
 
-- bouncer-core M001 must be evidence-closed.
+- bouncer-core M001 was evidence-closed by `plans/closure/bouncer-core/003-status.md`.
 
 Current implementation status: remains blocked. The registration-only runtime slice is not an M002 implementation and does not change this dependency.
 
@@ -45,9 +45,9 @@ Build the first complete bouncer vertical without introducing a concrete I2P rou
 
 The milestone is operational only through fake/test I2pStreamProvider and LocalAcceptor implementations. SAM remains out of scope.
 
-## 2. Why this milestone is blocked
+## 2. Readiness decision
 
-M002 depends on contracts M001 has not implemented or closed:
+M002 depended on contracts M001 had not implemented or closed:
 
 - strict wire parser/encoder;
 - I2pEndpoint/I2pStreamProvider;
@@ -57,7 +57,7 @@ M002 depends on contracts M001 has not implemented or closed:
 - deterministic fault streams;
 - static network-boundary guards.
 
-Implementation against guessed versions of those contracts would create exactly the coupling M001 is intended to avoid.
+Those contracts are now implemented and evidence-closed. This handoff is ready at baseline `82a931a`; the objective and scope below remain unchanged.
 
 Once M001 closes without a high-severity finding, this plan may be refreshed against the closure baseline and marked ready without changing its objective.
 

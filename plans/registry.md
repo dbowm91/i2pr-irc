@@ -26,20 +26,20 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M001 corrective pass required; M002 blocked | M001 closure found missing fault/time/property evidence. M002 remains blocked on M001 closure. M003-M005 are sequenced by the roadmap and do not yet have handoff plans. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M002 active | M001 is closed by corrective record 003. M002 is dependency-ready and in progress. M003-M005 remain sequenced and unplanned. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Dependency-ready implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
-| Bouncer Core M001 — Protocol, Domain, and Deterministic-Fault Foundation | corrective pass required | invariant + infrastructure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/001-status.md |
+| Bouncer Core M002 — Single-Network Operational Bouncer | active | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/002-status.md |
 
 ## Blocked implementation plans
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M002 — Single-Network Operational Bouncer | blocked | M001 is not evidence-closed; see plans/closure/bouncer-core/001-status.md | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md |
+| None | — | — | — |
 
 ## Unplanned later milestones
 
@@ -78,8 +78,5 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-The M001 attempt did not satisfy closure, and M002 remains blocked. The corrective evidence is recorded at:
-
-plans/closure/bouncer-core/001-status.md
-
-No later implementation plan is currently handoff-ready. Do not skip directly to SAM, SQLite, UI, or i2pr integration.
+M001's corrective qualification is closed in `plans/closure/bouncer-core/003-status.md`.
+M002 is the active handoff. Do not skip directly to SAM, SQLite, UI, or i2pr integration.
