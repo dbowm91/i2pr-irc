@@ -6,7 +6,7 @@ Source plan: `plans/implementation/bouncer-core/001-protocol-domain-and-fault-ha
 
 Reviewed baseline: `7276d2f8f6ec62c3c8a9023b027bbdaf90528f02`
 
-Implementation commit: `9ce67be715b52fcb94e84e47ccff9e9b196b1e8d`.
+Implementation commit: `89f7e30a3c32a5828ff1643c58d52f27e20bd1b2`.
 
 ## Finding
 

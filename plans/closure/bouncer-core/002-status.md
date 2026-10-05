@@ -6,7 +6,7 @@ Source plan: `plans/implementation/bouncer-core/002-single-network-operational-b
 
 Dependency: M001 is not evidence-closed; see `plans/closure/bouncer-core/001-status.md`.
 
-Reviewed implementation commit: `9ce67be715b52fcb94e84e47ccff9e9b196b1e8d` (registration-only slice; not milestone-complete).
+Reviewed implementation commit: `89f7e30a3c32a5828ff1643c58d52f27e20bd1b2` (registration-only slice; not milestone-complete).
 
 ## Finding
 
