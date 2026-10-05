@@ -1,6 +1,8 @@
 # Bouncer Core Corrective 003 — M001 Wire, Time, and Fault Qualification
 
-Status: active
+Status: closed
+
+Closure record: `plans/closure/bouncer-core/003-status.md`
 
 Repository baseline: `6c7a093152b7062adaf2e3a87c4fe66fdd93c8f3`
 

@@ -1,6 +1,8 @@
 # Bouncer Core Corrective 004 — M002 Persistent Upstream Lifecycle and State Fidelity
 
-Status: ready for handoff
+Status: closed
+
+Closure record: `plans/closure/bouncer-core/004-status.md`
 
 Repository baseline: `e76561a517563296e2ebb92110a76f3b06cec34b`
 

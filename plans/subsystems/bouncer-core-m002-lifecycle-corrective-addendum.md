@@ -1,6 +1,6 @@
 # Bouncer Core M002 Post-Closure Corrective Addendum
 
-Status: active
+Status: closed
 
 Long-term references:
 

@@ -103,13 +103,13 @@ It does not require Proposal 170.
 
 ## 4. Current state
 
-M001 protocol/domain/fault foundations are evidence-closed. M002 has a historical evidence-based closure, but post-closure review found that its runtime couples upstream Network lifetime to downstream client lifetime and has state-fidelity/static-boundary gaps that must be corrected before persistence or multi-client fanout. Those findings are owned by the active M002 post-closure corrective addendum and Corrective 004. M003 is blocked on Corrective 004 closure.
+M001 protocol/domain/fault foundations are evidence-closed. M002 has a historical evidence-based closure, and its post-closure findings — upstream lifetime coupled to downstream attachment, and lossy channel/member/mode state — were owned by the M002 post-closure corrective addendum and Corrective 004. Corrective 004 is now closed in `plans/closure/bouncer-core/004-status.md`, so the owner model is corrected and M003 is planning-eligible (still unplanned).
 
 Canonical product/security direction and terminology are frozen. ADR-0001 establishes I2P-only upstream authority through I2pStreamProvider.
 
 Research has identified ZNC as a mature feature-envelope reference and soju as the closer conceptual reference for persistent multi-network/multi-client/history behavior. Current IRCv3 specifications establish the need for explicit capability mediation, labeled-response routing, message-tag bounds, and draft-isolated history/read-marker behavior.
 
-The runtime now contains the M002 single-network operational vertical, including CAP/SASL registration, liveness, bounded queues, state projection, reconnect/backoff, and deterministic fault evidence. Its current owner shape is not yet acceptable as the persistence foundation because a downstream detach terminates the upstream generation/supervisor and the channel/member mode representation is still lossy. Corrective 004 owns those bounded defects.
+The runtime contains the corrected single-network owner: registration, CAP/SASL, liveness, observed state, and the upstream writer task are owned by the upstream generation, while a zero-or-one local client attachment is handled as data, so local-client absence no longer gates or ends an upstream session. Observed channel, member, and mode state is bounded and driven by advertised `CHANTYPES`, `PREFIX`, and `CHANMODES`; state that cannot be represented truthfully is marked incomplete and omitted from synthesized projections rather than projected falsely. This is an acceptable foundation for persistence: M003 may store this state model, but it must not reintroduce coupled upstream/downstream lifetime.
 
 ## 5. Target architecture
 
@@ -170,7 +170,7 @@ M005 mature operator feature set
 Dependency classes:
 
 - M002 has a hard dependency on M001.
-- M003 has hard dependencies on historical M002 completion and the active C001 / Corrective 004 post-closure repair.
+- M003 had hard dependencies on historical M002 completion and the C001 / Corrective 004 post-closure repair; both are now closed, so M003 is planning-eligible but still unplanned.
 - M004 has a hard dependency on M003.
 - M005 has a hard dependency on M004.
 - Router integration has a hard dependency on M005 under the canonical phase ordering.
@@ -489,8 +489,8 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
 | M001 | closed | plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md | plans/closure/bouncer-core/003-status.md | — |
-| M002 | historical closure; corrective active | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | plans/closure/bouncer-core/002-status.md | Strict current authority is C001 / Corrective 004 |
-| C001 / Corrective 004 | ready | plans/implementation/bouncer-core/004-m002-persistent-upstream-lifecycle-and-state-fidelity-corrective.md | future plans/closure/bouncer-core/004-status.md | none |
-| M003 | blocked | future | future | C001 / Corrective 004 closure |
+| M002 | closed | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | plans/closure/bouncer-core/002-status.md | none |
+| C001 / Corrective 004 | closed | plans/implementation/bouncer-core/004-m002-persistent-upstream-lifecycle-and-state-fidelity-corrective.md | plans/closure/bouncer-core/004-status.md | none |
+| M003 | planning-eligible; unplanned | future | future | needs an implementation handoff against this baseline |
 | M004 | not started | future | future | M003 |
 | M005 | not started | future | future | M004 |
