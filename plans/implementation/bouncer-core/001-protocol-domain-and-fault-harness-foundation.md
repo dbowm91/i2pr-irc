@@ -1,6 +1,6 @@
 # Bouncer Core Milestone 001 — Protocol, Domain, and Deterministic-Fault Foundation
 
-Status: ready for handoff
+Status: corrective pass required
 
 Repository baseline: 7276d2f8f6ec62c3c8a9023b027bbdaf90528f02
 

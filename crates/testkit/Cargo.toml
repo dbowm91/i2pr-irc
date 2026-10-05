@@ -1,0 +1,11 @@
+[package]
+name = "i2pr-irc-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[dependencies]
+i2pr-irc-core = { path = "../core" }
+tokio.workspace = true
+async-trait.workspace = true
+[lints]
+workspace = true

@@ -32,4 +32,11 @@ No environment-derived hostname, username, OS/router version, local path, proces
 
 plans/registry.md is the active planning control surface.
 
+## Rust workspace checks
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+- `scripts/verify.sh quick` or `scripts/verify.sh full`
+
 If implementation requires generic host DNS, generic upstream TCP, arbitrary HTTP egress, or private i2pr internals, stop for architecture review.

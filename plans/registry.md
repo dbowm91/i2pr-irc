@@ -26,20 +26,20 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M001 ready; M002 blocked | M001 has no blocker. M002 waits on M001 closure. M003-M005 are sequenced by the roadmap and do not yet have handoff plans. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M001 corrective pass required; M002 blocked | M001 closure found missing fault/time/property evidence. M002 remains blocked on M001 closure. M003-M005 are sequenced by the roadmap and do not yet have handoff plans. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Dependency-ready implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
-| Bouncer Core M001 — Protocol, Domain, and Deterministic-Fault Foundation | ready | invariant + infrastructure | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/001-status.md |
+| Bouncer Core M001 — Protocol, Domain, and Deterministic-Fault Foundation | corrective pass required | invariant + infrastructure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/001-status.md |
 
 ## Blocked implementation plans
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M002 — Single-Network Operational Bouncer | blocked | Bouncer Core M001 closure | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md |
+| Bouncer Core M002 — Single-Network Operational Bouncer | blocked | M001 is not evidence-closed; see plans/closure/bouncer-core/001-status.md | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md |
 
 ## Unplanned later milestones
 
@@ -78,8 +78,8 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-The only implementation-ready work at repository bootstrap is:
+The M001 attempt did not satisfy closure, and M002 remains blocked. The corrective evidence is recorded at:
 
-plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md
+plans/closure/bouncer-core/001-status.md
 
-Its closure must decide whether M002 can become ready. Do not skip directly to SAM, SQLite, UI, or i2pr integration.
+No later implementation plan is currently handoff-ready. Do not skip directly to SAM, SQLite, UI, or i2pr integration.

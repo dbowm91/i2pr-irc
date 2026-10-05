@@ -1,0 +1,9 @@
+[package]
+name = "i2pr-irc-fuzz-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[dependencies]
+i2pr-irc-wire = { path = "../wire" }
+[lints]
+workspace = true

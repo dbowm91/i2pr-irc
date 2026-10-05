@@ -14,4 +14,8 @@ Planning authority begins at:
 - plans/003-planning-process.md
 - plans/registry.md
 
+## Implementation state
+
+The Rust workspace now contains bounded wire/domain foundations and a deterministic stream fixture. The single-network runtime currently implements an upstream registration attempt only; it is not yet a complete usable bouncer. See [architecture/overview.md](architecture/overview.md) and the milestone closure records under `plans/closure/bouncer-core/`.
+
 Research lives under plans/research/. Subsystem roadmaps live under plans/subsystems/. Bounded implementation handoffs live under plans/implementation/, and evidence-based completion records live under plans/closure/.

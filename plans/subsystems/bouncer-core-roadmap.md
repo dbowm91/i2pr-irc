@@ -483,7 +483,7 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
-| M001 | ready | plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md | future | none |
+| M001 | corrective pass required | plans/implementation/bouncer-core/001-protocol-domain-and-fault-harness-foundation.md | plans/closure/bouncer-core/001-status.md | incomplete fault/time/property evidence |
 | M002 | blocked | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | future | M001 |
 | M003 | not started | future | future | M002 |
 | M004 | not started | future | future | M003 |

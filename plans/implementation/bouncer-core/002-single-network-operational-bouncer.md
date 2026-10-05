@@ -25,6 +25,8 @@ Hard dependency:
 
 - bouncer-core M001 must be evidence-closed.
 
+Current implementation status: remains blocked. The registration-only runtime slice is not an M002 implementation and does not change this dependency.
+
 ## 1. Objective
 
 Build the first complete bouncer vertical without introducing a concrete I2P router dependency:
