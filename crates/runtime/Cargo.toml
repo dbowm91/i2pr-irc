@@ -10,5 +10,9 @@ tokio.workspace = true
 thiserror.workspace = true
 base64.workspace = true
 zeroize.workspace = true
+[dev-dependencies]
+i2pr-irc-testkit = { path = "../testkit" }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 [lints]
 workspace = true

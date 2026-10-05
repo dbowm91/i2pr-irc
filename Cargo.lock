@@ -45,8 +45,10 @@ dependencies = [
 name = "i2pr-irc-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "i2pr-irc-core",
+ "i2pr-irc-testkit",
  "i2pr-irc-wire",
  "thiserror",
  "tokio",

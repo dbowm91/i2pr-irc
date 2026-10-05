@@ -6,4 +6,4 @@
 
 Wire tests exercise the exact normal/tagged limits, parameters, tags, all representative split points, concatenation, and deterministic arbitrary byte inputs. The release fuzz-smoke binary repeats arbitrary input and semantic round-trip/bounded-buffer properties. This is a deterministic smoke campaign; it is not coverage-guided fuzzing.
 
-M002's current runtime remains an unqualified registration attempt, not a functioning bouncer.
+M002's runtime integration suite uses `FakeI2pStreamProvider` and `FakeLocalAcceptor` for CAP/SASL registration, downstream handshake and CAP mediation, channel/topic/mode/member projection, tagged-message filtering, message/query routing, PING/PONG priority, no-replay after ambiguous disconnect, desired-channel reconstruction, stopped-registration cancellation, registration/liveness deadlines, and 100 provider failures before recovery. Tokio's paused clock drives reconnect and online deadline tests without wall-clock waiting.

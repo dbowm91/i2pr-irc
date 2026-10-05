@@ -43,6 +43,7 @@ pub struct Message {
     pub prefix: Option<Vec<u8>>,
     pub command: Vec<u8>,
     pub params: Vec<Vec<u8>>,
+    trailing_parameter: bool,
     raw_client_tag_data_len: Option<usize>,
     raw_server_tag_data_len: Option<usize>,
 }
@@ -63,6 +64,7 @@ impl Message {
             prefix: None,
             command: command.into(),
             params: Vec::new(),
+            trailing_parameter: false,
             raw_client_tag_data_len: None,
             raw_server_tag_data_len: None,
         }
@@ -175,6 +177,7 @@ impl Message {
             &[]
         };
         let mut params = Vec::new();
+        let mut trailing_parameter = false;
         while !rest.is_empty() {
             if params.len() == MAX_PARAMS {
                 return Err(WireError::TooManyParams);
@@ -183,6 +186,7 @@ impl Message {
                 return Err(WireError::InvalidFraming);
             }
             if rest[0] == b':' {
+                trailing_parameter = true;
                 params.push(rest[1..].to_vec());
                 break;
             }
@@ -199,6 +203,7 @@ impl Message {
             prefix,
             command,
             params,
+            trailing_parameter,
             raw_client_tag_data_len,
             raw_server_tag_data_len,
         })
@@ -290,7 +295,10 @@ impl Message {
             }
             out.push(b' ');
             if i + 1 == self.params.len()
-                && (param.is_empty() || param.contains(&b' ') || param.first() == Some(&b':'))
+                && (self.trailing_parameter
+                    || param.is_empty()
+                    || param.contains(&b' ')
+                    || param.first() == Some(&b':'))
             {
                 out.push(b':');
             } else if param.is_empty() || param.contains(&b' ') {
