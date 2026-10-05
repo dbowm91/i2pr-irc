@@ -22,6 +22,7 @@ pub const NORMAL_QUEUE_CAPACITY: usize = 64;
 pub const CONTROL_QUEUE_CAPACITY: usize = 8;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(180);
+pub const CAP_SASL_TIMEOUT: Duration = Duration::from_secs(90);
 pub const MAX_CHANNELS: usize = 128;
 pub const MAX_MEMBERS_PER_CHANNEL: usize = 2048;
 pub const MAX_TOTAL_MEMBERS: usize = 8192;
@@ -286,7 +287,14 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
             let mut requested = false;
             let mut sasl_active = false;
             while !(welcomed && cap_finished) {
-                let n = ur.read(&mut buf).await?;
+                let n = if cap_finished {
+                    ur.read(&mut buf).await?
+                } else {
+                    tokio::time::timeout(CAP_SASL_TIMEOUT, ur.read(&mut buf))
+                        .await
+                        .map_err(|_| RuntimeError::Timeout)?
+                        .map_err(RuntimeError::Io)?
+                };
                 if n == 0 {
                     return Err(RuntimeError::Protocol);
                 }
@@ -1357,6 +1365,41 @@ mod tests {
         let _downstream = local.take_peer().await;
         let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         tokio::time::advance(REGISTRATION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(state.borrow().phase, Some(Phase::Backoff));
+        assert_eq!(state.borrow().last_error, Some("timeout"));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cap_sasl_phase_has_its_own_bounded_deadline() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(51), FaultScript::default())))
+            .unwrap();
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            UpstreamConfig {
+                endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
+                nick: "bot".into(),
+                username: "user".into(),
+                realname: "bouncer".into(),
+                sasl: None,
+                desired_channels: vec![],
+            },
+        )
+        .unwrap();
+        let state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = provider.take_peer().await;
+        let _downstream = local.take_peer().await;
+        let _ = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        tokio::time::advance(CAP_SASL_TIMEOUT + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(state.borrow().phase, Some(Phase::Backoff));
         assert_eq!(state.borrow().last_error, Some("timeout"));
