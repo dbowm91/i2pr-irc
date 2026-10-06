@@ -248,7 +248,9 @@ pub(crate) fn classify(kind: &i2pr_irc_store::StoreErrorKind) -> RuntimeError {
             // surfaced rather than being worked around.
             RuntimeError::InvalidConfig
         }
-        Kind::Sqlite => RuntimeError::Protocol,
+        // A SQLite failure that is really a domain or constraint violation (a missing
+        // client lineage, for example) must not be reported as a protocol failure.
+        Kind::Sqlite => RuntimeError::InvalidConfig,
     }
 }
 

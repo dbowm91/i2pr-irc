@@ -16,14 +16,18 @@ use crate::{
     REGISTRATION_TIMEOUT, RuntimeError,
     catalog::SupervisorCommand,
     downstream::DownstreamDisposition,
+    journal::IngestOutcome,
+    playback::PlaybackOutcome,
     projection,
-    session::{SESSION_EVENT_QUEUE_CAPACITY, SessionEvent, SessionIntent, SessionTask},
+    session::{
+        SESSION_EVENT_QUEUE_CAPACITY, SessionEvent, SessionHandle, SessionIntent, SessionTask,
+    },
     state::{LineOutcome, NetworkState},
 };
 use i2pr_irc_core::{
     ByteStream, ClientId, ConnectionGeneration, I2pStreamProvider, NetworkId, SessionId,
 };
-use i2pr_irc_store::{StoreError, StoreHandle};
+use i2pr_irc_store::{BufferId, BufferKind, StoreError, StoreHandle};
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::{
@@ -39,6 +43,110 @@ use zeroize::Zeroizing;
 pub const MAX_SESSIONS_PER_NETWORK: usize = 64;
 /// Ceiling on buffered upstream intents awaiting persistence confirmation.
 pub const PENDING_INTENT_CAPACITY: usize = 64;
+/// Ceiling on lines queued for durable history ingestion.
+///
+/// History work is bounded and strictly best effort: when this is full, the event is
+/// dropped and counted rather than buffered, because an unbounded retry buffer would
+/// trade memory pressure for history that arrives too late to matter.
+pub const INGEST_QUEUE_CAPACITY: usize = 256;
+/// How many queued ingestion items one loop turn may drain, so history work cannot
+/// monopolize the owner and delay PING/PONG.
+pub const INGEST_BATCH_PER_TURN: usize = 16;
+/// Ceiling on buffers whose backlog one session may receive in one pass, so a client
+/// attached to many channels still receives a bounded total amount of history.
+pub const MAX_BACKLOG_BUFFERS: usize = 32;
+
+/// Delivers the bounded legacy backlog for every resolved buffer this session can see.
+///
+/// The whole set is capped in total events and bytes, so a client attached to many
+/// channels receives a bounded amount rather than one full backlog per buffer.
+async fn deliver_legacy_backlog(
+    journal: &mut crate::journal::HistoryJournal,
+    handle: &SessionHandle,
+    client: ClientId,
+    session: SessionId,
+    buffers: &BTreeMap<String, BufferId>,
+    snapshot: &watch::Sender<NetworkSnapshot>,
+) -> PlaybackOutcome {
+    let cap = crate::journal::BacklogCap::DEFAULT;
+    let mut total = PlaybackOutcome::default();
+    for buffer in buffers.values().copied().take(MAX_BACKLOG_BUFFERS) {
+        if total.delivered >= cap.events || total.bytes >= cap.bytes {
+            total.more_pending = true;
+            break;
+        }
+        let remaining = crate::journal::BacklogCap::new(
+            cap.events.saturating_sub(total.delivered),
+            cap.bytes.saturating_sub(total.bytes),
+        );
+        let outcome =
+            crate::playback::deliver_buffer(journal, handle, client, session, buffer, remaining)
+                .await;
+        total.delivered += outcome.delivered;
+        total.bytes += outcome.bytes;
+        total.overflowed |= outcome.overflowed;
+        total.session_ended |= outcome.session_ended;
+        total.more_pending |= outcome.more_pending;
+        if outcome.overflowed || outcome.session_ended {
+            break;
+        }
+    }
+    snapshot.send_modify(|state| {
+        state.backlog_delivered = state
+            .backlog_delivered
+            .saturating_add(total.delivered as u64);
+        state.backlog_truncated = state.backlog_truncated || total.more_pending;
+        state.last_error = if total.overflowed {
+            Some("backlog-overflow")
+        } else {
+            state.last_error
+        };
+    });
+    total
+}
+
+/// The channel this line authoritatively confirmed membership of, if any.
+///
+/// Only a self JOIN from the server confirms membership. A `PART` removes it, and any
+/// other JOIN is someone else's membership and proves nothing about this bouncer.
+fn confirmed_self_channel(state: &NetworkState, message: &Message) -> Option<String> {
+    let command = &message.command;
+    let target = std::str::from_utf8(message.params.first()?).ok()?;
+    if !is_channel_target(target) {
+        return None;
+    }
+    let prefix = message.prefix.as_ref()?;
+    // A prefix is `nick!user@host`; the nick is the part before the first `!`.
+    let nick = prefix.split(|byte| *byte == b'!').next()?;
+    if !state.same_nick(std::str::from_utf8(nick).ok()?, &state.nick) {
+        return None;
+    }
+    if command.eq_ignore_ascii_case(b"PART") {
+        return None;
+    }
+    if !command.eq_ignore_ascii_case(b"JOIN") {
+        return None;
+    }
+    state
+        .joined_channels()
+        .into_iter()
+        .find(|channel| state.same_nick(channel, target))
+}
+
+/// Casemapped lookup key for a wire target.
+fn casemapped(target: &str) -> String {
+    i2pr_irc_core::Casemapping::Rfc1459
+        .fold(target.as_bytes())
+        .into_iter()
+        .map(char::from)
+        .collect()
+}
+
+/// One upstream line queued for durable history ingestion.
+struct IngestItem {
+    buffer: BufferId,
+    message: Message,
+}
 
 /// Bounded, non-secret diagnostic projection of one Network owner.
 #[derive(Clone, Debug, Default)]
@@ -61,6 +169,15 @@ pub struct NetworkSnapshot {
     pub pending_joins: Vec<String>,
     pub rejected_joins: Vec<(String, &'static str)>,
     pub last_error: Option<&'static str>,
+    /// Bounded history counters. Never carries a payload.
+    pub history_recorded: u64,
+    pub history_skipped: u64,
+    /// Lines dropped because the ingestion queue was full.
+    pub history_dropped: u64,
+    /// Events confirmed delivered to clients by automatic backlog.
+    pub backlog_delivered: u64,
+    /// True when more retained history exists beyond what the cap delivered.
+    pub backlog_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -452,6 +569,24 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
 
         // Every attached session, keyed by its ephemeral identity.
         let mut sessions: BTreeMap<SessionId, SessionTask> = BTreeMap::new();
+        // The per-generation history journal and its bounded ingestion queue. They are
+        // generation-scoped: a new generation starts with fresh observed buffers and
+        // never inherits the previous generation's queue.
+        let mut journal = crate::journal::HistoryJournal::new(
+            self.context.network,
+            self.store.clone(),
+            Box::new(i2pr_irc_core::SystemWallClock),
+            i2pr_irc_core::Casemapping::Rfc1459,
+        );
+        // Resolved conversation targets, populated from authoritative membership and
+        // from client intents. A target is only resolved durably once.
+        let mut buffers: BTreeMap<String, BufferId> = BTreeMap::new();
+        for channel in state.joined_channels() {
+            if let Ok(buffer) = journal.resolve_buffer(BufferKind::Channel, &channel).await {
+                buffers.insert(casemapped(&channel), buffer);
+            }
+        }
+        let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestItem>(INGEST_QUEUE_CAPACITY);
         // Attachments that arrived while this generation was starting.
         for (session, client, stream) in pending_attach.drain(..).take(MAX_SESSIONS_PER_NETWORK) {
             attach_session(
@@ -499,7 +634,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &control_tx,
                         &normal_tx,
                         generation,
-                    ).await;
+                        &mut journal,
+                        &buffers,
+                    )
+                    .await;
                 }
                 writer = writer_exit => {
                     match writer {
@@ -507,6 +645,43 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         Some(Ok(Err(error))) => break Err(RuntimeError::Io(error)),
                         Some(Err(error)) => break Err(RuntimeError::Io(std::io::Error::other(error))),
                         None => break Err(RuntimeError::Protocol),
+                    }
+                }
+                item = ingest_rx.recv() => {
+                    // At most a bounded batch per turn, so history work cannot
+                    // monopolize the owner and delay a keepalive answer.
+                    if let Some(item) = item {
+                        let mut batch = vec![item];
+                        for _ in 1..INGEST_BATCH_PER_TURN {
+                            match ingest_rx.try_recv() {
+                                Ok(next) => batch.push(next),
+                                Err(_) => break,
+                            }
+                        }
+                        for item in batch {
+                            match journal.ingest(item.buffer, &item.message).await {
+                                Ok(IngestOutcome::Recorded { .. }) => self.snapshot
+                                    .send_modify(|snapshot| {
+                                        snapshot.history_recorded =
+                                            snapshot.history_recorded.saturating_add(1)
+                                    }),
+                                Ok(IngestOutcome::Skipped) => self.snapshot.send_modify(
+                                    |snapshot| {
+                                        snapshot.history_skipped =
+                                            snapshot.history_skipped.saturating_add(1)
+                                    },
+                                ),
+                                Ok(IngestOutcome::StoreUnavailable) => self.snapshot
+                                    .send_modify(|snapshot| {
+                                        snapshot.history_dropped =
+                                            snapshot.history_dropped.saturating_add(1)
+                                    }),
+                                Err(_) => self.snapshot.send_modify(|snapshot| {
+                                    snapshot.history_dropped =
+                                        snapshot.history_dropped.saturating_add(1)
+                                }),
+                            }
+                        }
                     }
                 }
                 _ = probe.tick() => {
@@ -543,12 +718,32 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 _ => { failure = Some(RuntimeError::Protocol); break; }
                             }
                         }
+                        // Resolve a newly confirmed channel to a durable buffer before
+                        // any of its lines become history-eligible. Membership is only
+                        // what the state already observed, so this adds nothing.
+                        if confirmed_self_channel(&state, &message).is_some_and(|channel| {
+                            !buffers.contains_key(&casemapped(&channel))
+                        }) && let Some(channel) = confirmed_self_channel(&state, &message) {
+                            match journal.resolve_buffer(BufferKind::Channel, &channel).await {
+                                Ok(buffer) => {
+                                    buffers.insert(casemapped(&channel), buffer);
+                                }
+                                Err(_) => {
+                                    self.snapshot.send_modify(|snapshot| {
+                                        snapshot.history_dropped =
+                                            snapshot.history_dropped.saturating_add(1)
+                                        });
+                                }
+                            }
+                        }
                         match self.apply_upstream_line(
                             &raw,
                             &message,
                             &mut state,
                             &sessions,
                             &control_tx,
+                            &buffers,
+                            &ingest_tx,
                         ) {
                             Ok(()) => {}
                             Err(error) => { failure = Some(error); break; }
@@ -675,6 +870,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     ///
     /// The event is normalized and applied once; fanout then decides per session. A
     /// session whose queue is full is detached on its own.
+    ///
+    /// A history-eligible line is also queued for durable ingestion. That queue is
+    /// bounded and non-blocking: a full queue drops the event and counts it, so
+    /// history pressure can never delay control traffic.
     #[allow(clippy::too_many_arguments)]
     fn apply_upstream_line(
         &self,
@@ -683,6 +882,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         state: &mut NetworkState,
         sessions: &BTreeMap<SessionId, SessionTask>,
         control_tx: &mpsc::Sender<Vec<u8>>,
+        buffers: &BTreeMap<String, BufferId>,
+        ingest_tx: &mpsc::Sender<IngestItem>,
     ) -> Result<(), RuntimeError> {
         match state.apply_line(message) {
             LineOutcome::Quiet => {}
@@ -707,6 +908,23 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 let _ = session;
             }
         }
+        // Only a message with a known buffer target is history-eligible. Eligibility
+        // itself is decided by the journal, not here.
+        let target = history_target(message);
+        if let Some(buffer) = target.and_then(|target| buffers.get(target))
+            && ingest_tx
+                .try_send(IngestItem {
+                    buffer: *buffer,
+                    message: message.clone(),
+                })
+                .is_err()
+        {
+            // Bounded ingestion: a refused item is dropped and counted rather than
+            // buffered. Retrying into an unbounded queue would be worse.
+            self.snapshot.send_modify(|snapshot| {
+                snapshot.history_dropped = snapshot.history_dropped.saturating_add(1)
+            });
+        }
         Ok(())
     }
 
@@ -720,6 +938,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         control_tx: &mpsc::Sender<Vec<u8>>,
         normal_tx: &mpsc::Sender<OutboundIntent>,
         generation: ConnectionGeneration,
+        journal: &mut crate::journal::HistoryJournal,
+        buffers: &BTreeMap<String, BufferId>,
     ) {
         match event {
             SessionEvent::Ended {
@@ -746,6 +966,23 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     SessionIntent::RequestProjection => {
                         if let Some(task) = sessions.get(&session) {
                             let _ = projection::project(task.handle(), state, &state.nick);
+                        }
+                        // Legacy automatic backlog runs only after the projection, so a
+                        // client sees current state before retained history.
+                        if let Some((handle, client)) = sessions
+                            .get(&session)
+                            .map(|task| (task.handle().clone(), task.client()))
+                            && crate::playback::wants_backlog(handle.capabilities())
+                        {
+                            deliver_legacy_backlog(
+                                journal,
+                                &handle,
+                                client,
+                                session,
+                                buffers,
+                                &self.snapshot,
+                            )
+                            .await;
                         }
                     }
                     SessionIntent::Quit => {
@@ -831,6 +1068,34 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         self.snapshot
             .send_modify(|snapshot| snapshot.last_error = Some("store-refused"));
     }
+}
+
+/// The conversation target a history-eligible line belongs to.
+///
+/// Only PRIVMSG and NOTICE carry history in this milestone. A status prefix (server or
+/// nick!user@host) identifies a channel target; a bare nick is a direct-message peer.
+fn history_target(message: &Message) -> Option<&str> {
+    let command = &message.command;
+    if !command.eq_ignore_ascii_case(b"PRIVMSG") && !command.eq_ignore_ascii_case(b"NOTICE") {
+        return None;
+    }
+    let target = std::str::from_utf8(message.params.first()?).ok()?;
+    let prefix = message
+        .prefix
+        .as_ref()
+        .and_then(|prefix| std::str::from_utf8(prefix).ok())
+        .map(|prefix| prefix.rsplit_once('!').map_or(prefix, |(_, rest)| rest))
+        .unwrap_or(target);
+    Some(if target.starts_with(['#', '&']) {
+        target
+    } else {
+        prefix
+    })
+}
+
+/// True when this line names a channel rather than a direct-message peer.
+fn is_channel_target(target: &str) -> bool {
+    target.starts_with(['#', '&'])
 }
 
 /// Spawns one session task and records it under its ephemeral identity.

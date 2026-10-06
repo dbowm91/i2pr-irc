@@ -72,7 +72,7 @@ impl Drop for StoredSecret {
 }
 
 /// Durable kind of a history buffer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BufferKind {
     Channel,
     Query,

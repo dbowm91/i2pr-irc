@@ -13,7 +13,7 @@ use i2pr_irc_wire::{LineDecoder, MAX_LINE_BYTES, Message, TagDirection};
 use std::io;
 use tokio::{
     io::{AsyncReadExt, ReadHalf, WriteHalf},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
@@ -81,6 +81,28 @@ impl DownstreamDisposition {
     }
 }
 
+/// One frame queued for a session's writer task.
+///
+/// A frame is either fire-and-forget or *acknowledged*. History playback must use the
+/// acknowledged form: a playback cursor may only advance after the writer reports the
+/// bytes actually reached the socket, so a crash between write and commit duplicates
+/// on restart rather than leaving a silent gap.
+#[derive(Debug)]
+pub enum QueuedFrame {
+    /// Written without confirmation.
+    Fire(Vec<u8>),
+    /// Written, then the result is reported to `ack`.
+    Ack(Vec<u8>, oneshot::Sender<io::Result<()>>),
+}
+impl QueuedFrame {
+    fn into_parts(self) -> (Vec<u8>, Option<oneshot::Sender<io::Result<()>>>) {
+        match self {
+            Self::Fire(bytes) => (bytes, None),
+            Self::Ack(bytes, ack) => (bytes, Some(ack)),
+        }
+    }
+}
+
 /// Ownership handle for one client's writer task. It is never detached.
 pub struct SessionWriter {
     exit: mpsc::Receiver<io::Result<()>>,
@@ -99,7 +121,67 @@ impl SessionWriter {
 }
 
 /// Spawns the owned writer task plus its separate bounded control/normal queues.
+///
+/// This is the M003-B/M003-C session writer: frames carry an optional acknowledgment
+/// so history playback can advance a cursor only after bytes reach the socket.
 pub fn spawn_session_writer<D: ByteStream + 'static>(
+    stream: WriteHalf<D>,
+) -> (
+    mpsc::Sender<QueuedFrame>,
+    mpsc::Sender<QueuedFrame>,
+    SessionWriter,
+) {
+    let (control_tx, mut control_rx) = mpsc::channel::<QueuedFrame>(CONTROL_QUEUE_CAPACITY);
+    let (normal_tx, mut normal_rx) = mpsc::channel::<QueuedFrame>(NORMAL_QUEUE_CAPACITY);
+    let (exit_tx, exit_rx) = mpsc::channel::<io::Result<()>>(1);
+    let handle = tokio::spawn(async move {
+        let mut stream = stream;
+        let result = loop {
+            match crate::next_queued_frame(&mut control_rx, &mut normal_rx).await {
+                Some(frame) => {
+                    let (bytes, ack) = frame.into_parts();
+                    match crate::write_frame(&mut stream, &bytes).await {
+                        Ok(()) => {
+                            // The acknowledgment is only sent after the bytes are on
+                            // the socket, so a cursor advance is never premature.
+                            if let Some(ack) = ack {
+                                let _ = ack.send(Ok(()));
+                            }
+                        }
+                        Err(error) => {
+                            let reported = std::io::Error::new(error.kind(), error.to_string());
+                            if let Some(ack) = ack {
+                                let _ = ack.send(Err(std::io::Error::new(
+                                    reported.kind(),
+                                    reported.to_string(),
+                                )));
+                            }
+                            break Err(error);
+                        }
+                    }
+                }
+                None => break Ok(()),
+            }
+        };
+        let _ = exit_tx.send(result).await;
+    });
+    (
+        control_tx,
+        normal_tx,
+        SessionWriter {
+            exit: exit_rx,
+            handle,
+        },
+    )
+}
+
+/// Spawns a writer task over raw, already-framed upstream bytes.
+///
+/// The legacy single-session path predates per-frame acknowledgment and only ever
+/// forwards already-formed bytes, so it needs no acknowledgment channel. Keeping
+/// this separate avoids widening the acknowledged session writer with a mode it
+/// never uses.
+pub fn spawn_raw_writer<D: ByteStream + 'static>(
     stream: WriteHalf<D>,
 ) -> (mpsc::Sender<Vec<u8>>, mpsc::Sender<Vec<u8>>, SessionWriter) {
     let (control_tx, mut control_rx) = mpsc::channel::<Vec<u8>>(CONTROL_QUEUE_CAPACITY);
@@ -108,7 +190,7 @@ pub fn spawn_session_writer<D: ByteStream + 'static>(
     let handle = tokio::spawn(async move {
         let mut stream = stream;
         let result = loop {
-            match crate::next_queued_frame(&mut control_rx, &mut normal_rx).await {
+            match crate::next_upstream_frame(&mut control_rx, &mut normal_rx).await {
                 Some(frame) => {
                     if let Err(error) = crate::write_frame(&mut stream, &frame).await {
                         break Err(error);

@@ -6,7 +6,9 @@
 //! upstream session and client detach never ends the upstream generation.
 pub mod catalog;
 pub mod downstream;
+pub mod journal;
 pub mod owner;
+pub mod playback;
 pub mod projection;
 pub mod session;
 pub mod state;
@@ -90,6 +92,10 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("stopped")]
     Stopped,
+    /// Two durable buffer identities would merge under the requested casemapping.
+    /// The journal fails closed rather than silently merging two histories.
+    #[error("ambiguous durable buffer target: {0}")]
+    AmbiguousBuffer(String),
 }
 #[derive(Clone)]
 pub struct Secret(String);
@@ -566,7 +572,7 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
                     match accepted {
                         Some(Ok((client, stream))) => {
                             let (read, write) = tokio::io::split(stream);
-                            let (client_control, client_normal, writer) = downstream::spawn_session_writer(write);
+                            let (client_control, client_normal, writer) = downstream::spawn_raw_writer(write);
                             session = Some(DownstreamSession::new(client, read, client_control, client_normal));
                             session_writer = Some(writer);
                             self.snapshot.send_modify(|snapshot| {
@@ -849,6 +855,7 @@ pub(crate) fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
         Err(RuntimeError::InvalidConfig) => "configuration",
         Err(RuntimeError::QueueOverloaded) => "queue-overload",
         Err(RuntimeError::GenerationExhausted) => "generation-exhausted",
+        Err(RuntimeError::AmbiguousBuffer(_)) => "ambiguous-buffer",
         Ok(()) => "stopped",
     }
 }
@@ -877,7 +884,18 @@ pub(crate) fn queue_control(
         .try_send(line.as_bytes().to_vec())
         .map_err(|_| RuntimeError::QueueOverloaded)
 }
+/// Next frame for a session writer. Control outranks normal so a saturated user
+/// queue can never delay a keepalive answer.
 pub(crate) async fn next_queued_frame(
+    control: &mut mpsc::Receiver<downstream::QueuedFrame>,
+    normal: &mut mpsc::Receiver<downstream::QueuedFrame>,
+) -> Option<downstream::QueuedFrame> {
+    tokio::select! { biased; command = control.recv() => command, command = normal.recv() => command }
+}
+
+/// Next raw upstream frame. Upstream traffic is already framed bytes, so it carries
+/// no per-frame acknowledgment state.
+pub(crate) async fn next_upstream_frame(
     control: &mut mpsc::Receiver<Vec<u8>>,
     normal: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Option<Vec<u8>> {
@@ -1167,13 +1185,13 @@ mod tests {
             .unwrap();
         control_tx.try_send(b"PONG :urgent\r\n".to_vec()).unwrap();
         assert_eq!(
-            next_queued_frame(&mut control_rx, &mut normal_rx)
+            next_upstream_frame(&mut control_rx, &mut normal_rx)
                 .await
                 .unwrap(),
             b"PONG :urgent\r\n"
         );
         assert_eq!(
-            next_queued_frame(&mut control_rx, &mut normal_rx)
+            next_upstream_frame(&mut control_rx, &mut normal_rx)
                 .await
                 .unwrap(),
             b"PRIVMSG #c :queued\r\n"

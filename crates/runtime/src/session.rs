@@ -16,10 +16,10 @@ use crate::{
 };
 use i2pr_irc_core::{ByteStream, ClientId, SessionId};
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, io};
 use tokio::{
     io::{AsyncReadExt, ReadHalf},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
@@ -66,6 +66,33 @@ pub enum SessionEvent {
     },
 }
 
+/// Per-attachment capability flags the bouncer honors when serving that client.
+///
+/// `legacy_backlog` is reserved now so a client that later negotiates `chathistory`
+/// can suppress automatic backlog without changing the session's structure. Until
+/// M003-E no client negotiates it, so every session currently receives a backlog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionCapabilities {
+    /// Deliver an automatic bounded backlog after registration.
+    pub legacy_backlog: bool,
+    /// The client will fetch history itself, so automatic backlog is suppressed.
+    pub explicit_history: bool,
+}
+impl Default for SessionCapabilities {
+    fn default() -> Self {
+        Self {
+            legacy_backlog: true,
+            explicit_history: false,
+        }
+    }
+}
+impl SessionCapabilities {
+    /// True when this session should receive an automatic backlog.
+    pub fn wants_backlog(&self) -> bool {
+        self.legacy_backlog && !self.explicit_history
+    }
+}
+
 /// Handle the owner uses to reach one session.
 ///
 /// The owner holds only bounded routing metadata, never a stream or mutable session
@@ -74,8 +101,9 @@ pub enum SessionEvent {
 pub struct SessionHandle {
     session: SessionId,
     client: ClientId,
-    control_tx: mpsc::Sender<Vec<u8>>,
-    normal_tx: mpsc::Sender<Vec<u8>>,
+    control_tx: mpsc::Sender<crate::downstream::QueuedFrame>,
+    normal_tx: mpsc::Sender<crate::downstream::QueuedFrame>,
+    capabilities: SessionCapabilities,
 }
 
 impl SessionHandle {
@@ -104,8 +132,16 @@ impl SessionHandle {
     /// owner can detach *this* client rather than stalling upstream or other clients.
     pub fn fanout(&self, bytes: Vec<u8>) -> Result<(), RuntimeError> {
         self.normal_tx
-            .try_send(bytes)
+            .try_send(crate::downstream::QueuedFrame::Fire(bytes))
             .map_err(|_| RuntimeError::QueueOverloaded)
+    }
+    /// This attachment's negotiated capabilities.
+    pub fn capabilities(&self) -> SessionCapabilities {
+        self.capabilities
+    }
+    pub fn with_capabilities(mut self, capabilities: SessionCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
@@ -140,6 +176,7 @@ impl SessionTask {
             client,
             control_tx,
             normal_tx,
+            capabilities: SessionCapabilities::default(),
         };
         let identity = session;
         let owner_handle = handle.clone();
@@ -433,11 +470,35 @@ impl<D: ByteStream> SessionReader<D> {
     }
 }
 
-fn queue_line(sender: &mpsc::Sender<Vec<u8>>, line: &str) -> Result<(), RuntimeError> {
+fn queue_line(
+    sender: &mpsc::Sender<crate::downstream::QueuedFrame>,
+    line: &str,
+) -> Result<(), RuntimeError> {
     if line.len() > i2pr_irc_wire::MAX_LINE_BYTES || !line.ends_with("\r\n") {
         return Err(RuntimeError::Protocol);
     }
     sender
-        .try_send(line.as_bytes().to_vec())
+        .try_send(crate::downstream::QueuedFrame::Fire(
+            line.as_bytes().to_vec(),
+        ))
         .map_err(|_| RuntimeError::QueueOverloaded)
+}
+
+/// Queues a frame whose delivery is reported back once the bytes reach the socket.
+pub(crate) fn queue_acknowledged(
+    handle: &SessionHandle,
+    line: &str,
+) -> Result<oneshot::Receiver<io::Result<()>>, RuntimeError> {
+    if line.len() > i2pr_irc_wire::MAX_LINE_BYTES || !line.ends_with("\r\n") {
+        return Err(RuntimeError::Protocol);
+    }
+    let (ack, response) = oneshot::channel();
+    handle
+        .normal_tx
+        .try_send(crate::downstream::QueuedFrame::Ack(
+            line.as_bytes().to_vec(),
+            ack,
+        ))
+        .map_err(|_| RuntimeError::QueueOverloaded)?;
+    Ok(response)
 }
