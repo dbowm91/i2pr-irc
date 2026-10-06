@@ -290,10 +290,6 @@ pub(crate) fn classify(kind: &i2pr_irc_store::StoreErrorKind) -> RuntimeError {
     }
 }
 
-/// Bounds the total sessions one catalog may hold at once, so many Networks cannot
-/// together produce an unbounded session population.
-pub const MAX_TOTAL_SESSIONS: usize = 1024;
-
 /// Process-wide shutdown signal shared by every supervisor.
 pub fn stop_signal() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
