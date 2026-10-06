@@ -376,6 +376,7 @@ impl Session {
 
     async fn send(&mut self, state: &NetworkState, line: &[u8]) {
         let context = DownstreamContext {
+            negotiated: std::collections::BTreeSet::new(),
             generation: ConnectionGeneration(7),
             state,
             upstream_control: &self.upstream_control,
@@ -512,6 +513,7 @@ async fn a_client_line_that_violates_the_contract_is_an_explicit_error() {
     let state = NetworkState::new("bot", &[]);
     let mut session = Session::new();
     let context = DownstreamContext {
+        negotiated: std::collections::BTreeSet::new(),
         generation: ConnectionGeneration(7),
         state: &state,
         upstream_control: &session.upstream_control,

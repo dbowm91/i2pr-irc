@@ -611,6 +611,10 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
                                 None => continue,
                             };
                             let context = DownstreamContext {
+                                negotiated: session
+                                    .as_ref()
+                                    .map(|session| session.negotiated())
+                                    .unwrap_or_default(),
                                 generation,
                                 state: &state,
                                 upstream_control: &control_tx,
@@ -2035,7 +2039,7 @@ mod tests {
             .write_all(b"CAP LS 302\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
             .await
             .unwrap();
-        let listing = read_until(&mut client, b"CAP * LS :\r\n").await;
+        let listing = read_until(&mut client, b"CAP * LS :draft/chathistory").await;
         assert!(String::from_utf8_lossy(&listing).contains("CAP * LS :"));
         let since = state.borrow().downstream_detach_total;
         client.shutdown().await.unwrap();

@@ -27,7 +27,6 @@ pub const TIMESTAMP_BYTES: usize = 24;
 /// Smallest accepted year. `0000` is rejected; the IRCv3 grammar is four digits
 /// and year zero has no meaning for a UTC civil calendar.
 pub const MIN_YEAR: u16 = 1;
-
 /// Largest accepted year, fixed by the four-digit field width.
 pub const MAX_YEAR: u16 = 9999;
 
@@ -84,6 +83,19 @@ pub struct IrcTimestamp {
 }
 
 impl IrcTimestamp {
+    /// The Unix epoch, `1970-01-01T00:00:00.000Z`.
+    ///
+    /// Useful as a total fallback where a missing value must still be well formed.
+    pub const EPOCH: Self = Self {
+        year: 1970,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        millis: 0,
+    };
+
     /// Parse the canonical wire form.
     ///
     /// Rejects anything that is not exactly `YYYY-MM-DDThh:mm:ss.sssZ`, including

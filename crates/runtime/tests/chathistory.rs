@@ -8,8 +8,8 @@ use i2pr_irc_core::{
 use i2pr_irc_runtime::{
     capability::{DownstreamCapabilities, UpstreamCapabilities},
     chathistory::{
-        self, CHATHISTORY_CAPABILITY, HistoryQueryRequest, HistoryRefusal, MessageReference,
-        ParsedMarker, ParsedRequest, READ_MARKER_CAPABILITY,
+        self, CHATHISTORY_CAPABILITY, HistoryQueryRequest, HistoryRefusal, MarkerRefusal,
+        MessageReference, ParsedMarker, ParsedRequest, READ_MARKER_CAPABILITY,
     },
     journal::{HistoryJournal, IngestOutcome},
     session::SessionCapabilities,
@@ -49,6 +49,13 @@ async fn journal_for(handle: &StoreHandle) -> HistoryJournal {
     )
 }
 
+/// A canonical `server-time` value for an epoch-second reading.
+fn stamp(epoch_seconds: i64) -> String {
+    i2pr_irc_wire::IrcTimestamp::from_unix_millis(epoch_seconds * 1_000)
+        .expect("representable")
+        .to_string()
+}
+
 fn parse(raw: &str) -> Message {
     Message::parse(raw.as_bytes()).expect("parses")
 }
@@ -62,7 +69,12 @@ async fn record(
     let mut recorded = Vec::with_capacity(count);
     for index in 0..count {
         let msgid = format!("m{index}");
-        let line = format!("@msgid={msgid} :a!b@c PRIVMSG #room :message {index}\r\n");
+        // A real conformant `time` tag, so reference resolution is exercised against
+        // the protocol representation rather than the local receive clock.
+        let line = format!(
+            "@time={};msgid={msgid} :a!b@c PRIVMSG #room :message {index}\r\n",
+            stamp(1_700_000_000 + i64::try_from(index).expect("small"))
+        );
         if let IngestOutcome::Recorded { event } = journal
             .ingest(buffer, &parse(&line))
             .await
@@ -231,23 +243,70 @@ async fn results_are_ordered_by_local_identity_not_by_timestamp() {
 }
 
 #[tokio::test]
-async fn an_unsupported_subcommand_is_refused_rather_than_degraded() {
+async fn an_unknown_subcommand_is_refused_rather_than_degraded() {
     let (_store, handle) = store();
     let journal = journal_for(&handle).await;
-    let parsed =
-        chathistory::parse_chathistory(&parse("CHATHISTORY AROUND #room 10 timestamp=1\r\n"));
-    assert_eq!(
-        parsed,
-        ParsedRequest::Refused(HistoryRefusal::UnsupportedSubcommand),
-        "AROUND needs a bounded time index this milestone does not build"
-    );
-    // The refusal happens at parse time, before any store work, so the adapter never
-    // produces a plausible-looking answer for a subcommand it does not implement.
-    assert!(matches!(
-        chathistory::parse_chathistory(&parse("CHATHISTORY AROUND #room 10 timestamp=1\r\n")),
-        ParsedRequest::Refused(HistoryRefusal::UnsupportedSubcommand)
-    ));
+    for raw in [
+        "CHATHISTORY FROBNICATE #room * 10\r\n",
+        "CHATHISTORY SIDEWAYS #room msgid=m0 10\r\n",
+    ] {
+        assert_eq!(
+            chathistory::parse_chathistory(&parse(raw)),
+            ParsedRequest::Refused(HistoryRefusal::UnknownSubcommand),
+            "{raw}"
+        );
+    }
     let _ = &journal;
+}
+
+#[tokio::test]
+async fn around_brackets_a_selector_within_its_limit() {
+    let (_store, handle) = store();
+    let mut journal = journal_for(&handle).await;
+    let buffer = journal
+        .resolve_buffer(BufferKind::Channel, "#room")
+        .await
+        .expect("buffer");
+    record(&mut journal, buffer, 9).await;
+
+    // AROUND is a real bounded query, not a refusal: the total returned never exceeds
+    // the requested limit, and the selector's own message is included.
+    for limit in [1usize, 2, 4, 6] {
+        let reply = chathistory::execute(
+            &journal,
+            buffer,
+            &HistoryQueryRequest::Around {
+                reference: MessageReference::MsgId("m4".to_owned()),
+                limit,
+            },
+        )
+        .await
+        .expect("executes");
+        assert!(
+            reply.lines.len() <= limit,
+            "AROUND returned {} lines for limit {limit}",
+            reply.lines.len()
+        );
+    }
+
+    // A 6-message window around the middle event contains that event.
+    let reply = chathistory::execute(
+        &journal,
+        buffer,
+        &HistoryQueryRequest::Around {
+            reference: MessageReference::MsgId("m4".to_owned()),
+            limit: 6,
+        },
+    )
+    .await
+    .expect("executes");
+    assert!(
+        reply
+            .lines
+            .iter()
+            .any(|line| String::from_utf8_lossy(line).contains("message 4")),
+        "AROUND must include the selected message"
+    );
 }
 
 #[tokio::test]
@@ -270,13 +329,18 @@ async fn a_stale_reference_fails_deterministically() {
         },
     )
     .await;
-    assert_eq!(outcome.err(), Some(HistoryRefusal::StaleReference));
+    assert_eq!(outcome.err(), Some(HistoryRefusal::HistoryUnavailable));
 
     // A timestamp beyond everything retained resolves to the newest event.
-    let resolved =
-        chathistory::resolve(&journal, buffer, &MessageReference::Timestamp(i64::MAX / 2))
-            .await
-            .expect("resolves");
+    let resolved = chathistory::resolve(
+        &journal,
+        buffer,
+        &MessageReference::Timestamp(
+            i2pr_irc_wire::IrcTimestamp::parse_str("9999-12-31T23:59:59.999Z").expect("parses"),
+        ),
+    )
+    .await
+    .expect("resolves");
     assert!(resolved.0 > 0);
 }
 
@@ -352,13 +416,19 @@ async fn a_read_marker_moves_only_forward_and_is_shared_per_buffer() {
         .expect("buffer");
     let recorded = record(&mut journal, buffer, 4).await;
 
-    let ParsedMarker::Set(reference) =
-        chathistory::parse_markread(&parse(&format!("MARKREAD #room {}\r\n", recorded[2].1)))
-            .expect("parses")
-    else {
+    let ParsedMarker::Set { target, timestamp } = chathistory::parse_markread(&parse(&format!(
+        "MARKREAD #room timestamp={}\r\n",
+        stamp(1_700_000_002)
+    )))
+    .expect("parses") else {
         panic!("expected a set marker")
     };
-    let resolved = chathistory::resolve(&journal, buffer, &reference)
+    assert_eq!(target, "#room");
+    assert_eq!(
+        timestamp,
+        i2pr_irc_wire::IrcTimestamp::parse_str(&stamp(1_700_000_002)).expect("parses")
+    );
+    let resolved = chathistory::resolve(&journal, buffer, &MessageReference::Timestamp(timestamp))
         .await
         .expect("resolves");
     assert_eq!(
@@ -412,7 +482,7 @@ async fn a_marker_reference_into_pruned_history_clamps_rather_than_failing() {
 }
 
 #[tokio::test]
-async fn a_markread_clear_is_accepted_without_touching_upstream() {
+async fn a_markread_get_is_answered_locally_without_touching_upstream() {
     let (_store, handle) = store();
     let mut journal = journal_for(&handle).await;
     let buffer = journal
@@ -421,8 +491,13 @@ async fn a_markread_clear_is_accepted_without_touching_upstream() {
         .expect("buffer");
     record(&mut journal, buffer, 2).await;
     assert_eq!(
-        chathistory::parse_markread(&parse("MARKREAD *\r\n")),
-        Ok(ParsedMarker::Clear)
+        chathistory::parse_markread(&parse("MARKREAD #room\r\n")),
+        Ok(ParsedMarker::Get)
+    );
+    // A client cannot erase a marker by sending the unknown-marker sentinel.
+    assert_eq!(
+        chathistory::parse_markread(&parse("MARKREAD #room *\r\n")).err(),
+        Some(MarkerRefusal::InvalidTimestamp)
     );
     // Read state is local: nothing here is written upstream, and the marker lives in
     // the operator's own durable store.
@@ -434,12 +509,15 @@ async fn a_markread_clear_is_accepted_without_touching_upstream() {
 #[test]
 fn every_refusal_is_deterministic_and_names_a_reason() {
     for refusal in [
-        HistoryRefusal::UnsupportedSubcommand,
-        HistoryRefusal::InvalidLimit,
-        HistoryRefusal::InvalidReference,
+        HistoryRefusal::UnknownSubcommand,
+        HistoryRefusal::MissingParameters,
         HistoryRefusal::TooManyParameters,
-        HistoryRefusal::StaleReference,
+        HistoryRefusal::InvalidTimestamp,
+        HistoryRefusal::InvalidReference,
+        HistoryRefusal::InvalidLimit,
+        HistoryRefusal::UnsupportedReferenceType,
         HistoryRefusal::NoSuchBuffer,
+        HistoryRefusal::HistoryUnavailable,
     ] {
         let text = refusal.to_string();
         assert!(!text.is_empty());

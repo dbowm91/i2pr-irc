@@ -6,6 +6,7 @@
 //! handles, never upstream generation completion.
 use crate::{
     CONTROL_QUEUE_CAPACITY, IntentClass, NORMAL_QUEUE_CAPACITY, OutboundIntent, RuntimeError,
+    chathistory::{CHATHISTORY_CAPABILITY, READ_MARKER_CAPABILITY},
     state::NetworkState,
 };
 use i2pr_irc_core::{ByteStream, ClientId, ConnectionGeneration};
@@ -16,6 +17,37 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+
+/// Capabilities this bouncer can genuinely serve for a local client.
+///
+/// Deliberately short. Advertising a capability the session does not implement would
+/// make `CAP LS` a lie the client has no way to detect.
+pub const DOWNSTREAM_ADVERTISED: &[&str] = &[CHATHISTORY_CAPABILITY, READ_MARKER_CAPABILITY];
+
+/// Ceiling on capabilities one client may hold negotiated.
+pub const MAX_NEGOTIATED_CAPABILITIES: usize = 8;
+
+/// The capabilities a `CAP REQ` line asks for, bounded and upper-cased.
+fn requested_capabilities(message: &Message) -> Vec<String> {
+    message
+        .params
+        .iter()
+        .skip(1)
+        .filter_map(|param| {
+            // The lossy string is a temporary, so each piece is owned before the
+            // next parameter is visited.
+            let text = String::from_utf8_lossy(param).into_owned();
+            (!text.is_empty()).then_some(text)
+        })
+        .flat_map(|text| {
+            text.split(' ')
+                .filter(|name| !name.is_empty())
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .take(MAX_NEGOTIATED_CAPABILITIES * 2)
+        .collect()
+}
 
 /// Maximum complete tagged line accepted from one local client.
 pub const MAX_CLIENT_LINE: usize = i2pr_irc_wire::MAX_TAGGED_LINE_BYTES;
@@ -217,6 +249,12 @@ pub struct DownstreamContext<'a> {
     pub state: &'a NetworkState,
     pub upstream_control: &'a mpsc::Sender<Vec<u8>>,
     pub upstream_normal: &'a mpsc::Sender<OutboundIntent>,
+    /// Capabilities this client successfully negotiated with the bouncer.
+    ///
+    /// An owned snapshot rather than a borrow: the session owns the live set and is
+    /// borrowed mutably for the duration of the call. It is bounded by
+    /// [`MAX_NEGOTIATED_CAPABILITIES`], so cloning it is not a scaling concern.
+    pub negotiated: std::collections::BTreeSet<String>,
 }
 
 /// One attached local IRC client.
@@ -227,6 +265,11 @@ pub struct DownstreamSession<D: ByteStream> {
     control_tx: mpsc::Sender<Vec<u8>>,
     normal_tx: mpsc::Sender<Vec<u8>>,
     registered_nick: Option<String>,
+    /// Capabilities this client successfully negotiated with the bouncer.
+    ///
+    /// Bounded by [`MAX_NEGOTIATED_CAPABILITIES`]; a client cannot make this set
+    /// grow without limit by sending repeated `CAP REQ` lines.
+    negotiated: std::collections::BTreeSet<String>,
     user_received: bool,
     /// A client that issued `CAP LS`/`CAP REQ` before registration is still
     /// negotiating: it must send `CAP END` before any welcome or state projection.
@@ -247,11 +290,17 @@ impl<D: ByteStream> DownstreamSession<D> {
             control_tx,
             normal_tx,
             registered_nick: None,
+            negotiated: std::collections::BTreeSet::new(),
             user_received: false,
             cap_negotiating: false,
             ready: false,
         }
     }
+    /// Capabilities this client successfully negotiated, for projection decisions.
+    pub fn negotiated(&self) -> std::collections::BTreeSet<String> {
+        self.negotiated.clone()
+    }
+
     pub fn client(&self) -> ClientId {
         self.client
     }
@@ -324,31 +373,74 @@ impl<D: ByteStream> DownstreamSession<D> {
                 if !self.ready {
                     self.cap_negotiating = true;
                 }
-                match subcommand.as_str() {
-                    "REQ" => queue_line(
-                        &self.normal_tx,
-                        &format!(":bouncer CAP {target} NAK :Unsupported capabilities\r\n"),
-                    ),
-                    _ => queue_line(&self.normal_tx, &format!(":bouncer CAP {target} LS :\r\n")),
-                }
             }
             "END" => {
                 if !self.ready {
                     self.cap_negotiating = false;
                 }
-                Ok(())
+                return Ok(());
             }
-            "LIST" => queue_line(
-                &self.normal_tx,
-                &format!(":bouncer CAP {target} LIST :\r\n"),
-            ),
+            "LIST" => {
+                return queue_line(
+                    &self.normal_tx,
+                    &format!(
+                        ":bouncer CAP {target} LIST :{}\r\n",
+                        self.joined_capabilities()
+                    ),
+                );
+            }
             // `ACK`/`NAK` are server-to-client; receiving one is a client protocol
             // error, not a negotiation step.
-            _ => queue_line(
-                &self.normal_tx,
-                ":bouncer 410 * CAP :Invalid CAP subcommand\r\n",
-            ),
+            _ => {
+                return queue_line(
+                    &self.normal_tx,
+                    ":bouncer 410 * CAP :Invalid CAP subcommand\r\n",
+                );
+            }
         }
+
+        if subcommand == "REQ" {
+            // A request is acknowledged only when *every* capability in it is one
+            // this bouncer genuinely implements downstream. A partial ACK would be a
+            // promise the session cannot keep.
+            let requested = requested_capabilities(message);
+            let supported = !requested.is_empty()
+                && requested
+                    .iter()
+                    .all(|name| DOWNSTREAM_ADVERTISED.contains(&name.as_str()));
+            if !supported {
+                return queue_line(
+                    &self.normal_tx,
+                    &format!(":bouncer CAP {target} NAK :Unsupported capabilities\r\n"),
+                );
+            }
+            for name in &requested {
+                if self.negotiated.len() < MAX_NEGOTIATED_CAPABILITIES {
+                    self.negotiated.insert(name.clone());
+                }
+            }
+            return queue_line(
+                &self.normal_tx,
+                &format!(":bouncer CAP {target} ACK :{}\r\n", requested.join(" ")),
+            );
+        }
+
+        queue_line(
+            &self.normal_tx,
+            &format!(
+                ":bouncer CAP {target} LS :{}\r\n",
+                DOWNSTREAM_ADVERTISED.join(" ")
+            ),
+        )
+    }
+
+    /// The capabilities this client currently holds negotiated.
+    fn joined_capabilities(&self) -> String {
+        self.negotiated
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn handle_registration(
@@ -459,6 +551,18 @@ impl<D: ByteStream> DownstreamSession<D> {
                 &self.normal_tx,
                 &format!(":bouncer 005 {target} {token} :are supported by this server\r\n"),
             )?;
+        }
+        // The bouncer's own history surface is advertised only to clients that
+        // actually negotiated it, and only for the subcommands this build really
+        // implements. Advertising `CHATHISTORY` to a client that never negotiated the
+        // capability would invite a request the client has no batch support to read.
+        if ctx.negotiated.contains(CHATHISTORY_CAPABILITY) {
+            for token in crate::chathistory::isupport_tokens() {
+                queue_line(
+                    &self.normal_tx,
+                    &format!(":bouncer 005 {target} {token} :are supported by this server\r\n"),
+                )?;
+            }
         }
         for channel in ctx.state.joined_channels() {
             queue_line(
@@ -577,6 +681,7 @@ mod tests {
         /// Borrows disjoint fields so the session can be used mutably.
         fn send(&mut self, line: &[u8]) -> Result<DownstreamDisposition, RuntimeError> {
             let context = DownstreamContext {
+                negotiated: self.session.negotiated.clone(),
                 generation: ConnectionGeneration(7),
                 state: &self.state,
                 upstream_control: &self.upstream_control,
@@ -904,6 +1009,69 @@ mod tests {
             b":bouncer PONG bouncer :local\r\n"
         );
         assert!(!harness.session.is_ready());
+    }
+
+    #[test]
+    fn cap_acknowledges_only_capabilities_the_session_really_implements() {
+        let mut harness = Harness::new(NetworkState::new("bot", &["#room".into()]));
+        harness.register();
+
+        // A supported capability is acknowledged and retained.
+        harness
+            .send(b"CAP REQ :draft/chathistory\r\n")
+            .expect("accepted");
+        let out = harness.drain_normal();
+        assert!(
+            out.contains("ACK :draft/chathistory"),
+            "a supported capability must be acknowledged: {out}"
+        );
+        assert!(
+            harness
+                .session
+                .negotiated()
+                .contains(crate::chathistory::CHATHISTORY_CAPABILITY),
+            "the acknowledged capability must be retained for projection decisions"
+        );
+
+        // An unsupported one is refused, and a mixed request is refused whole rather
+        // than partially acknowledged.
+        harness.send(b"CAP REQ :sasl/PLAIN\r\n").expect("accepted");
+        assert!(harness.drain_normal().contains("NAK"));
+        harness
+            .send(b"CAP REQ :draft/chathistory sasl/PLAIN\r\n")
+            .expect("accepted");
+        assert!(
+            harness.drain_normal().contains("NAK"),
+            "a partially-supported request must be refused, not half-acknowledged"
+        );
+    }
+
+    #[test]
+    fn chathistory_isupport_is_advertised_only_to_a_negotiated_client() {
+        // A client that never negotiated the capability must not be told it exists.
+        let mut harness = Harness::new(NetworkState::new("bot", &["#room".into()]));
+        harness.register();
+        harness.send(b"JOIN #room\r\n").expect("accepted");
+        let out = harness.drain_normal();
+        assert!(
+            !out.contains("CHATHISTORY="),
+            "an un-negotiated client must not receive the history ISUPPORT: {out}"
+        );
+
+        let mut harness = Harness::new(NetworkState::new("bot", &["#room".into()]));
+        harness
+            .send(b"CAP REQ :draft/chathistory\r\n")
+            .expect("accepted");
+        // Registration only completes after the negotiation round is closed.
+        harness.send(b"CAP END\r\n").expect("accepted");
+        harness.drain_normal();
+        harness.register();
+        harness.send(b"JOIN #room\r\n").expect("accepted");
+        let out = harness.drain_normal();
+        assert!(
+            out.contains("CHATHISTORY=50") && out.contains("MSGREFTYPES="),
+            "a negotiated client must receive the truthful history ISUPPORT: {out}"
+        );
     }
 
     #[test]

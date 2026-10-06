@@ -1076,7 +1076,7 @@ async fn read_marker_and_cursor_survive_retention_and_clamp_monotonically() {
         )
         .await
         .err(),
-        Some(i2pr_irc_runtime::chathistory::HistoryRefusal::StaleReference)
+        Some(i2pr_irc_runtime::chathistory::HistoryRefusal::HistoryUnavailable)
     );
 }
 
