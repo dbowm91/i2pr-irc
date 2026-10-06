@@ -48,7 +48,7 @@ no single mechanism suite would catch it.
 | Reviewed CTCP policy is complete | `the_directional_policy_is_deny_by_default` | Pass. Both directions are allowlists; everything else is refused, including any command word added later. |
 | Local client software/version/time/environment cannot leak through CTCP auto-replies | `a_client_metadata_reply_never_reaches_the_upstream_server`; `an_upstream_ctcp_ping_is_answered_by_the_bouncer_itself`; `no_build_router_or_version_string_is_exposed_by_default` | Pass. The auto-answer is a fixed `NOTICE` echoing only the probe's own token. |
 | Client-only tags follow explicit deny policy | `client_tags_are_denied_except_the_bouncers_own_label`; `a_flood_of_denied_tags_costs_no_extra_queue_capacity` | Pass. Tag mediation runs on every forwarded frame, not only chat. |
-| CLIENTTAGDENY is truthful | `the_advertised_client_tag_deny_is_truthful`; `the_capability_set_and_the_tag_deny_agree_for_every_negotiating_client` | Pass. The advertised `*` is checked against the mediator over all 14 named client-only tags plus one the build has never seen, for every negotiating client mix. |
+| CLIENTTAGDENY is truthful | `the_advertised_client_tag_deny_is_truthful`; `the_capability_set_and_the_tag_deny_agree_for_every_negotiating_client` | Pass. The advertised `*` is checked against the mediator over all 15 named client-only tags plus one the build has never seen, for every negotiating client mix. |
 | No ambient host identity values become IRC-visible | `no_host_environment_value_reaches_the_wire_or_a_diagnostic` | Pass. Real host values are used as sentinels, so a match would be attributable rather than merely suspicious. |
 | Secret / redaction tests pass | `a_sasl_secret_never_reaches_a_diagnostic`; `qualification_diagnostics_carry_no_secret_or_endpoint_material`; `no_durable_row_records_a_session_id_or_generation` | Pass. |
 | Raw protocol logging is disabled by default | `raw_protocol_logging_is_absent_from_every_production_path` | Pass, structurally. No logging facade is a dependency of any production crate, and no production source writes to stdout or stderr. |
@@ -115,8 +115,8 @@ rather than left implicit.
 
 | Claim | Evidence | Result |
 |---|---|---|
-| Global scheduler gates startup and retry | 19 tests in `reconnect_budget.rs` | Pass. |
-| Connect concurrency bounded | `MAX_IN_FLIGHT_CONNECTS = 4`; burst gate campaign | Pass. Peak in-flight was 4. |
+| Global scheduler gates startup and retry | 19 tests in `reconnect_budget.rs` | Pass for the production path (`catalog::NetworkSupervisor` over `owner::NetworkOwner`). See UF-015-1 for the legacy supervisor, which is outside it. |
+| Connect concurrency bounded | `MAX_IN_FLIGHT_CONNECTS = 4`; burst gate campaign | Pass on the production path. Peak in-flight was 4. |
 | Start rate bounded | `CONNECT_TOKEN_INTERVAL = 2s`, `MAX_CONNECT_BURST = 4` | Pass. |
 | Fairness / no starvation | FIFO waiter queue, one waiter per Network | Pass. |
 | Terminal failures do not consume infinite retries | `classify` returns a terminal decision | Pass. |
@@ -161,8 +161,13 @@ Carried from `017-status.md`, where the campaigns ran. Every campaign settled to
 
 No hidden unbounded structure exists: the ledger stores current-and-peak only, so its own
 memory is constant regardless of run time or campaign count. Every queue, batch set, route
-table, and waiter queue has an explicit ceiling, and every ceiling is asserted somewhere in
-the workspace's 464 tests.
+table, and waiter queue has an explicit ceiling.
+
+One exception is recorded as UF-018-1 below: `catalog::MAX_TOTAL_SESSIONS` is declared but
+neither enforced nor asserted. The session population is still bounded — by
+`MAX_SUPERVISED_NETWORKS` (64, enforced at `catalog.rs:212`) times `MAX_SESSIONS_PER_NETWORK`
+(64, enforced in `owner.rs`) — but that product is 4096, not the 1024 the unused constant
+declares.
 
 ## Static network-boundary evidence
 
@@ -183,8 +188,9 @@ it.
 
 **No third-party production dependency was added during M004.** The entire `Cargo.lock` delta
 across the milestone is one line: `i2pr-irc-fuzz-smoke` gaining the first-party path
-dependency `i2pr-irc-runtime`. That change is deliberate — fuzzing a model of the mediation
-policy would prove nothing about shipping code.
+dependency `i2pr-irc-runtime`. That change landed in M004-C (`a0e13e3`), not in this pass:
+`git diff cffd8db HEAD -- Cargo.lock` is empty. It is deliberate — fuzzing a model of the
+mediation policy would prove nothing about shipping code.
 
 The full external dependency set is unchanged from M003: `tokio`, `thiserror`, `async-trait`,
 `base64`, `zeroize`, and `rusqlite` (M003-era, `bundled`, `default-features = false`).
@@ -241,10 +247,19 @@ resolves.
 
 | ID | Severity | Finding |
 |---|---|---|
-| UF-015-1 | low | The legacy `NetworkSupervisor` in `crates/runtime/src/lib.rs:222` is gated by neither the `ReconnectScheduler` nor the resource ledger. It is a `pub struct` at the crate root and so is compiled into the shipped rlib, but nothing outside its own `#[cfg(test)]` module constructs it — the production path is `catalog::NetworkSupervisor` over `owner::NetworkOwner`. It must be gated or removed before any promotion to production. |
+| UF-015-1 | medium | The legacy `NetworkSupervisor` at `crates/runtime/src/lib.rs:222` is gated by neither the `ReconnectScheduler` nor the resource ledger. It is a `pub struct` at the crate root with no `cfg` attribute, so it is compiled into the shipped rlib and appears in the generated public API; its `pub fn serve` performs a second unconditional upstream connect at `lib.rs:290`. Only its *call sites* live inside `#[cfg(test)]`, and nothing outside `lib.rs` constructs it — the production path is `catalog::NetworkSupervisor` over `owner::NetworkOwner`. Because the type is public API, "no test constructs it" is not the same as "no production code can". It must be gated or deleted before any promotion to production. |
 | UF-017-1 | low | `NetworkOwner::serve` constructs `Backoff` inline (base 1s, cap 300s, jitter 20%) rather than injecting it, so churn campaigns must pin virtual time and advance by the cap. Not a defect; it constrains testability. |
+| UF-018-1 | low | `catalog::MAX_TOTAL_SESSIONS` (`catalog.rs:295`) is declared with a doc comment claiming it bounds a catalog's total sessions, but no production code reads it and no test asserts it. The effective bound is `MAX_SUPERVISED_NETWORKS` × `MAX_SESSIONS_PER_NETWORK` = 4096, not the 1024 declared. The population is bounded; this constant is a stale duplicate of a bound that is enforced elsewhere. It should be enforced or deleted. |
 
-Neither is blocking, and neither is anonymity-, egress-, herd-, routing-, or resource-bound.
+The session population is bounded without UF-018-1 (the product of two enforced ceilings),
+so none of the three is an unbounded-resource finding. None is blocking, and none is
+anonymity-, egress-, herd-, routing-, or resource-bound.
+
+UF-015-1 is the only one that touches an egress path: the legacy supervisor holds a second
+ungated upstream connect. It is not reachable from the production entry point and nothing
+outside its own test module constructs it, which is why it does not block closure — but it is
+recorded at medium rather than low because the type is public API, so the guarantee is "no
+production code calls this today" rather than "this cannot be called".
 
 Two audit observations were examined and deliberately not changed:
 
@@ -255,6 +270,34 @@ Two audit observations were examined and deliberately not changed:
 - `crates/runtime/tests/privacy.rs:612` reads real host environment values as sentinels.
   That is intentional: real values make a leak attributable rather than merely suspicious,
   and the assertion is that they are *absent* everywhere.
+
+## Independent audit
+
+An independent read-only audit of this record against the repository checked every cited test
+name and assertion, every constant value and type, the test-count figures at both commits, the
+dependency and MSRV analysis, the boundary guard, and both unresolved findings. It confirmed
+the substance — all cited tests exist and assert what is attributed to them, the constants are
+exactly as stated, the 464/17 and 458/16 figures reproduce, and the dependency analysis is
+accurate.
+
+It found four overstatements, all corrected above: UF-015-1's "(test-only)" wording (D1), the
+blanket "every ceiling is asserted" claim (D2), the Cargo.lock framing relative to the
+record's stated baseline (D3), and an off-by-one on the named tag count (D5). The resulting
+scoping of the reconnect matrix rows follows from D1 (D4).
+
+Two further observations were informational and are recorded rather than changed:
+
+- `a_command_refused_by_the_upstream_queue_is_reported_and_never_replayed` asserts the
+  *reporting* half directly; the *non-replay* half is structural (a refused frame is never
+  enqueued), not separately asserted.
+- `qualification_diagnostics_carry_no_secret_or_endpoint_material` renders
+  `NetworkSnapshot::default()`. The populated-snapshot case is covered by the new
+  `a_full_generation_never_leaks...` composition test instead.
+
+One coverage gap it found was real and is fixed: the new logging test scanned manifests and
+sources over four crates while omitting `fuzz-smoke`, even though this milestone added
+`fuzz-smoke` to the boundary guard's list and it calls production mediation code. The test now
+covers it.
 
 ## Defects found and fixed during this pass
 
@@ -268,6 +311,10 @@ affected nothing, and `TagDisposition::Rejected` could never be constructed. Bot
 removed. This changes no behaviour: only `label` survives mediation, and it did so before
 and after.
 
+**3. The logging test did not cover `fuzz-smoke`.** Found by the independent audit. The test
+claimed to cover "every production path" while scanning four crates, omitting the one crate
+this milestone had just made a first-party exerciser of production code. Now scanned.
+
 ## Stop conditions
 
 Plan 018 section 8 forbids closing M004 with any of the following. None is present:
@@ -278,7 +325,7 @@ Plan 018 section 8 forbids closing M004 with any of the following. None is prese
 | client-dependent upstream fingerprint | None. Registration and CTCP visibility are client-independent. |
 | environment/secret leakage | None. See the negative matrix. |
 | dead response-routing machinery | None. Routes open, route, and close on live traffic. |
-| unbounded reconnect admission | None. Four explicit ceilings. |
+| unbounded reconnect admission | None on the production path. Four explicit ceilings. The legacy supervisor in UF-015-1 sits outside them. |
 | starvation | None. FIFO fairness proven. |
 | task/queue/resource leak | None. Every campaign settles to baseline. |
 | hidden replay of ambiguous user traffic | None. Refusals are reported, never retried; intents are generation-stamped. |

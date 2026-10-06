@@ -502,7 +502,7 @@ fn raw_protocol_logging_is_absent_from_every_production_path() {
 
     // 1. No logging facade is a dependency of any production crate. A facade would let a
     //    raw frame reach a subscriber the Operator configured by accident.
-    for crate_dir in ["wire", "core", "store", "runtime", "testkit"] {
+    for crate_dir in ["wire", "core", "store", "runtime", "testkit", "fuzz-smoke"] {
         let manifest = root.join("crates").join(crate_dir).join("Cargo.toml");
         let text = std::fs::read_to_string(&manifest)
             .unwrap_or_else(|error| panic!("{}: {error}", manifest.display()));
@@ -525,7 +525,7 @@ fn raw_protocol_logging_is_absent_from_every_production_path() {
     //    only way raw protocol reaches a console without a logging dependency, and it is
     //    exactly the leak the claim forbids.
     let mut checked = 0usize;
-    for crate_dir in ["wire", "core", "store", "runtime"] {
+    for crate_dir in ["wire", "core", "store", "runtime", "fuzz-smoke"] {
         let src = root.join("crates").join(crate_dir).join("src");
         for entry in walk(&src) {
             let text = std::fs::read_to_string(&entry)
