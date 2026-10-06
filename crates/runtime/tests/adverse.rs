@@ -579,12 +579,60 @@ async fn wait_for(id: NetworkId, snapshot: &watch::Receiver<NetworkSnapshot>, ph
 /// loop.
 ///
 /// This is the one claim that cannot be proved by reading a counter at the end: a spin
-/// would also produce many attempts, just far faster than backoff allows. The test
-/// therefore pins virtual time, so "fast" and "at the scheduled rate" stop being
-/// distinguishable by wall-clock luck.
+/// would also produce many attempts, just far faster than backoff allows.
+///
+/// Corrective 019 found this campaign was vacuous. It advanced virtual time once by
+/// 600s and asserted `NETWORKS <= attempts <= NETWORKS * 32`. `tokio::time::advance`
+/// performs a single poll, so a timer re-armed during that poll never fires: the chain
+/// `connect -> backoff -> retry` advances one link per `advance()` call. The campaign
+/// therefore measured **4 attempts for 4 Networks -- exactly one each**, landing on its
+/// own lower bound and 32x under its upper bound. A spin was indistinguishable from
+/// correct backoff, which is the one thing this test exists to rule out.
+///
+/// The repair is to step time in a loop so the retry chain is actually walked. Attempts
+/// then scale with both virtual time and the number of polls, because each poll is one
+/// chance for a re-armed timer to fire:
+///
+/// | steps x step | virtual time | attempts |
+/// |---|---|---|
+/// | 1 x 600s (the old campaign) | 600s | 4 -- vacuous |
+/// | 1000 x 100ms | 100s | 4 |
+/// | 500 x 600ms | 300s | 12 |
+/// | 1000 x 300ms | 300s | 12 |
+/// | 1000 x 600ms | 600s | 20 |
+/// | 2000 x 600ms | 1200s | 32 |
+/// | 5000 x 600ms (chosen) | 3000s | **52** |
+/// | 20000 x 600ms | 12000s | 141 |
+///
+/// Those figures are deterministic, not lucky: `fleet_budget` fixes the jitter seed and
+/// `jitter_entropy` is a pure function of Network, generation, and seed, so the campaign
+/// reproduces exactly.
+///
+/// **The ceiling below is mutation-verified, which is what the original was not.** Under
+/// the minimal mutation that removes backoff entirely -- `base` and `cap` set to zero in
+/// `owner.rs`, nothing else changed -- the attempt counts are:
+///
+/// | steps | with backoff | backoff removed |
+/// |---|---|---|
+/// | 1000 | 20 | 20 |
+/// | 2000 | 32 | 40 |
+/// | 5000 | 52 | 100 |
+/// | 20000 | 141 | 400 |
+///
+/// The two curves start together, so a short campaign cannot separate them at all: at
+/// 1000 steps the old-style bound would have passed a spin. They diverge as polls
+/// accumulate, because a removed backoff retries once per poll while a real one waits for
+/// its timer. At 5000 steps the gap is wide enough to state a real ceiling.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_provider_produces_a_bounded_number_of_attempts() {
     const NETWORKS: usize = 4;
+    /// 5000 polls of 600ms: enough for the backoff chain to retry repeatedly and for a
+    /// spin to separate from it, and deterministic so the ceiling can be tight.
+    const STEPS: usize = 5000;
+    const STEP_MS: u64 = 600;
+    /// Measured 52 (13 per Network). A backoff-removed run measures 100, so this
+    /// ceiling sits above the real schedule and below a spin.
+    const MAX_ATTEMPTS: usize = NETWORKS * 16;
     let (_store, store_handle) = store();
     let provider = Arc::new(GateProvider::new());
     // No outcomes queued at all: every attempt fails immediately as unavailable.
@@ -622,18 +670,27 @@ async fn a_stalled_provider_produces_a_bounded_number_of_attempts() {
         members
     };
 
-    // Long enough to cover many backoff intervals if the loop were tight, short enough
-    // that a healthy run stays fast.
-    tokio::time::advance(Duration::from_secs(600)).await;
+    // Walk the clock in bounded steps so `connect -> backoff -> retry` is exercised
+    // repeatedly rather than once. A single large advance would move the clock past
+    // every deadline at once and exercise exactly one retry, which is what made the
+    // original campaign vacuous.
+    for _ in 0..STEPS {
+        tokio::time::advance(Duration::from_millis(STEP_MS)).await;
+    }
 
     let attempts = provider.requested();
     assert!(
-        attempts <= NETWORKS * 32,
-        "a stalled provider produced {attempts} attempts, which is a spin rather than a backoff"
+        attempts > NETWORKS,
+        "every Network must have retried at least once, not merely tried once: saw \
+         {attempts} attempts for {NETWORKS} Networks, which is what a stalled provider \
+         looks like when the retry chain never runs"
     );
     assert!(
-        attempts >= NETWORKS,
-        "every Network must have tried at least once, saw {attempts}"
+        attempts <= MAX_ATTEMPTS,
+        "a stalled provider produced {attempts} attempts, which is a spin rather than a \
+         backoff: with backoff removed this campaign measures 100, and the ceiling is \
+         {MAX_ATTEMPTS} over {}s of virtual time",
+        STEPS * STEP_MS as usize / 1000
     );
     assert!(
         resources.snapshot().current.in_flight_connects <= MAX_IN_FLIGHT_CONNECTS,
