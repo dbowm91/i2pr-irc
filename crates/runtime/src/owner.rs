@@ -63,6 +63,240 @@ pub const MAX_BACKLOG_BUFFERS: usize = 32;
 ///
 /// The whole set is capped in total events and bytes, so a client attached to many
 /// channels receives a bounded amount rather than one full backlog per buffer.
+/// Answers one `CHATHISTORY` request from the owning generation.
+///
+/// The reply goes only to the session that asked. History is the bouncer's own state,
+/// so a request never crosses the upstream connection and never reaches another
+/// client.
+async fn answer_history_query(
+    journal: &mut crate::journal::HistoryJournal,
+    handle: &SessionHandle,
+    wire: &[u8],
+    buffers: &BTreeMap<String, BufferId>,
+    batches: &mut crate::ircv3::BatchTracker,
+) {
+    let Some(message) = i2pr_irc_wire::Message::parse(wire).ok() else {
+        return;
+    };
+    let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
+    let first_param = message
+        .params
+        .get(1)
+        .and_then(|param| String::from_utf8(param.to_vec()).ok());
+    let parsed = crate::chathistory::parse_chathistory(&message);
+    let request = match parsed {
+        crate::chathistory::ParsedRequest::Accepted(request) => request,
+        crate::chathistory::ParsedRequest::Refused(refusal) => {
+            // A refusal is still a reply: the client needs to learn why nothing
+            // arrived, or it will simply wait.
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+                refusal,
+                &command,
+                first_param.as_deref(),
+            )));
+            return;
+        }
+    };
+
+    // `TARGETS` names buffers rather than messages, so it has no single buffer to
+    // page. It is answered with its own batch type.
+    if let crate::chathistory::HistoryQueryRequest::Targets {
+        older,
+        newer,
+        limit,
+    } = &request
+    {
+        let _ = answer_targets(journal, handle, older, newer, *limit, batches).await;
+        return;
+    }
+
+    let Some(target) = message
+        .params
+        .get(1)
+        .and_then(|p| String::from_utf8(p.to_vec()).ok())
+    else {
+        return;
+    };
+    let Some(buffer) = buffers.get(&target) else {
+        let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+            crate::chathistory::HistoryRefusal::NoSuchBuffer,
+            &command,
+            Some(&target),
+        )));
+        return;
+    };
+    let buffer = *buffer;
+
+    let reply = match crate::chathistory::execute(journal, buffer, &request).await {
+        Ok(reply) => reply,
+        Err(refusal) => {
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+                refusal,
+                &command,
+                Some(&target),
+            )));
+            return;
+        }
+    };
+    // A client that negotiated `batch` gets its history inside one; `wrap_in_batch`
+    // closes the batch even when there is nothing to send.
+    match crate::chathistory::wrap_in_batch(&reply, &target, batches) {
+        Ok(lines) => {
+            for line in lines {
+                if handle.queue_normal(&frame(&line)).is_err() {
+                    return;
+                }
+            }
+        }
+        Err(refusal) => {
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+                refusal,
+                &command,
+                Some(&target),
+            )));
+        }
+    }
+}
+
+/// Answers one `TARGETS` request: buffers with retained history in a time window.
+async fn answer_targets(
+    journal: &crate::journal::HistoryJournal,
+    handle: &SessionHandle,
+    older: &i2pr_irc_wire::IrcTimestamp,
+    newer: &i2pr_irc_wire::IrcTimestamp,
+    limit: usize,
+    batches: &mut crate::ircv3::BatchTracker,
+) -> bool {
+    let batch = match batches.open(
+        crate::chathistory::TARGETS_BATCH_TYPE,
+        None,
+        std::time::Instant::now(),
+    ) {
+        Ok(batch) => batch,
+        Err(_) => return false,
+    };
+    // The list is bounded and the window is inclusive of both endpoints, matching the
+    // draft's "newer than / older than" wording.
+    let targets = journal
+        .recent_targets(older.unix_millis(), newer.unix_millis(), limit)
+        .await
+        .unwrap_or_default();
+    let _ = handle.queue_normal(&frame(format!(
+        ":bouncer BATCH +{} {} *\r\n",
+        batch.id,
+        crate::chathistory::TARGETS_BATCH_TYPE
+    )));
+    for target in targets.into_iter().take(limit) {
+        // Each target names the timestamp of the newest message in it, so a client
+        // can resume from exactly that point.
+        let _ = handle.queue_normal(&frame(format!(
+            ":bouncer BATCH +{} chathistory {} timestamp={}\r\n",
+            batch.id, target.target, target.newest
+        )));
+    }
+    let _ = batches.close(&batch.id);
+    let _ = handle.queue_normal(&frame(format!(":bouncer BATCH -{}\r\n", batch.id)));
+    true
+}
+
+/// Answers one `MARKREAD` request: a client get or a client set.
+async fn answer_marker_update(
+    journal: &mut crate::journal::HistoryJournal,
+    handle: &SessionHandle,
+    wire: &[u8],
+    buffers: &BTreeMap<String, BufferId>,
+) {
+    let Some(message) = i2pr_irc_wire::Message::parse(wire).ok() else {
+        return;
+    };
+    let parsed = crate::chathistory::parse_markread(&message);
+    let target = message
+        .params
+        .first()
+        .and_then(|p| String::from_utf8(p.to_vec()).ok())
+        .unwrap_or_default();
+    match parsed {
+        Ok(crate::chathistory::ParsedMarker::Get) => {
+            let Some(buffer) = buffers.get(&target).copied() else {
+                let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_reply(
+                    &target, None,
+                )));
+                return;
+            };
+            let stored = journal.read_marker(buffer).await.ok().flatten();
+            // The reply carries the stored marker, or `*` when none is known. The
+            // durable marker is an event id, so it is translated back into the
+            // protocol timestamp the client set.
+            let stamp = match stored {
+                Some(event) => journal.event_timestamp(buffer, event).await.ok().flatten(),
+                None => None,
+            };
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_reply(
+                &target, stamp,
+            )));
+        }
+        Ok(crate::chathistory::ParsedMarker::Set { target, timestamp }) => {
+            let Some(buffer) = buffers.get(&target).copied() else {
+                let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_failure(
+                    crate::chathistory::MarkerRefusal::NoSuchBuffer,
+                    Some(&target),
+                )));
+                return;
+            };
+            // Resolving the client timestamp to a durable position keeps the marker
+            // monotonic: a client cannot name an arbitrary instant to skip ahead.
+            let reference = crate::chathistory::MessageReference::Timestamp(timestamp);
+            match crate::chathistory::resolve(journal, buffer, &reference).await {
+                Ok(event) => {
+                    match journal.set_read_marker(buffer, event).await {
+                        Ok(applied) => {
+                            // The draft requires the server to answer with the value
+                            // it stored, which may be older than requested.
+                            let stored = journal
+                                .event_timestamp(buffer, applied)
+                                .await
+                                .ok()
+                                .flatten();
+                            let _ = handle.queue_normal(&frame(
+                                crate::chathistory::render_marker_reply(&target, stored),
+                            ));
+                        }
+                        Err(_) => {
+                            let _ = handle.queue_normal(&frame(
+                                crate::chathistory::render_marker_failure(
+                                    crate::chathistory::MarkerRefusal::Internal,
+                                    Some(&target),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_failure(
+                        crate::chathistory::MarkerRefusal::InvalidTimestamp,
+                        Some(&target),
+                    )));
+                }
+            }
+        }
+        Err(refusal) => {
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_failure(
+                refusal,
+                Some(&target),
+            )));
+        }
+    }
+}
+
+/// Frames an already-rendered line for the session queue.
+///
+/// Accepts either raw bytes or an already-formatted string; both paths are ASCII or
+/// lossy-converted, and the session writer is the component that decides whether a
+/// frame is well formed enough to send.
+fn frame(line: impl AsRef<[u8]>) -> String {
+    String::from_utf8_lossy(line.as_ref()).into_owned()
+}
+
 async fn deliver_legacy_backlog(
     journal: &mut crate::journal::HistoryJournal,
     handle: &SessionHandle,
@@ -644,6 +878,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // Response routing is generation-local and SessionId-scoped. It is created per
         // generation, so nothing can survive into a different connection.
         let mut router = ResponseRouter::default();
+        // Batch identifiers are generation-local, exactly like response routes: a
+        // batch id from an earlier connection must never be referencable later.
+        let mut batches = crate::ircv3::BatchTracker::default();
         // Attachments that arrived while this generation was starting.
         for (session, client, stream) in pending_attach.drain(..).take(MAX_SESSIONS_PER_NETWORK) {
             attach_session(
@@ -694,6 +931,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &mut journal,
                         &buffers,
                         &mut router,
+                        &mut batches,
                     )
                     .await;
                 }
@@ -1015,6 +1253,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         journal: &mut crate::journal::HistoryJournal,
         buffers: &BTreeMap<String, BufferId>,
         router: &mut ResponseRouter,
+        batches: &mut crate::ircv3::BatchTracker,
     ) {
         match event {
             SessionEvent::Ended {
@@ -1074,6 +1313,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 Some(DownstreamDisposition::LocalDetach.class());
                             snapshot.attached_sessions = sessions.len();
                         });
+                    }
+                    SessionIntent::HistoryQuery { wire } => {
+                        if let Some(task) = sessions.get(&session) {
+                            answer_history_query(journal, task.handle(), &wire, buffers, batches)
+                                .await;
+                        }
+                    }
+                    SessionIntent::MarkerUpdate { wire } => {
+                        if let Some(task) = sessions.get(&session) {
+                            answer_marker_update(journal, task.handle(), &wire, buffers).await;
+                        }
                     }
                     SessionIntent::Forward { wire, class } => {
                         // The owner stamps the generation, so a session cannot forge a

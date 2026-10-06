@@ -47,6 +47,20 @@ pub enum SessionIntent {
     Part { channel: String },
     /// The client completed registration and wants the current projection.
     RequestProjection,
+    /// The client asked the bouncer itself for retained history.
+    ///
+    /// The bouncer owns the store, so a session cannot answer this: it submits the
+    /// request and the owner executes it against the journal. The session never holds
+    /// a store handle, which is what keeps one live owner per Network.
+    HistoryQuery {
+        /// The original framed command, re-parsed by the draft adapter.
+        wire: Vec<u8>,
+    },
+    /// The client asked to read or advance a read marker.
+    MarkerUpdate {
+        /// The original framed command, re-parsed by the draft adapter.
+        wire: Vec<u8>,
+    },
     /// The client asked to end its own session.
     Quit,
 }
@@ -95,6 +109,13 @@ impl SessionCapabilities {
         self.legacy_backlog && !self.explicit_history
     }
 
+    /// True when this client negotiated the history capability and will fetch its own
+    /// history, so the bouncer must both suppress the legacy backlog and advertise the
+    /// history ISUPPORT tokens.
+    pub fn manages_own_history(&self) -> bool {
+        self.explicit_history
+    }
+
     /// Applies a client's successful `CAP REQ`, recording that it manages history.
     pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
         Self {
@@ -109,18 +130,43 @@ impl SessionCapabilities {
 ///
 /// The owner holds only bounded routing metadata, never a stream or mutable session
 /// state, so the number of attached clients cannot widen the owner's own state.
-#[derive(Clone)]
 pub struct SessionHandle {
     session: SessionId,
     client: ClientId,
     control_tx: mpsc::Sender<crate::downstream::QueuedFrame>,
     normal_tx: mpsc::Sender<crate::downstream::QueuedFrame>,
-    capabilities: SessionCapabilities,
+    /// Negotiated-capability view, shared with the owner across the session.
+    capabilities: std::sync::Arc<std::sync::Mutex<SessionCapabilities>>,
+}
+
+impl Clone for SessionHandle {
+    /// Clones the routing handles; the negotiated-capability view is shared, not
+    /// copied, so the owner and the session reader never disagree about what a
+    /// client negotiated.
+    fn clone(&self) -> Self {
+        Self {
+            session: self.session,
+            client: self.client,
+            control_tx: self.control_tx.clone(),
+            normal_tx: self.normal_tx.clone(),
+            capabilities: self.capabilities.clone(),
+        }
+    }
 }
 
 impl SessionHandle {
     pub fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Records the capabilities this client negotiated, for owner-side decisions.
+    ///
+    /// The owner needs this to decide whether a client that can fetch its own history
+    /// should still receive the automatic legacy backlog.
+    pub fn set_negotiated(&self, enabled: &std::collections::BTreeSet<String>) {
+        if let Ok(mut capabilities) = self.capabilities.lock() {
+            *capabilities = capabilities.with_negotiated(enabled);
+        }
     }
     pub fn client(&self) -> ClientId {
         self.client
@@ -151,9 +197,12 @@ impl SessionHandle {
     /// This attachment's negotiated capabilities.
     pub fn capabilities(&self) -> SessionCapabilities {
         self.capabilities
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
     }
     pub fn with_capabilities(mut self, capabilities: SessionCapabilities) -> Self {
-        self.capabilities = capabilities;
+        self.capabilities = std::sync::Arc::new(std::sync::Mutex::new(capabilities));
         self
     }
 }
@@ -189,7 +238,9 @@ impl SessionTask {
             client,
             control_tx,
             normal_tx,
-            capabilities: SessionCapabilities::default(),
+            capabilities: std::sync::Arc::new(
+                std::sync::Mutex::new(SessionCapabilities::default()),
+            ),
         };
         let identity = session;
         let owner_handle = handle.clone();
@@ -246,6 +297,11 @@ struct SessionReader<D: ByteStream> {
     /// A client that issued `CAP LS`/`CAP REQ` before registration is still
     /// negotiating: it must send `CAP END` before any welcome or projection.
     cap_negotiating: bool,
+    /// Capabilities this client successfully negotiated with the bouncer.
+    ///
+    /// Bounded by [`crate::downstream::MAX_NEGOTIATED_CAPABILITIES`]. A client cannot
+    /// grow this set without limit by repeating `CAP REQ`.
+    negotiated: std::collections::BTreeSet<String>,
     ready: bool,
 }
 
@@ -265,6 +321,7 @@ impl<D: ByteStream> SessionReader<D> {
             registered_nick: None,
             user_received: false,
             cap_negotiating: false,
+            negotiated: std::collections::BTreeSet::new(),
             ready: false,
         }
     }
@@ -426,6 +483,33 @@ impl<D: ByteStream> SessionReader<D> {
                     class: IntentClass::NonReplayable,
                 }));
             }
+            // History and read markers are answered by the bouncer itself and are
+            // never forwarded upstream. Both require the matching capability to have
+            // been negotiated: answering a client that did not ask for the extension
+            // would be unsolicited traffic, and a client that did not negotiate
+            // `message-tags` cannot read tagged replies.
+            "CHATHISTORY" | "MARKREAD" => {
+                let capability = if command == "CHATHISTORY" {
+                    crate::chathistory::CHATHISTORY_CAPABILITY
+                } else {
+                    crate::chathistory::READ_MARKER_CAPABILITY
+                };
+                let wire = message.encode().map_err(|_| RuntimeError::Protocol)?;
+                if self.negotiated.contains(capability) {
+                    return Ok(Some(if command == "CHATHISTORY" {
+                        SessionIntent::HistoryQuery { wire }
+                    } else {
+                        SessionIntent::MarkerUpdate { wire }
+                    }));
+                }
+                // Explicitly refused rather than silently ignored: a client that
+                // issued the command needs to learn why nothing happened. This is not
+                // grounds for ending the session.
+                let nick = self.registered_nick.as_deref().unwrap_or("*");
+                let line = format!(":bouncer 421 {nick} {command} :Unsupported command\r\n");
+                self.handle.queue_normal(&line)?;
+                return Ok(None);
+            }
             "WHOIS" | "WHO" | "NAMES" | "LIST" => {
                 return Ok(Some(SessionIntent::Forward {
                     wire: message.encode().map_err(|_| RuntimeError::Protocol)?,
@@ -457,24 +541,55 @@ impl<D: ByteStream> SessionReader<D> {
                 if !self.ready {
                     self.cap_negotiating = true;
                 }
-                match subcommand.as_str() {
-                    "REQ" => self.handle.queue_normal(&format!(
-                        ":bouncer CAP {target} NAK :Unsupported capabilities\r\n"
-                    )),
-                    _ => self
-                        .handle
-                        .queue_normal(&format!(":bouncer CAP {target} LS :\r\n")),
+                if subcommand == "REQ" {
+                    // Acknowledged only when every requested capability is one this
+                    // bouncer genuinely serves. A partial ACK would be a promise the
+                    // session cannot keep.
+                    let requested = crate::downstream::requested_capabilities(message);
+                    let supported = !requested.is_empty()
+                        && requested.iter().all(|name| {
+                            crate::downstream::DOWNSTREAM_ADVERTISED.contains(&name.as_str())
+                        });
+                    if !supported {
+                        return self.handle.queue_normal(&format!(
+                            ":bouncer CAP {target} NAK :Unsupported capabilities\r\n"
+                        ));
+                    }
+                    for name in &requested {
+                        if self.negotiated.len() < crate::downstream::MAX_NEGOTIATED_CAPABILITIES {
+                            self.negotiated.insert(name.clone());
+                        }
+                    }
+                    // The owner needs the same view to suppress the duplicate legacy
+                    // backlog for a client that will fetch its own history.
+                    self.handle.set_negotiated(&self.negotiated);
+                    return self.handle.queue_normal(&format!(
+                        ":bouncer CAP {target} ACK :{}\r\n",
+                        requested.join(" ")
+                    ));
                 }
+                self.handle.queue_normal(&format!(
+                    ":bouncer CAP {target} LS :{}\r\n",
+                    crate::downstream::DOWNSTREAM_ADVERTISED.join(" ")
+                ))
             }
             "END" => {
                 if !self.ready {
                     self.cap_negotiating = false;
                 }
+                self.handle.set_negotiated(&self.negotiated);
                 Ok(())
             }
-            "LIST" => self
-                .handle
-                .queue_normal(&format!(":bouncer CAP {target} LIST :\r\n")),
+            "LIST" => {
+                let held = self
+                    .negotiated
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.handle
+                    .queue_normal(&format!(":bouncer CAP {target} LIST :{held}\r\n"))
+            }
             // `ACK`/`NAK` are server-to-client; receiving one is a client error.
             _ => self
                 .handle

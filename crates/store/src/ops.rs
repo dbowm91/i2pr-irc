@@ -546,6 +546,88 @@ impl rusqlite::ToSql for ServerTimeText {
 }
 
 /// Reads one bounded history range for a Buffer in canonical local order.
+/// Buffers on one Network whose newest retained event falls in a time window.
+///
+/// Bounded on both rows and time: a `TARGETS` request must not become an unbounded
+/// scan of every buffer this Network has ever seen.
+pub(crate) fn recent_targets(
+    connection: &Connection,
+    network: NetworkId,
+    lower_unix_millis: i64,
+    upper_unix_millis: i64,
+    limit: usize,
+) -> Result<Vec<RecentTarget>, StoreError> {
+    if limit == 0 || limit > MAX_RECENT_TARGETS {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "recent-targets limit",
+        )));
+    }
+    if upper_unix_millis < lower_unix_millis {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "recent-targets window",
+        )));
+    }
+    let network = to_sql_id(network.0)?;
+    // The newest event per buffer is found with the index, not a scan, and the
+    // window is applied to that newest value so a client sees only buffers that
+    // actually advanced inside it.
+    let mut statement = connection
+        .prepare(
+            "SELECT b.buffer_id, b.target, h.event_id, h.server_time, h.received_at
+             FROM buffers b
+             JOIN history_events h ON h.event_id = (
+                 SELECT MAX(e.event_id) FROM history_events e WHERE e.buffer_id = b.buffer_id
+             )
+             WHERE b.network_id = ?1
+               AND COALESCE(h.server_time, '') >= ?2
+               AND COALESCE(h.server_time, '') <= ?3
+             ORDER BY h.event_id DESC
+             LIMIT ?4",
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![
+                network,
+                lower_unix_millis,
+                upper_unix_millis,
+                to_sql_id(u64::try_from(limit).map_err(|_| StoreError::new(
+                    StoreErrorKind::InvalidRequest("recent-targets limit")
+                ))?)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (buffer, target, event, server_time, received_at) =
+            row.map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+        // `server_time` is canonical text; the fallback keeps a reply usable for an
+        // event the upstream never stamped.
+        let newest = match server_time {
+            Some(text) => IrcTimestamp::parse_str(&text).ok(),
+            None => None,
+        }
+        .or_else(|| IrcTimestamp::from_unix_millis(received_at.saturating_mul(1_000)))
+        .unwrap_or(IrcTimestamp::EPOCH);
+        found.push(RecentTarget {
+            buffer: BufferId(from_sql_id(buffer)?),
+            target,
+            newest,
+            newest_event: HistoryEventId(from_sql_id(event)?),
+        });
+    }
+    Ok(found)
+}
+
 pub(crate) fn query_history(
     connection: &Connection,
     query: &HistoryQuery,

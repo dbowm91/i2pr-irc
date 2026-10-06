@@ -276,6 +276,21 @@ const DRAIN_IDLE: Duration = Duration::from_millis(25);
 ///
 /// The fake server side has a finite buffer, so a test that never reads it would make
 /// the *fixture* the back-pressure it is trying to measure.
+/// Drains upstream and returns what it read, so a test can assert that a local
+/// request never crossed the connection.
+async fn drain_upstream_capture(owner: &mut Online) -> String {
+    let mut buf = [0; 4096];
+    let mut all = Vec::new();
+    loop {
+        let read = tokio::time::timeout(DRAIN_IDLE, owner.upstream().read(&mut buf)).await;
+        match read {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(count)) => all.extend_from_slice(&buf[..count]),
+        }
+    }
+    String::from_utf8_lossy(&all).into_owned()
+}
+
 async fn drain_upstream(owner: &mut Online) {
     let mut buf = [0; 4096];
     loop {
@@ -1077,6 +1092,233 @@ async fn read_marker_and_cursor_survive_retention_and_clamp_monotonically() {
         .await
         .err(),
         Some(i2pr_irc_runtime::chathistory::HistoryRefusal::HistoryUnavailable)
+    );
+}
+
+// ====================================================== LIVE HISTORY ADAPTERS
+
+#[tokio::test]
+async fn a_negotiated_client_really_receives_history_through_the_live_path() {
+    // The M003-E adapters used to be unreachable: CHATHISTORY and MARKREAD fell
+    // through the session dispatcher to `421 Unsupported command`. This proves a real
+    // attached client can now negotiate the capability, ask for history, and receive a
+    // batched reply containing the retained message.
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+
+    // Retain one message in #room through the journal the owner will use.
+    {
+        let mut journal = journal(1, handle.clone());
+        let buffer = journal
+            .resolve_buffer(BufferKind::Channel, "#room")
+            .await
+            .expect("buffer");
+        journal
+            .ingest(
+                buffer,
+                &i2pr_irc_wire::Message::parse(
+                    b"@time=2023-11-14T22:13:20.620Z;msgid=abc123 :a!u@h PRIVMSG #room :retained\r\n",
+                )
+                .expect("parses"),
+            )
+            .await
+            .expect("ingests");
+    }
+
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    // The upstream must have self-joined before history is eligible, so the owner's
+    // buffer resolution has a channel to attach to.
+    join_upstream(&mut owner, "bot", "#room").await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+
+    // Negotiate, then register.
+    client
+        .write_all(b"CAP REQ :draft/chathistory\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+        .await
+        .expect("client writable");
+    let welcome = client_read_until(&mut client, b"001 ").await;
+    assert!(
+        welcome.contains("ACK :draft/chathistory"),
+        "a supported capability must be acknowledged: {welcome}"
+    );
+    assert!(
+        welcome.contains("CHATHISTORY="),
+        "a negotiated client must be told the real history bound: {welcome}"
+    );
+
+    // Ask using the real draft grammar: the limit is the last parameter.
+    client
+        .write_all(b"CHATHISTORY LATEST #room * 10\r\n")
+        .await
+        .expect("client writable");
+    let reply = client_read_until(&mut client, b"draft/chathistory-end").await;
+
+    assert!(
+        reply.contains("retained"),
+        "the retained message must actually reach the client: {reply}"
+    );
+    assert!(
+        reply.contains("BATCH +"),
+        "a negotiated client must receive a batch: {reply}"
+    );
+    assert!(
+        reply.contains("batch="),
+        "each message must be tagged into the batch: {reply}"
+    );
+    // The replayed timestamp is canonical text, never an integer epoch.
+    assert!(
+        reply.contains("2023-11-14T22:13:20.620Z"),
+        "the upstream timestamp must round-trip with its milliseconds: {reply}"
+    );
+    assert!(
+        !reply.contains("1700000000"),
+        "an integer epoch is not a server-time value: {reply}"
+    );
+    // Local history is never forwarded upstream.
+    assert!(
+        !drain_upstream_capture(&mut owner)
+            .await
+            .contains("CHATHISTORY"),
+        "a local history request must not cross the upstream connection"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_history_request_is_answered_not_silently_ignored() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+    client
+        .write_all(b"CAP REQ :draft/chathistory\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+        .await
+        .expect("client writable");
+    client_read_until(&mut client, b"001 ").await;
+
+    // An integer epoch is not a valid timestamp selector.
+    client
+        .write_all(b"CHATHISTORY BEFORE #room timestamp=1700000000 10\r\n")
+        .await
+        .expect("client writable");
+    let refusal = client_read_until(&mut client, b"INVALID_PARAMS").await;
+    assert!(
+        refusal.contains("FAIL CHATHISTORY INVALID_PARAMS"),
+        "a malformed selector must be answered with the standard error: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_did_not_negotiate_history_is_refused_explicitly() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+    client_register(&mut client, "bot").await;
+
+    client
+        .write_all(b"CHATHISTORY LATEST #room * 10\r\n")
+        .await
+        .expect("client writable");
+    let refusal = client_read_until(&mut client, b"421 ").await;
+    assert!(
+        refusal.contains("421"),
+        "an un-negotiated command must be refused, not silently dropped: {refusal}"
+    );
+    // And the client is still attached: a refusal is not grounds for disconnection.
+    assert_eq!(
+        owner.snapshot.borrow().attached_sessions,
+        1,
+        "refusing one command must not end the session"
+    );
+}
+
+#[tokio::test]
+async fn a_read_marker_round_trips_through_the_live_path() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    {
+        let mut journal = journal(1, handle.clone());
+        let buffer = journal
+            .resolve_buffer(BufferKind::Channel, "#room")
+            .await
+            .expect("buffer");
+        journal
+            .ingest(
+                buffer,
+                &i2pr_irc_wire::Message::parse(
+                    b"@time=2023-11-14T22:13:20.620Z;msgid=abc123 :a!u@h PRIVMSG #room :one\r\n",
+                )
+                .expect("parses"),
+            )
+            .await
+            .expect("ingests");
+    }
+
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    join_upstream(&mut owner, "bot", "#room").await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+    client
+        .write_all(b"CAP REQ :draft/read-marker\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+        .await
+        .expect("client writable");
+    client_read_until(&mut client, b"001 ").await;
+
+    // A get with no marker stored answers with the unknown-marker sentinel.
+    client
+        .write_all(b"MARKREAD #room\r\n")
+        .await
+        .expect("client writable");
+    let unknown = client_read_until(&mut client, b"MARKREAD #room *\r\n").await;
+    assert!(
+        unknown.contains("MARKREAD #room *"),
+        "an unknown marker is reported as a literal star: {unknown}"
+    );
+
+    // A set is answered with the value actually stored.
+    client
+        .write_all(b"MARKREAD #room timestamp=2023-11-14T22:13:20.620Z\r\n")
+        .await
+        .expect("client writable");
+    let stored = client_read_until(&mut client, b"timestamp=2023-11-14T22:13:20.620Z\r\n").await;
+    assert!(
+        stored.contains("MARKREAD #room timestamp=2023-11-14T22:13:20.620Z"),
+        "the server must answer with the marker it stored: {stored}"
+    );
+
+    // A client may not set the unknown-marker sentinel, and the session survives it.
+    client
+        .write_all(b"MARKREAD #room *\r\n")
+        .await
+        .expect("client writable");
+    let refused = client_read_until(&mut client, b"FAIL MARKREAD").await;
+    assert!(
+        refused.contains("FAIL MARKREAD"),
+        "a client must not be able to erase read state with the sentinel: {refused}"
+    );
+    assert_eq!(
+        owner.snapshot.borrow().attached_sessions,
+        1,
+        "refusing a marker set must not end the session"
     );
 }
 

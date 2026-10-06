@@ -316,6 +316,8 @@ pub fn intent_class(intent: &SessionIntent) -> &'static str {
         SessionIntent::Join { .. } => "join",
         SessionIntent::Part { .. } => "part",
         SessionIntent::RequestProjection => "projection",
+        SessionIntent::HistoryQuery { .. } => "history-query",
+        SessionIntent::MarkerUpdate { .. } => "marker-update",
         SessionIntent::Quit => "quit",
     }
 }

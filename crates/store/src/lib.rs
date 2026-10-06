@@ -20,7 +20,7 @@ mod worker;
 pub use error::{CommitState, StoreError, StoreErrorKind};
 pub use model::{
     BufferKind, BufferRecord, ClientRecord, EventDirection, HistoryAppendResult, HistoryEvent,
-    HistoryQuery, HistoryQueryBound, NetworkRecord, NetworkSummary, NewHistoryEvent,
+    HistoryQuery, HistoryQueryBound, NetworkRecord, NetworkSummary, NewHistoryEvent, RecentTarget,
     RetentionReport, RetentionRequest, SavedNetwork, StoreHealth, StorePath, StoredSecret,
 };
 // The explicit storage ceilings, re-exported so a caller bounds its own behavior with

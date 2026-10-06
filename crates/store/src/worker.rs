@@ -92,6 +92,14 @@ enum Request {
         request: Box<RetentionRequest>,
         reply: Reply<Result<RetentionReport, StoreError>>,
     },
+    /// Buffers with retained history inside a time window, for `TARGETS`.
+    RecentTargets {
+        network: NetworkId,
+        lower_unix_millis: i64,
+        upper_unix_millis: i64,
+        limit: usize,
+        reply: Reply<Result<Vec<RecentTarget>, StoreError>>,
+    },
     Health(Reply<Result<StoreHealth, StoreError>>),
     Flush(Reply<Result<(), StoreError>>),
 }
@@ -229,6 +237,23 @@ impl StoreHandle {
     ) -> Result<Vec<HistoryEvent>, StoreError> {
         self.submit(|reply| Request::QueryHistory {
             query: Box::new(*query),
+            reply,
+        })
+        .await
+    }
+    /// Buffers whose newest retained event falls inside a time window.
+    pub async fn recent_targets(
+        &self,
+        network: NetworkId,
+        lower_unix_millis: i64,
+        upper_unix_millis: i64,
+        limit: usize,
+    ) -> Result<Vec<RecentTarget>, StoreError> {
+        self.submit(|reply| Request::RecentTargets {
+            network,
+            lower_unix_millis,
+            upper_unix_millis,
+            limit,
             reply,
         })
         .await
@@ -541,6 +566,24 @@ fn execute(connection: &mut Connection, request: Request) {
         }
         Request::AdvanceReadMarker { buffer, to, reply } => {
             answer!(reply, ops::advance_read_marker(connection, buffer, to))
+        }
+        Request::RecentTargets {
+            network,
+            lower_unix_millis,
+            upper_unix_millis,
+            limit,
+            reply,
+        } => {
+            answer!(
+                reply,
+                ops::recent_targets(
+                    connection,
+                    network,
+                    lower_unix_millis,
+                    upper_unix_millis,
+                    limit
+                )
+            )
         }
         Request::Retain { request, reply } => answer!(reply, ops::retain(connection, &request)),
         Request::Health(reply) => {

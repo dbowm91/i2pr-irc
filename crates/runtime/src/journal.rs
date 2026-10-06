@@ -431,6 +431,44 @@ impl HistoryJournal {
             .map_err(|error| classify(error.kind()))
     }
 
+    /// Buffers on this Network whose newest retained event falls in a time window.
+    ///
+    /// Bounded on rows and passed through to a store query that uses the buffer
+    /// index, so a `TARGETS` request cannot become a full scan.
+    pub async fn recent_targets(
+        &self,
+        lower_unix_millis: i64,
+        upper_unix_millis: i64,
+        limit: usize,
+    ) -> Result<Vec<i2pr_irc_store::RecentTarget>, RuntimeError> {
+        self.store
+            .recent_targets(self.network, lower_unix_millis, upper_unix_millis, limit)
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// The canonical protocol timestamp for one retained event.
+    ///
+    /// Falls back to local receive time when the upstream never stamped the event, so
+    /// a marker reply always carries a usable value.
+    pub async fn event_timestamp(
+        &self,
+        buffer: BufferId,
+        event: HistoryEventId,
+    ) -> Result<Option<i2pr_irc_wire::IrcTimestamp>, RuntimeError> {
+        // A one-event window bounded by the identity itself, so this stays a single
+        // indexed lookup rather than a scan.
+        let after = HistoryEventId(event.0.saturating_sub(1));
+        let before = HistoryEventId(event.0.saturating_add(1));
+        let events = self
+            .backlog_range(buffer, Some(after), Some(before), 1)
+            .await?;
+        Ok(events.first().map(|row| {
+            row.server_time
+                .unwrap_or_else(|| crate::chathistory::local_timestamp(row.received_at))
+        }))
+    }
+
     pub async fn set_read_marker(
         &mut self,
         buffer: BufferId,

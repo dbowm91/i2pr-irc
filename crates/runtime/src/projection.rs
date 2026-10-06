@@ -20,6 +20,17 @@ pub fn project(
             ":bouncer 005 {target} {token} :are supported by this server\r\n"
         ))?;
     }
+    // The bouncer's own history surface is advertised only to a client that actually
+    // negotiated the capability, and only for what this build implements. A client
+    // that never negotiated it must not be invited to send a request it has no batch
+    // support to read.
+    if handle.capabilities().manages_own_history() {
+        for token in crate::chathistory::isupport_tokens() {
+            handle.queue_normal(&format!(
+                ":bouncer 005 {target} {token} :are supported by this server\r\n"
+            ))?;
+        }
+    }
     for channel in state.joined_channels() {
         handle.queue_normal(&format!(":{} JOIN {channel}\r\n", state.nick))?;
         let Some(channel_state) = state.channels.get(&channel) else {

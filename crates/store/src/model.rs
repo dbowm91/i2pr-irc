@@ -21,6 +21,8 @@ pub const MAX_BUFFERS_PER_NETWORK: usize = 1024;
 pub const MAX_HISTORY_BATCH: usize = 512;
 /// Maximum events returned by one bounded history query.
 pub const MAX_HISTORY_QUERY_EVENTS: usize = 512;
+/// Ceiling on buffers one `TARGETS` query may return.
+pub const MAX_RECENT_TARGETS: usize = 256;
 /// Maximum replay payload bytes retained for one event.
 pub const MAX_HISTORY_PAYLOAD_BYTES: usize = 4096;
 /// Maximum total replay payload bytes one bounded query may return.
@@ -251,6 +253,19 @@ pub struct HistoryEvent {
     /// Stable protocol class retained for truthful replay decisions.
     pub event_class: String,
     pub payload: Vec<u8>,
+}
+
+/// One buffer that has retained history, for a `CHATHISTORY TARGETS` reply.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentTarget {
+    pub buffer: BufferId,
+    pub target: String,
+    /// Canonical protocol timestamp of the newest retained event in this buffer.
+    ///
+    /// Falls back to local receive time for events the upstream never stamped, so
+    /// the value is always a usable resume point rather than absent.
+    pub newest: IrcTimestamp,
+    pub newest_event: HistoryEventId,
 }
 
 /// One event accepted for durable append. `event` is assigned by the store so the

@@ -28,7 +28,7 @@ pub const DOWNSTREAM_ADVERTISED: &[&str] = &[CHATHISTORY_CAPABILITY, READ_MARKER
 pub const MAX_NEGOTIATED_CAPABILITIES: usize = 8;
 
 /// The capabilities a `CAP REQ` line asks for, bounded and upper-cased.
-fn requested_capabilities(message: &Message) -> Vec<String> {
+pub(crate) fn requested_capabilities(message: &Message) -> Vec<String> {
     message
         .params
         .iter()
