@@ -19,7 +19,7 @@ Only the last two rows may coincide with upstream shutdown. Client detach, proto
 
 Queue overload is deliberately *not* a detach. A saturated queue is the bouncer's own bound, not client misbehaviour, so the bounded response is to lose that one frame for that one client and count it. Detachment stays reserved for what the client actually did — `QUIT`, EOF, a protocol violation, or a writer failure.
 
-Registration requires NICK and USER before sending 001; the NICK must match the configured current upstream network nick under negotiated casemapping. The runtime answers client PING locally, handles CAP LS/REQ/END with an empty advertised capability set, and routes a bounded command allowlist upstream. Unsupported commands receive 421. Client-supplied prefixes are rejected, and client tag budgets are checked before re-encoding.
+Registration requires NICK and USER before sending 001; the NICK must match the configured current upstream network nick under negotiated casemapping. The runtime answers client PING locally, mediates CAP LS/REQ/END against a fixed reviewed downstream capability set, and routes a bounded command allowlist upstream. Unsupported commands receive 421. Client-supplied prefixes are rejected, and client tag budgets are checked before re-encoding.
 
 ## Registration and CAP negotiation
 
@@ -36,7 +36,7 @@ Registration state is four explicit facts, not an implicit `ready` flag: a valid
 | `CAP LS`/`LIST` after registration | no | unchanged | locally answered; registration is never undone |
 | `CAP ACK`/`NAK` from a client | unchanged | unchanged | `410 … Invalid CAP subcommand` |
 
-A client that entered CAP negotiation therefore cannot observe any part of the registration burst before it sends `CAP END`, and a client that never uses CAP is unaffected. Repeated or late CAP commands are deterministic: negotiation only ever starts before registration, and it ends at most once. Downstream CAP is mediated locally, so it cannot alter the upstream generation's negotiated capability set, and the advertised downstream capability set remains empty.
+A client that entered CAP negotiation therefore cannot observe any part of the registration burst before it sends `CAP END`, and a client that never uses CAP is unaffected. Repeated or late CAP commands are deterministic: negotiation only ever starts before registration, and it ends at most once. Downstream CAP is mediated locally, so it cannot alter the upstream generation's negotiated capability set. Advertisement is derived from semantics the bouncer itself serves and is independent of the attached client's brand or upstream CAP offer.
 
 ## Projection truthfulness
 
@@ -53,4 +53,4 @@ Incomplete knowledge is expressed by omission, never by a false value. A mode le
 
 Every externally controlled quantity is bounded: 2048 members per channel, 8192 members in total, 128 channels, 128 ISUPPORT tokens, 128 mode letters per channel, 16 arguments per mode, 100-byte mode arguments, 400-byte topics, 8 prefix pairs, 8 channel-type symbols, 64 mode letters per `CHANMODES` group. Client queues hold 8 control and 64 normal frames, and the client writer task is aborted and joined on detach, so a canceled session cannot outlive itself. A projection larger than the bounded client queue fails the client explicitly with an overload disposition rather than unbounded buffering; the retained state itself stays with the generation for the next client.
 
-The runtime does not advertise message-tags, batch, SASL, or other downstream capabilities because it does not implement those semantics for downstream clients.
+The current runtime advertises draft/chathistory, draft/read-marker, message-tags, batch and labeled-response. server-time and echo-message remain deliberately withheld until their full downstream semantics are implemented. Local SASL server authentication is not part of the current bound-session core.

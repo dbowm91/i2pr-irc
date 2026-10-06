@@ -17,7 +17,7 @@ Requesting everything a server offers would be the same error in the other direc
 
 ## Advertise only what you implement
 
-Downstream advertisement covers `message-tags`, `server-time`, `batch`, and `labeled-response`, plus `echo-message` **only** when upstream negotiated it.
+Current downstream advertisement covers message-tags, batch and labeled-response, plus the implemented draft/chathistory and draft/read-marker adapters. server-time and echo-message are deliberately withheld at the M004 closure baseline and are M005 protocol-polish work.
 
 `chathistory` and `read-marker` are advertised only to the extent they are actually served, and the advertised surface is enumerated in [chathistory.md](chathistory.md). Deferring a capability is a reviewable decision; omitting it by accident is not, and neither is advertising an extension that is only half implemented.
 
@@ -27,7 +27,7 @@ Downstream advertisement covers `message-tags`, `server-time`, `batch`, and `lab
 
 The bouncer confirms a message only once the **server** has echoed it. A local socket write is not evidence of upstream delivery.
 
-So `echo-message` is advertised only when upstream negotiated it. Without an upstream echo, advertising it would promise confirmation the bouncer cannot deliver — and would retroactively make Plan 009's omission of local outgoing history look like a bug when it is the correct behavior.
+echo-message is requested upstream when offered but is not yet advertised downstream. M005 may promote it only after downstream confirmation/fanout semantics are implemented. Without an upstream echo, advertising it would promise confirmation the bouncer cannot deliver.
 
 ## Labels are translated, never forwarded
 
