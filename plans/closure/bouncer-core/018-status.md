@@ -241,7 +241,7 @@ resolves.
 
 | ID | Severity | Finding |
 |---|---|---|
-| UF-015-1 | low | The legacy `NetworkSupervisor` in `crates/runtime/src/lib.rs` (test-only) is gated by neither the `ReconnectScheduler` nor the resource ledger. It must be gated before any promotion to production. |
+| UF-015-1 | low | The legacy `NetworkSupervisor` in `crates/runtime/src/lib.rs:222` is gated by neither the `ReconnectScheduler` nor the resource ledger. It is a `pub struct` at the crate root and so is compiled into the shipped rlib, but nothing outside its own `#[cfg(test)]` module constructs it — the production path is `catalog::NetworkSupervisor` over `owner::NetworkOwner`. It must be gated or removed before any promotion to production. |
 | UF-017-1 | low | `NetworkOwner::serve` constructs `Backoff` inline (base 1s, cap 300s, jitter 20%) rather than injecting it, so churn campaigns must pin virtual time and advance by the cap. Not a defect; it constrains testability. |
 
 Neither is blocking, and neither is anonymity-, egress-, herd-, routing-, or resource-bound.
