@@ -1,6 +1,6 @@
 # Bouncer Core Corrective 005 — Pre-M003 Observed Membership and Downstream CAP Correctness
 
-Status: ready for handoff
+Status: closed — see `plans/closure/bouncer-core/005-status.md`
 
 Repository baseline: `3de5e66e49826735346a23030374ad96bfdb5a3b`
 
