@@ -30,11 +30,32 @@ pub const UPSTREAM_FOUNDATIONAL: [&str; 5] = [
 
 /// Downstream capabilities this build can truthfully advertise.
 ///
-/// Each one corresponds to semantics implemented in this milestone. `echo-message` is
-/// conditional on upstream negotiation (see [`UpstreamCapabilities::echo_available`]),
-/// because the bouncer will only confirm a message it has seen the server echo.
-pub const DOWNSTREAM_FOUNDATIONAL: [&str; 4] =
-    ["message-tags", "server-time", "batch", "labeled-response"];
+/// This list is intentionally small and reviewed. Every entry must correspond to
+/// semantics the live `SessionReader` actually implements behind
+/// [`crate::downstream::DOWNSTREAM_ADVERTISED`], because a `CAP LS` the client cannot
+/// rely on is a lie it has no way to detect.
+///
+/// `labeled-response` and its `message-tags`/`batch` prerequisites are deliberately
+/// absent. Response routing is live for this bouncer's own upstream correlation, but
+/// serving a client's labels also requires downstream message-tag mediation and a
+/// truthful `CLIENTTAGDENY`, neither of which exists yet. They are named in
+/// [`DOWNSTREAM_DEFERRED_FOUNDATIONAL`] so that withholding them is a reviewable
+/// decision rather than an omission, and are promoted together when the mediator lands.
+pub const DOWNSTREAM_FOUNDATIONAL: [&str; 0] = [];
+
+/// Capabilities withheld downstream until the client-tag mediator is live.
+///
+/// Advertising any of these now would promise label semantics this build cannot honour:
+/// a client that negotiated them would attach tags the live session has no policy to
+/// forward or deny.
+pub const DOWNSTREAM_DEFERRED_FOUNDATIONAL: [&str; 3] =
+    ["message-tags", "batch", "labeled-response"];
+
+/// `server-time` is withheld downstream alongside the deferred set.
+///
+/// It is a message-tag capability: serving it means forwarding the tag, which is the
+/// same mediator that gates `message-tags`.
+pub const DOWNSTREAM_DEFERRED_SERVER_TIME: [&str; 1] = ["server-time"];
 
 /// Draft history capabilities, delegated to the versioned adapter so no `draft/...`
 /// literal appears outside it.
@@ -188,6 +209,24 @@ impl DownstreamCapabilities {
         advertised
     }
 
+    /// The complete downstream capability set for one generation.
+    ///
+    /// This is the single authority the live `SessionReader` uses for `CAP LS`. It is
+    /// defined here rather than in `downstream` so that the history drafts and the
+    /// foundational set cannot drift apart, and so a capability cannot be advertised by
+    /// one module while the live reader omits it.
+    pub fn advertisement(upstream: &UpstreamCapabilities) -> Vec<String> {
+        let mut advertised: Vec<String> = crate::downstream::DOWNSTREAM_ADVERTISED
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        let foundational = DownstreamCapabilities::default().advertise(upstream);
+        advertised.extend(foundational);
+        advertised.sort();
+        advertised.dedup();
+        advertised
+    }
+
     /// The advertisement as a set, for `CAP REQ` matching.
     pub fn advertise_set(&self, upstream: &UpstreamCapabilities) -> BTreeSet<String> {
         self.advertise(upstream).into_iter().collect()
@@ -332,24 +371,53 @@ mod tests {
 
     #[test]
     fn only_advertised_capabilities_are_granted_and_the_request_is_all_or_nothing() {
+        // The advertisement is the live set, so this exercises the same authority the
+        // session reader uses rather than a parallel claim that could drift from it.
         let upstream = UpstreamCapabilities::default();
-        let advertised: BTreeSet<String> = DownstreamCapabilities::default()
-            .advertise(&upstream)
+        let advertised: BTreeSet<String> = DownstreamCapabilities::advertisement(&upstream)
             .into_iter()
             .collect();
+        let history = crate::downstream::DOWNSTREAM_ADVERTISED[0];
         let mut downstream = DownstreamCapabilities::default();
         assert_eq!(
-            downstream.request(&advertised, &["batch".to_owned(), "server-time".to_owned()]),
-            CapDecision::Granted(vec!["batch".to_owned(), "server-time".to_owned()])
+            downstream.request(&advertised, &[history.to_owned()]),
+            CapDecision::Granted(vec![history.to_owned()]),
+            "a capability the live session serves must be grantable"
         );
-        assert!(downstream.is_enabled("batch"));
+        assert!(downstream.is_enabled(history));
         // A request naming one unavailable capability is refused as a whole, so the
         // client is never left guessing which half took effect.
         assert_eq!(
-            downstream.request(&advertised, &["batch".to_owned(), "chathistory".to_owned()]),
+            downstream.request(&advertised, &[history.to_owned(), "nonsense".to_owned()]),
             CapDecision::Refused
         );
-        assert!(!downstream.is_enabled("chathistory"));
+        assert!(
+            !downstream.is_enabled("nonsense"),
+            "an all-or-nothing refusal must leave nothing half-enabled"
+        );
+    }
+
+    #[test]
+    fn the_advertisement_never_exceeds_what_the_live_reader_serves() {
+        // Corrective 014 reconciliation: a capability advertised by one module while the
+        // live SessionReader omits it is a `CAP LS` the client has no way to challenge.
+        let upstream = UpstreamCapabilities::default();
+        let advertised = DownstreamCapabilities::advertisement(&upstream);
+        for withheld in DOWNSTREAM_DEFERRED_FOUNDATIONAL
+            .iter()
+            .chain(DOWNSTREAM_DEFERRED_SERVER_TIME.iter())
+        {
+            assert!(
+                !advertised.iter().any(|name| name == withheld),
+                "{withheld} is withheld downstream and must not be advertised"
+            );
+        }
+        assert!(
+            advertised
+                .iter()
+                .all(|name| crate::downstream::downstream_supported().contains(&name.as_str())),
+            "every advertised capability must be one the live reader serves"
+        );
     }
 
     #[test]

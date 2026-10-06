@@ -77,6 +77,30 @@ impl Harness {
         store: StoreHandle,
         online: bool,
     ) -> Self {
+        let mut harness = Self::build(network, nick, channels, store).await;
+        if online {
+            let mut upstream = harness.provider.take_peer().await;
+            harness.drive_online(&mut upstream).await;
+            harness.upstream = Some(upstream);
+        }
+        harness
+    }
+
+    /// The same harness, registered with the upstream label surface negotiated.
+    async fn start_labeled(
+        network: u64,
+        nick: &str,
+        channels: &[&str],
+        store: StoreHandle,
+    ) -> Self {
+        let mut harness = Self::build(network, nick, channels, store).await;
+        let mut upstream = harness.provider.take_peer().await;
+        harness.drive_online_labeled(&mut upstream).await;
+        harness.upstream = Some(upstream);
+        harness
+    }
+
+    async fn build(network: u64, nick: &str, channels: &[&str], store: StoreHandle) -> Self {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         // Queue enough connect outcomes that a later reconnect attempt fails loudly
         // with an empty queue rather than silently blocking.
@@ -96,7 +120,7 @@ impl Harness {
         let handle = SupervisorHandle::new(NetworkId(network), command_tx.clone());
         let (stop, stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move { owner.serve(command_rx, stop_rx).await });
-        let mut harness = Self {
+        Self {
             provider,
             commands: command_tx,
             handle,
@@ -105,13 +129,7 @@ impl Harness {
             snapshot,
             network: NetworkId(network),
             upstream: None,
-        };
-        if online {
-            let mut upstream = harness.provider.take_peer().await;
-            harness.drive_online(&mut upstream).await;
-            harness.upstream = Some(upstream);
         }
-        harness
     }
 
     /// The upstream stream for the current generation.
@@ -126,6 +144,37 @@ impl Harness {
         read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
         upstream
             .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+    }
+
+    /// Completes registration with the label surface negotiated upstream.
+    ///
+    /// Response routing needs upstream `labeled-response` before the bouncer will put a
+    /// label on its own queries. Without it the bouncer correctly falls back to
+    /// one-outstanding-query-per-family correlation, which cannot serve two concurrent
+    /// lookups or a labeled batch.
+    async fn drive_online_labeled(&self, upstream: &mut ScriptedStream) {
+        read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(b":srv CAP * LS :message-tags server-time batch labeled-response\r\n")
+            .await
+            .unwrap();
+        let request = read_until(upstream, b"CAP REQ").await;
+        let requested = String::from_utf8_lossy(&request);
+        for capability in ["message-tags", "server-time", "batch", "labeled-response"] {
+            assert!(
+                requested.contains(capability),
+                "the bouncer must request {capability}: {requested}"
+            );
+        }
+        upstream
+            .write_all(b":srv CAP * ACK :message-tags server-time batch labeled-response\r\n")
+            .await
+            .unwrap();
+        read_until(upstream, b"CAP END").await;
+        upstream
+            .write_all(b":srv 001 bot :welcome\r\n")
             .await
             .unwrap();
     }
@@ -707,4 +756,302 @@ async fn a_session_cannot_forge_an_upstream_generation() {
     // upstream session rather than being dropped or misattributed.
     let frames = read_until(upstream, b"PRIVMSG #room :forwarded\r\n").await;
     assert!(String::from_utf8_lossy(&frames).contains("PRIVMSG #room :forwarded"));
+}
+
+// ======================================================== LIVE RESPONSE ROUTING
+//
+// Corrective 014 qualification. These tests drive a real attached client through a
+// real upstream stream, so they prove the owner routes replies by SessionId rather
+// than proving only that the router does so in isolation.
+
+/// Reads until the needle arrives, returning everything the client saw so far.
+///
+/// Used where the assertion is about what a client did *not* receive: the caller
+/// writes the client command, drives the upstream reply, and then checks the peer's
+/// buffer without blocking on a frame that must never come.
+async fn drain_client(stream: &mut tokio::io::DuplexStream) -> String {
+    let mut all = Vec::new();
+    let mut buf = [0; 512];
+    // Drain whatever is already buffered without blocking indefinitely.
+    let read = async {
+        loop {
+            let count = stream.read(&mut buf).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..count]);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(400), read).await;
+    String::from_utf8_lossy(&all).into_owned()
+}
+
+#[tokio::test]
+async fn a_query_reply_reaches_only_the_client_that_asked() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(1, "bot", &[], handle, true).await;
+    harness.wait_phase(Phase::Online).await;
+
+    let (_first_session, mut first) = harness.attach(ClientId(1)).await;
+    harness.wait_attached(1).await;
+    register(&mut first, "bot").await;
+    let (_second_session, mut second) = harness.attach(ClientId(2)).await;
+    harness.wait_attached(2).await;
+    register(&mut second, "bot").await;
+
+    let upstream = harness.upstream();
+    first.write_all(b"WHOIS alice\r\n").await.unwrap();
+    read_until(upstream, b"WHOIS alice\r\n").await;
+
+    // The multi-line WHOIS answer. Without routing these would fan out to both clients,
+    // disclosing one client's lookup to the other.
+    upstream
+        .write_all(
+            b":srv 311 bot alice ~a host * :Alice\r\n\
+              :srv 318 bot alice :End of /WHOIS list.\r\n",
+        )
+        .await
+        .unwrap();
+
+    let seen_by_asking = read_client_until(&mut first, b"311 bot alice").await;
+    assert!(
+        seen_by_asking.contains("318 bot alice"),
+        "the asking client must receive the whole answer: {seen_by_asking}"
+    );
+    let seen_by_other = drain_client(&mut second).await;
+    assert!(
+        !seen_by_other.contains("WHOIS") && !seen_by_other.contains("311 bot alice"),
+        "a reply to one client must never reach another: {seen_by_other}"
+    );
+}
+
+#[tokio::test]
+async fn two_clients_query_concurrently_and_each_gets_only_its_own_answer() {
+    let (_store, handle) = store();
+    // Upstream must offer the label surface before the bouncer will label its own
+    // queries; otherwise concurrent lookups cannot be disambiguated.
+    let mut harness = Harness::start_labeled(1, "bot", &[], handle).await;
+    harness.wait_phase(Phase::Online).await;
+
+    let (_a, mut first) = harness.attach(ClientId(1)).await;
+    harness.wait_attached(1).await;
+    register(&mut first, "bot").await;
+    let (_b, mut second) = harness.attach(ClientId(2)).await;
+    harness.wait_attached(2).await;
+    register(&mut second, "bot").await;
+
+    let upstream = harness.upstream();
+    // Both clients use the *same* downstream label. Translated upstream they must not
+    // collide, or the two answers would be indistinguishable.
+    first
+        .write_all(b"@label=same WHOIS alice\r\n")
+        .await
+        .unwrap();
+    second
+        .write_all(b"@label=same WHOIS bob\r\n")
+        .await
+        .unwrap();
+    let frames = read_until(upstream, b"WHOIS bob\r\n").await;
+    let text = String::from_utf8_lossy(&frames);
+    assert!(
+        text.contains("@label="),
+        "a correlated query must carry a translated upstream label: {text}"
+    );
+    assert!(
+        !text.contains("@label=same"),
+        "a downstream label must never reach the server: {text}"
+    );
+
+    // The server answers each query with the label the bouncer sent. Answers arrive out
+    // of order, to prove ordering is not what routes them.
+    let label_of = |needle: &str| -> String {
+        text.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no query for {needle} in {text}"))
+            .split_whitespace()
+            .next()
+            .and_then(|tag| tag.strip_prefix("@label="))
+            .unwrap_or_else(|| panic!("query for {needle} carried no label in {text}"))
+            .to_owned()
+    };
+    let alice = label_of("WHOIS alice");
+    let bob = label_of("WHOIS bob");
+    assert_ne!(alice, bob, "two concurrent queries must not share a label");
+    upstream
+        .write_all(
+            format!(
+                "@label={bob} :srv 318 bot bob :End of /WHOIS list.\r\n\
+                 @label={alice} :srv 318 bot alice :End of /WHOIS list.\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let first_seen = read_client_until(&mut first, b"318 bot alice").await;
+    assert!(
+        first_seen.contains("@label=same"),
+        "the client's own label must be restored on its reply: {first_seen}"
+    );
+    let second_seen = read_client_until(&mut second, b"318 bot bob").await;
+    assert!(
+        second_seen.contains("@label=same"),
+        "the client's own label must be restored on its reply: {second_seen}"
+    );
+    let first_only = drain_client(&mut first).await;
+    assert!(
+        !first_only.contains("bot bob"),
+        "one client must not observe the other's answer: {first_only}"
+    );
+    let second_only = drain_client(&mut second).await;
+    assert!(
+        !second_only.contains("bot alice"),
+        "one client must not observe the other's answer: {second_only}"
+    );
+}
+
+#[tokio::test]
+async fn a_batched_multi_line_answer_stays_with_its_client_and_closes() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start_labeled(1, "bot", &[], handle).await;
+    harness.wait_phase(Phase::Online).await;
+
+    let (_first_session, mut first) = harness.attach(ClientId(1)).await;
+    harness.wait_attached(1).await;
+    register(&mut first, "bot").await;
+    let (_second_session, mut second) = harness.attach(ClientId(2)).await;
+    harness.wait_attached(2).await;
+    register(&mut second, "bot").await;
+
+    let upstream = harness.upstream();
+    first.write_all(b"WHOIS alice\r\n").await.unwrap();
+    let frames = read_until(upstream, b"WHOIS alice\r\n").await;
+    let label = String::from_utf8_lossy(&frames)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|tag| tag.strip_prefix("@label="))
+        .expect("the bouncer labeled its correlated query")
+        .to_owned();
+
+    // A batched answer: the opener carries the response label, the body carries only
+    // `batch=`, and the closing frame carries neither.
+    upstream
+        .write_all(
+            format!(
+                "@label={label} BATCH +ref labeled-response\r\n\
+                 @batch=ref :srv 311 bot alice ~a host * :Alice\r\n\
+                 @batch=ref :srv 318 bot alice :End of /WHOIS list.\r\n\
+                 :srv BATCH -ref\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let seen = read_client_until(&mut first, b"BATCH -ref").await;
+    assert!(seen.contains("311 bot alice"), "batched body: {seen}");
+    let other = drain_client(&mut second).await;
+    assert!(
+        !other.contains("311 bot alice") && !other.contains("BATCH"),
+        "a batched reply must not leak to another client: {other}"
+    );
+    // The batch consumed its route, so the table is back to empty.
+    assert_eq!(harness.snapshot.borrow().response_routes, 0);
+}
+
+#[tokio::test]
+async fn a_reply_arriving_after_a_detach_reaches_nobody() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(1, "bot", &[], handle, true).await;
+    harness.wait_phase(Phase::Online).await;
+
+    let (_session, mut client) = harness.attach(ClientId(1)).await;
+    harness.wait_attached(1).await;
+    register(&mut client, "bot").await;
+
+    let upstream = harness.upstream();
+    client.write_all(b"WHOIS alice\r\n").await.unwrap();
+    read_until(upstream, b"WHOIS alice\r\n").await;
+    assert_eq!(harness.snapshot.borrow().response_routes, 1);
+
+    // The client vanishes before its answer arrives.
+    drop(client);
+    harness.wait_attached(0).await;
+    assert_eq!(
+        harness.snapshot.borrow().response_routes,
+        0,
+        "detaching a client must release its routes"
+    );
+
+    // The late answer now belongs to nobody. It must be dropped, not fanned out into a
+    // future attachment.
+    harness
+        .upstream()
+        .write_all(b":srv 318 bot alice :End of /WHOIS list.\r\n")
+        .await
+        .unwrap();
+    let (_late, mut later) = harness.attach(ClientId(2)).await;
+    harness.wait_attached(1).await;
+    register(&mut later, "bot").await;
+    let seen = drain_client(&mut later).await;
+    assert!(
+        !seen.contains("311 bot alice"),
+        "an orphaned reply must not be delivered to a new attachment: {seen}"
+    );
+}
+
+#[tokio::test]
+async fn a_generation_replacement_delivers_no_reply_from_the_old_one() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(1, "bot", &[], handle, true).await;
+    harness.wait_phase(Phase::Online).await;
+
+    let (_session, mut client) = harness.attach(ClientId(1)).await;
+    harness.wait_attached(1).await;
+    register(&mut client, "bot").await;
+
+    let upstream = harness.upstream();
+    client.write_all(b"WHOIS alice\r\n").await.unwrap();
+    read_until(upstream, b"WHOIS alice\r\n").await;
+    assert_eq!(harness.snapshot.borrow().response_routes, 1);
+
+    // Ending the stream ends the generation and builds a fresh router.
+    drop(harness.upstream.take());
+    harness.wait_phase(Phase::Backoff).await;
+    let mut next = harness.provider.take_peer().await;
+    harness.drive_online(&mut next).await;
+    harness.upstream = Some(next);
+    harness.wait_phase(Phase::Online).await;
+    assert_eq!(
+        harness.snapshot.borrow().response_routes,
+        0,
+        "a new generation must inherit no route from the old one"
+    );
+}
+
+#[tokio::test]
+async fn an_unsolicited_reply_still_fans_out_to_every_client() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(1, "bot", &[], handle, true).await;
+    harness.wait_phase(Phase::Online).await;
+
+    let (_a, mut first) = harness.attach(ClientId(1)).await;
+    harness.wait_attached(1).await;
+    register(&mut first, "bot").await;
+    let (_b, mut second) = harness.attach(ClientId(2)).await;
+    harness.wait_attached(2).await;
+    register(&mut second, "bot").await;
+
+    // Routing must not silence ordinary broadcast traffic.
+    harness
+        .upstream()
+        .write_all(b":srv 372 bot :- MOTD -\r\n")
+        .await
+        .unwrap();
+
+    let first_seen = read_client_until(&mut first, b"372 ").await;
+    assert!(first_seen.contains("372"), "fanout: {first_seen}");
+    let second_seen = read_client_until(&mut second, b"372 ").await;
+    assert!(second_seen.contains("372"), "fanout: {second_seen}");
 }

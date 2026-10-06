@@ -22,7 +22,19 @@ use tokio::{
 ///
 /// Deliberately short. Advertising a capability the session does not implement would
 /// make `CAP LS` a lie the client has no way to detect.
+///
+/// This is the live authority. The reviewable rationale for each entry, and the list of
+/// capabilities deliberately withheld, live in [`crate::capability`].
 pub const DOWNSTREAM_ADVERTISED: &[&str] = &[CHATHISTORY_CAPABILITY, READ_MARKER_CAPABILITY];
+
+/// The exact `CAP LS` and `CAP REQ` support set for this generation.
+///
+/// Both are derived from the same constant so a capability cannot be advertised by one
+/// path and refused by the other: an ACK for a capability absent from `CAP LS` is the
+/// kind of contradiction a client cannot detect until it depends on it.
+pub fn downstream_supported() -> &'static [&'static str] {
+    DOWNSTREAM_ADVERTISED
+}
 
 /// Ceiling on capabilities one client may hold negotiated.
 pub const MAX_NEGOTIATED_CAPABILITIES: usize = 8;
@@ -407,7 +419,7 @@ impl<D: ByteStream> DownstreamSession<D> {
             let supported = !requested.is_empty()
                 && requested
                     .iter()
-                    .all(|name| DOWNSTREAM_ADVERTISED.contains(&name.as_str()));
+                    .all(|name| downstream_supported().contains(&name.as_str()));
             if !supported {
                 return queue_line(
                     &self.normal_tx,
@@ -429,7 +441,7 @@ impl<D: ByteStream> DownstreamSession<D> {
             &self.normal_tx,
             &format!(
                 ":bouncer CAP {target} LS :{}\r\n",
-                DOWNSTREAM_ADVERTISED.join(" ")
+                downstream_supported().join(" ")
             ),
         )
     }

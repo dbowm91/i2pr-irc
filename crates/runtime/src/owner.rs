@@ -21,7 +21,10 @@ use crate::{
     journal::IngestOutcome,
     playback::PlaybackOutcome,
     projection,
-    routing::ResponseRouter,
+    routing::{
+        BatchRole, Incoming, LABEL_TAG, RequestClass, ResponseRouter, RouteOutcome, RouteRefusal,
+        Routed, RoutingRequest,
+    },
     session::{
         SESSION_EVENT_QUEUE_CAPACITY, SessionEvent, SessionHandle, SessionIntent, SessionTask,
     },
@@ -588,6 +591,13 @@ pub struct NetworkSnapshot {
     pub upstream_capabilities: String,
     /// Routes currently open for this generation. Never durable.
     pub response_routes: usize,
+    /// Correlated replies dropped because no live route claimed them.
+    ///
+    /// A reply that carries a response label but matches no route is orphaned: its
+    /// request is stale or was never the bouncer's. It is counted here precisely
+    /// because it is never shown to any client -- delivering it would hand one client's
+    /// discarded reply to another.
+    pub orphaned_replies_dropped: u64,
     pub backlog_delivered: u64,
     /// True when more retained history exists beyond what the cap delivered.
     pub backlog_truncated: bool,
@@ -1123,6 +1133,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &mut router,
                         &mut batches,
                         &mut reconcile,
+                        &upstream_caps,
                     )
                     .await
                     {
@@ -1249,6 +1260,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &control_tx,
                             &buffers,
                             &ingest_tx,
+                            &mut router,
                         ) {
                             Ok(report) => {
                                 // A session that lost a live frame is detached before
@@ -1423,8 +1435,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         control_tx: &mpsc::Sender<Vec<u8>>,
         buffers: &BTreeMap<String, BufferId>,
         ingest_tx: &mpsc::Sender<IngestItem>,
+        router: &mut ResponseRouter,
     ) -> Result<FanoutReport, RuntimeError> {
         let mut desynchronized = Vec::new();
+        // Network state is applied exactly once per upstream line, before any routing
+        // decision, so a reply delivered to a single client still updates the shared
+        // view exactly as an ordinary fanout would.
         match state.apply_line(message) {
             LineOutcome::Quiet => {}
             LineOutcome::ReplyPong(token) => {
@@ -1432,25 +1448,63 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             }
             LineOutcome::Malformed => return Err(RuntimeError::Protocol),
         }
-        // Message-tag semantics are not advertised downstream yet, so tags are removed
-        // rather than forwarded under a capability the client did not negotiate.
-        let outgoing = if message.tags.is_empty() {
-            raw.to_vec()
-        } else {
-            let mut untagged = message.clone();
-            untagged.tags.clear();
-            untagged.encode().map_err(|_| RuntimeError::Protocol)?
-        };
-        for (id, task) in sessions {
-            if task.handle().fanout(outgoing.clone()).is_err() {
-                // Bounded fanout: the owner never awaits the session, so a stalled
-                // client cannot delay the Network or any other client. What it cannot
-                // do is keep the client: it has now skipped a live frame, so it is
-                // detached by the caller and counted here.
-                desynchronized.push(*id);
+        // Routing is consulted before ordinary fanout. A reply belonging to one client's
+        // open route is delivered only to that client; it must never also fan out, or
+        // the whole point of routing would be defeated.
+        let outcome = router.deliver(incoming_for(message), |route| {
+            // The client's own label is restored and the server's opaque label is
+            // removed. No other client ever sees either.
+            rebuild_reply(message, route.downstream_label.as_deref())
+        });
+        let fans_out = matches!(outcome, RouteOutcome::Fanout);
+        match outcome {
+            RouteOutcome::Fanout => {}
+            RouteOutcome::Dropped => {
+                // A correlated-looking reply that belongs to no live route. Delivering
+                // it to anyone would hand one client's orphaned reply to another.
                 self.snapshot.send_modify(|snapshot| {
-                    snapshot.fanout_dropped = snapshot.fanout_dropped.saturating_add(1)
+                    snapshot.orphaned_replies_dropped =
+                        snapshot.orphaned_replies_dropped.saturating_add(1)
                 });
+                return Ok(FanoutReport { desynchronized });
+            }
+            RouteOutcome::Continued(delivered) | RouteOutcome::Completed(delivered) => {
+                // A session is removed from `sessions` on detachment, so a missing entry
+                // means the client is already gone and its routes were dropped with it.
+                if let Some(task) = sessions.get(&delivered.session)
+                    && task.handle().fanout(delivered.line).is_err()
+                {
+                    desynchronized.push(delivered.session);
+                    self.snapshot.send_modify(|snapshot| {
+                        snapshot.fanout_dropped = snapshot.fanout_dropped.saturating_add(1)
+                    });
+                }
+                self.snapshot
+                    .send_modify(|snapshot| snapshot.response_routes = router.open_routes());
+            }
+        }
+        if fans_out {
+            // Message-tag semantics are not advertised downstream yet, so tags are
+            // removed rather than forwarded under a capability the client did not
+            // negotiate.
+            let outgoing = if message.tags.is_empty() {
+                raw.to_vec()
+            } else {
+                let mut untagged = message.clone();
+                untagged.tags.clear();
+                untagged.encode().map_err(|_| RuntimeError::Protocol)?
+            };
+            for (id, task) in sessions {
+                if task.handle().fanout(outgoing.clone()).is_err() {
+                    // Bounded fanout: the owner never awaits the session, so a stalled
+                    // client cannot delay the Network or any other client. What it cannot
+                    // do is keep the client: it has now skipped a live frame, so it is
+                    // detached by the caller and counted here.
+                    desynchronized.push(*id);
+                    self.snapshot.send_modify(|snapshot| {
+                        snapshot.fanout_dropped = snapshot.fanout_dropped.saturating_add(1)
+                    });
+                }
             }
         }
         // Only a message with a known buffer target is history-eligible. Eligibility
@@ -1520,6 +1574,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         router: &mut ResponseRouter,
         batches: &mut crate::ircv3::BatchTracker,
         reconcile: &mut DesiredReconcile,
+        upstream_caps: &UpstreamCapabilities,
     ) -> Result<(), RuntimeError> {
         match event {
             SessionEvent::Ended {
@@ -1605,6 +1660,25 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         answer_marker_update(journal, sessions, session, &wire, buffers).await;
                     }
                     SessionIntent::Forward { wire, class } => {
+                        let class_label = class.as_str();
+                        // A query whose reply the client expects to correlate is routed,
+                        // not blindly forwarded: without a route its numeric replies
+                        // would fan out to every attached client, disclosing one client's
+                        // lookup to all of them.
+                        if class == IntentClass::GenerationQuery {
+                            self.forward_routed(
+                                router,
+                                upstream_caps,
+                                &UpstreamAdmission {
+                                    normal_tx,
+                                    generation,
+                                    sessions,
+                                },
+                                session,
+                                wire,
+                            );
+                            return Ok(());
+                        }
                         // The owner stamps the generation, so a session cannot forge a
                         // frame as belonging to a live generation.
                         //
@@ -1615,7 +1689,6 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         // refusal because this path allocates none -- route allocation
                         // and send happen in the same owner turn, and nothing is opened
                         // for a frame that was not admitted.
-                        let class_label = class.as_str();
                         if normal_tx
                             .try_send(OutboundIntent {
                                 generation,
@@ -1697,6 +1770,121 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             }
         }
         Ok(())
+    }
+
+    /// Routes one client query upstream, translating its label, then admits the frame.
+    ///
+    /// Route allocation and admission happen in the same owner turn on purpose. If the
+    /// upstream queue refuses the frame, the route that was just opened is cancelled in
+    /// the same turn, so a frame that definitely never reached the server can never leave
+    /// a route behind to capture a later reply that belongs to no one.
+    fn forward_routed(
+        &self,
+        router: &mut ResponseRouter,
+        upstream_caps: &UpstreamCapabilities,
+        admission: &UpstreamAdmission<'_>,
+        session: SessionId,
+        wire: Vec<u8>,
+    ) {
+        let UpstreamAdmission {
+            normal_tx,
+            generation,
+            sessions,
+        } = admission;
+        let message = match Message::parse(&wire) {
+            Ok(message) => message,
+            // The session reader already validated this frame, so an unparsable one
+            // cannot reach here. Refusing it is still correct: nothing is opened.
+            Err(_) => return,
+        };
+        let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
+        // The client's own label is extracted and then dropped: it is replaced by an
+        // opaque generation-local token, and it is never forwarded to the server.
+        let downstream_label = message
+            .tags
+            .get(LABEL_TAG.as_bytes())
+            .and_then(|value| value.as_ref())
+            .map(|value| String::from_utf8_lossy(value).to_ascii_lowercase());
+        let params: Vec<String> = message
+            .params
+            .iter()
+            .map(|param| String::from_utf8_lossy(param).into_owned())
+            .collect();
+        let client = sessions
+            .get(&session)
+            .map(SessionTask::client)
+            .unwrap_or(ClientId(session.0));
+        let routed = router.route(
+            RoutingRequest {
+                session,
+                client,
+                command: &command,
+                params: &params,
+                downstream_label: downstream_label.as_deref(),
+                labeled_upstream: upstream_caps.labels_available(),
+            },
+            std::time::Instant::now(),
+        );
+        let (line, upstream_label) = match routed {
+            // Not a correlated family: the bouncer makes no claim about this reply, so
+            // forwarding it untouched is correct and ordinary fanout applies later.
+            Routed::Unlabeled => (wire, None),
+            Routed::Frame {
+                line,
+                upstream_label,
+            } => (line.into_bytes(), upstream_label),
+            Routed::Refused(refusal) => {
+                // Refused locally: nothing was opened and nothing was sent upstream.
+                self.report_route_refusal(sessions, session, refusal);
+                return;
+            }
+        };
+        if normal_tx
+            .try_send(OutboundIntent {
+                generation: *generation,
+                class: IntentClass::GenerationQuery,
+                wire: line,
+            })
+            .is_err()
+        {
+            // The frame was not admitted, so the query definitively did not reach the
+            // server. The route must not survive to claim someone else's later reply.
+            match upstream_label {
+                Some(label) => {
+                    router.cancel_labeled(&label);
+                }
+                None => {
+                    if let Some(class) = RequestClass::parse(&command) {
+                        router.cancel_fallback(class);
+                    }
+                }
+            }
+            self.report_upstream_overload(sessions, session, "query");
+        }
+    }
+
+    /// Tells one client a correlated query was refused before it reached the server.
+    ///
+    /// The text is fixed and says nothing about the request itself, so a refusal cannot
+    /// disclose what the client asked or which other client is holding capacity.
+    fn report_route_refusal(
+        &self,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        session: SessionId,
+        refusal: RouteRefusal,
+    ) {
+        let nick = self.snapshot.borrow().nick.clone().unwrap_or_default();
+        let reason = match refusal {
+            RouteRefusal::Busy => "Bouncer is already tracking a similar request",
+            RouteRefusal::Unsupported => "Bouncer cannot correlate that request",
+        };
+        if let Some(task) = sessions.get(&session) {
+            let _ = task
+                .handle()
+                .queue_normal(&format!(":bouncer NOTICE {nick} :{reason}\r\n"));
+        }
+        self.snapshot
+            .send_modify(|snapshot| snapshot.last_error = Some("route-refused"));
     }
 
     /// Tells one client its durable operation failed, without touching the Network.
@@ -1793,6 +1981,84 @@ async fn initial_read_markers(
         }
     }
     markers
+}
+
+/// What this generation's upstream write path accepts right now.
+///
+/// Grouped so a routed query is admitted through exactly the same queue and generation
+/// fence an unrouted one uses; there is deliberately no second way in.
+struct UpstreamAdmission<'a> {
+    normal_tx: &'a mpsc::Sender<OutboundIntent>,
+    generation: ConnectionGeneration,
+    sessions: &'a BTreeMap<SessionId, SessionTask>,
+}
+
+/// Describes one upstream frame to the router, without re-parsing wire text.
+///
+/// A `BATCH` command carries its reference as a parameter rather than as a `batch` tag,
+/// and the closing frame is unlabeled, so both forms are normalized here. That is what
+/// lets the messages *inside* a labeled-response batch -- which carry only
+/// `batch=<reference>` -- still reach the client that asked the question.
+fn incoming_for(message: &Message) -> Incoming<'_> {
+    let tag_text = |key: &str| {
+        message
+            .tags
+            .get(key.as_bytes())
+            .and_then(|value| value.as_deref())
+            .and_then(|value| std::str::from_utf8(value).ok())
+    };
+    let command = message.command.as_slice();
+    let numeric = (command.len() == 3 && command.iter().all(u8::is_ascii_digit))
+        .then(|| std::str::from_utf8(command).ok())
+        .flatten();
+    if command.eq_ignore_ascii_case(b"BATCH") {
+        let (reference, role) = match message.params.first().map(Vec::as_slice) {
+            // `BATCH +<reference> [type]` opens; `BATCH -<reference>` closes.
+            Some(reference) if reference.first() == Some(&b'+') => {
+                (Some(&reference[1..]), BatchRole::Open)
+            }
+            Some(reference) if reference.first() == Some(&b'-') => {
+                (Some(&reference[1..]), BatchRole::Close)
+            }
+            _ => (None, BatchRole::None),
+        };
+        return Incoming {
+            label: tag_text(LABEL_TAG),
+            batch: reference.and_then(|value| std::str::from_utf8(value).ok()),
+            numeric: None,
+            batch_role: role,
+        };
+    }
+    Incoming {
+        label: tag_text(LABEL_TAG),
+        batch: tag_text("batch"),
+        numeric,
+        batch_role: BatchRole::None,
+    }
+}
+
+/// Rebuilds one reply for the client that asked, restoring its original label.
+///
+/// The server's opaque label is always removed: it is generation-local bookkeeping that
+/// means nothing downstream and would let one client observe another's routing state.
+/// Every other tag is preserved, because a client that negotiated `labeled-response` has
+/// already negotiated the message-tag surface those tags travel on.
+fn rebuild_reply(message: &Message, downstream_label: Option<&str>) -> Vec<u8> {
+    let mut rebuilt = message.clone();
+    rebuilt.tags.remove(LABEL_TAG.as_bytes());
+    if let Some(label) = downstream_label {
+        rebuilt.tags.insert(
+            LABEL_TAG.as_bytes().to_vec(),
+            Some(label.as_bytes().to_vec()),
+        );
+    }
+    // A label that cannot be re-encoded must never be dropped silently in favour of an
+    // untagged line: that would look like a fresh reply to the client. The encoder only
+    // fails on structurally invalid input, which parsing already rejected, so this is a
+    // defensive fallback rather than an expected path.
+    rebuilt
+        .encode()
+        .unwrap_or_else(|_| message.clone().encode().unwrap_or_default())
 }
 
 /// The conversation target a history-eligible line belongs to.

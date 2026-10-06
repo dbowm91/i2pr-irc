@@ -5,13 +5,14 @@
 use i2pr_irc_core::Casemapping;
 use i2pr_irc_runtime::{
     capability::{
-        CapDecision, CapabilityName, DOWNSTREAM_DEFERRED_HISTORY, DownstreamCapabilities,
-        UpstreamCapabilities, upstream_is_client_independent,
+        CapDecision, CapabilityName, DOWNSTREAM_DEFERRED_FOUNDATIONAL, DOWNSTREAM_DEFERRED_HISTORY,
+        DOWNSTREAM_DEFERRED_SERVER_TIME, DownstreamCapabilities, UpstreamCapabilities,
+        upstream_is_client_independent,
     },
     ircv3::{BatchError, BatchTracker, TagDisposition, mediate_client_tags},
     routing::{
-        MAX_DOWNSTREAM_LABEL_BYTES, MAX_ROUTES, RequestClass, ResponseRouter, RouteOutcome,
-        RouteRefusal, Routed,
+        BatchRole, Incoming, MAX_DOWNSTREAM_LABEL_BYTES, MAX_LABEL_BYTES, MAX_ROUTES, RequestClass,
+        ResponseRouter, RouteOutcome, RouteRefusal, Routed, RoutingRequest, frame_label,
     },
 };
 use i2pr_irc_wire::Message;
@@ -42,26 +43,38 @@ fn the_upstream_capability_fingerprint_is_downstream_client_independent() {
     let before = enabled(&["message-tags", "batch", "labeled-response", "echo-message"]);
     let after = before.clone();
 
-    let mut first = DownstreamCapabilities::default();
-    let advertised: BTreeSet<String> = DownstreamCapabilities::default()
-        .advertise_set(&before)
-        .into_iter()
-        .collect();
-    assert_eq!(
-        first.request(&advertised, &["batch".to_owned(), "server-time".to_owned()]),
-        CapDecision::Granted(vec!["batch".to_owned(), "server-time".to_owned()])
-    );
-    let mut second = DownstreamCapabilities::default();
-    assert_eq!(
-        second.request(&advertised, &["message-tags".to_owned()]),
-        CapDecision::Granted(vec!["message-tags".to_owned()])
-    );
+    // Upstream asks for the full label surface, because the bouncer uses it for its own
+    // correlation. That is independent of what any client negotiates.
+    assert!(before.labels_available());
 
     assert!(
         upstream_is_client_independent(&before, &after),
         "two different downstream CAP negotiations must not alter the upstream set"
     );
     assert_eq!(before.fingerprint(), after.fingerprint());
+}
+
+#[test]
+fn a_downstream_request_for_a_withheld_capability_is_refused_as_a_whole() {
+    // The live reader serves only the history drafts plus conditional echo-message.
+    let upstream = enabled(&["message-tags", "batch", "labeled-response"]);
+    let advertised = DownstreamCapabilities::advertisement(&upstream);
+    let mut downstream = DownstreamCapabilities::default();
+    let set: BTreeSet<String> = advertised.iter().cloned().collect();
+    for withheld in DOWNSTREAM_DEFERRED_FOUNDATIONAL
+        .iter()
+        .chain(DOWNSTREAM_DEFERRED_SERVER_TIME.iter())
+    {
+        assert!(
+            !set.contains(*withheld),
+            "{withheld} must not be advertised until the client-tag mediator is live"
+        );
+        assert_eq!(
+            downstream.request(&set, &[(*withheld).to_owned()]),
+            CapDecision::Refused,
+            "{withheld} must not be granted downstream"
+        );
+    }
 }
 
 #[test]
@@ -100,18 +113,36 @@ fn the_upstream_request_set_is_the_reviewed_constant_only() {
 #[test]
 fn downstream_advertisement_is_exactly_what_this_build_implements() {
     let upstream = enabled(&["message-tags", "batch", "labeled-response"]);
-    let advertised = DownstreamCapabilities::default().advertise(&upstream);
-    assert_eq!(
-        advertised,
-        vec!["batch", "labeled-response", "message-tags", "server-time"]
-    );
-    // Draft history capabilities belong to M003-E and must not be advertised.
-    for deferred in DOWNSTREAM_DEFERRED_HISTORY {
+    // The advertisement is the live `SessionReader` set plus the conditional
+    // echo-message, and nothing else. It must never be a superset of what the session
+    // can actually serve, because `CAP LS` is the client's only evidence of support.
+    let advertised = DownstreamCapabilities::advertisement(&upstream);
+    for served in i2pr_irc_runtime::downstream::downstream_supported() {
         assert!(
-            !advertised.iter().any(|name| name == deferred),
-            "{deferred} must not be advertised before it is implemented"
+            advertised.iter().any(|name| name == served),
+            "{served} is served live and must be advertised"
         );
     }
+    for withheld in DOWNSTREAM_DEFERRED_FOUNDATIONAL
+        .iter()
+        .chain(DOWNSTREAM_DEFERRED_SERVER_TIME.iter())
+    {
+        assert!(
+            !advertised.iter().any(|name| name == withheld),
+            "{withheld} must not be advertised before its semantics are live"
+        );
+    }
+    // echo-message is conditional: the bouncer confirms only what the server echoed.
+    assert!(
+        !DownstreamCapabilities::advertisement(&UpstreamCapabilities::default())
+            .iter()
+            .any(|name| name == "echo-message")
+    );
+    assert!(
+        DownstreamCapabilities::advertisement(&enabled(&["echo-message"]))
+            .iter()
+            .any(|name| name == "echo-message")
+    );
 }
 
 #[test]
@@ -164,44 +195,44 @@ fn now() -> std::time::Instant {
 fn two_sessions_issue_concurrent_labeled_whois_and_receive_only_their_own() {
     let mut router = ResponseRouter::default();
     let at = now();
-    let Routed::Frame { line: first } = router.route(
-        i2pr_irc_core::SessionId(1),
-        i2pr_irc_core::ClientId(1),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("mine"),
-        true,
+    let Routed::Frame { line: first, .. } = router.route(
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(1),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("mine"),
+            labeled_upstream: true,
+        },
         at,
     ) else {
         panic!("expected a routed frame")
     };
-    let Routed::Frame { line: second } = router.route(
-        i2pr_irc_core::SessionId(2),
-        i2pr_irc_core::ClientId(2),
-        "WHOIS",
-        &["bob".to_owned()],
-        Some("mine"),
-        true,
+    let Routed::Frame { line: second, .. } = router.route(
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(2),
+            client: i2pr_irc_core::ClientId(2),
+            command: "WHOIS",
+            params: &["bob".to_owned()],
+            downstream_label: Some("mine"),
+            labeled_upstream: true,
+        },
         at,
     ) else {
         panic!("expected a routed frame")
     };
-    let label = |line: &str| {
-        line.split(' ')
-            .next()
-            .expect("labeled")
-            .trim_start_matches('@')
-            .to_owned()
-    };
+    let label = |line: &str| frame_label(line).expect("labeled").to_owned();
     assert_ne!(label(&first), label(&second));
 
     // Each reply is restored to the client that asked, with its own label.
     let first_label = label(&first);
     let second_label = label(&second);
     let RouteOutcome::Completed(one) = router.deliver(
-        Some(&first_label),
-        Some("318"),
-        Some(RequestClass::Whois),
+        Incoming {
+            label: Some(&first_label),
+            numeric: Some("318"),
+            ..Incoming::default()
+        },
         |route| {
             format!(
                 "WHOIS reply for {}\r\n",
@@ -209,7 +240,6 @@ fn two_sessions_issue_concurrent_labeled_whois_and_receive_only_their_own() {
             )
             .into_bytes()
         },
-        at,
     ) else {
         panic!("terminator must complete the route")
     };
@@ -220,9 +250,11 @@ fn two_sessions_issue_concurrent_labeled_whois_and_receive_only_their_own() {
         "the client's own label is restored"
     );
     let RouteOutcome::Completed(two) = router.deliver(
-        Some(&second_label),
-        Some("318"),
-        Some(RequestClass::Whois),
+        Incoming {
+            label: Some(&second_label),
+            numeric: Some("318"),
+            ..Incoming::default()
+        },
         |route| {
             format!(
                 "WHOIS reply for {}\r\n",
@@ -230,7 +262,6 @@ fn two_sessions_issue_concurrent_labeled_whois_and_receive_only_their_own() {
             )
             .into_bytes()
         },
-        at,
     ) else {
         panic!("terminator must complete the route")
     };
@@ -242,13 +273,15 @@ fn two_sessions_issue_concurrent_labeled_whois_and_receive_only_their_own() {
 fn a_client_label_is_never_forwarded_upstream_and_never_encodes_a_client_id() {
     let mut router = ResponseRouter::default();
     let at = now();
-    let Routed::Frame { line } = router.route(
-        i2pr_irc_core::SessionId(7),
-        i2pr_irc_core::ClientId(4242),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("secret-label"),
-        true,
+    let Routed::Frame { line, .. } = router.route(
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(7),
+            client: i2pr_irc_core::ClientId(4242),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("secret-label"),
+            labeled_upstream: true,
+        },
         at,
     ) else {
         panic!("expected a routed frame")
@@ -261,9 +294,9 @@ fn a_client_label_is_never_forwarded_upstream_and_never_encodes_a_client_id() {
         !line.contains("4242"),
         "a ClientId must never be encoded into an upstream label: {line}"
     );
-    let generated = line.split(' ').next().expect("label");
+    let generated = frame_label(&line).expect("label");
     assert!(
-        generated.len() <= 64,
+        generated.len() <= MAX_LABEL_BYTES,
         "the generated label stays within bounds"
     );
 }
@@ -272,46 +305,54 @@ fn a_client_label_is_never_forwarded_upstream_and_never_encodes_a_client_id() {
 fn an_old_session_label_cannot_route_to_a_replacement_session() {
     let mut router = ResponseRouter::default();
     let at = now();
-    let Routed::Frame { line } = router.route(
-        i2pr_irc_core::SessionId(1),
-        i2pr_irc_core::ClientId(1),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("l"),
-        true,
+    let Routed::Frame { line, .. } = router.route(
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(1),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
     ) else {
         panic!("expected a routed frame")
     };
-    let stale = line.split(' ').next().expect("label").to_owned();
+    let stale = frame_label(&line).expect("label").to_owned();
     // The client detaches and reattaches with a fresh SessionId.
     router.drop_session(i2pr_irc_core::SessionId(1));
-    let Routed::Frame { line: replacement } = router.route(
-        i2pr_irc_core::SessionId(2),
-        i2pr_irc_core::ClientId(1),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("l"),
-        true,
+    let Routed::Frame {
+        line: replacement, ..
+    } = router.route(
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(2),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
-    ) else {
+    )
+    else {
         panic!("expected a routed frame")
     };
     assert_ne!(
         stale,
-        replacement.split(' ').next().expect("label"),
+        frame_label(&replacement).expect("label"),
         "a replacement session must not reuse the old upstream label"
     );
     // The old label now matches nothing and is delivered to nobody.
     assert_eq!(
         router.deliver(
-            Some(stale.trim_start_matches('@')),
-            Some("318"),
-            None,
-            |route| panic!("must not rebuild for {}", route.session.0),
-            at
+            Incoming {
+                label: Some(&stale),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
+            |route| panic!("must not rebuild for {}", route.session.0)
         ),
-        RouteOutcome::Unmatched
+        RouteOutcome::Dropped
     );
 }
 
@@ -320,23 +361,26 @@ fn a_late_reply_with_an_unknown_label_is_never_delivered_to_another_client() {
     let mut router = ResponseRouter::default();
     let at = now();
     router.route(
-        i2pr_irc_core::SessionId(1),
-        i2pr_irc_core::ClientId(1),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("l"),
-        true,
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(1),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
     );
     assert_eq!(
         router.deliver(
-            Some("nonexistent-label"),
-            Some("318"),
-            None,
-            |route| panic!("must not rebuild for {}", route.session.0),
-            at
+            Incoming {
+                label: Some("nonexistent-label"),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
+            |route| panic!("must not rebuild for {}", route.session.0)
         ),
-        RouteOutcome::Unmatched,
+        RouteOutcome::Dropped,
         "an unknown label belongs to nobody, so guessing is the only alternative and it is wrong"
     );
     assert_eq!(router.open_routes(), 1, "the live route is untouched");
@@ -348,24 +392,28 @@ fn the_route_table_is_bounded_and_overflow_gets_a_deterministic_refusal() {
     let at = now();
     for index in 0..MAX_ROUTES {
         let Routed::Frame { .. } = router.route(
-            i2pr_irc_core::SessionId(index as u64 + 1),
-            i2pr_irc_core::ClientId(1),
-            "WHO",
-            &["#c".to_owned()],
-            Some("l"),
-            true,
+            RoutingRequest {
+                session: i2pr_irc_core::SessionId(index as u64 + 1),
+                client: i2pr_irc_core::ClientId(1),
+                command: "WHO",
+                params: &["#c".to_owned()],
+                downstream_label: Some("l"),
+                labeled_upstream: true,
+            },
             at,
         ) else {
             panic!("route {index} should be accepted")
         };
     }
     let refused = router.route(
-        i2pr_irc_core::SessionId(9999),
-        i2pr_irc_core::ClientId(1),
-        "WHO",
-        &["#c".to_owned()],
-        Some("l"),
-        true,
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(9999),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHO",
+            params: &["#c".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
     );
     assert_eq!(refused, Routed::Refused(RouteRefusal::Busy));
@@ -377,12 +425,14 @@ fn a_route_times_out_and_releases_its_slot_deterministically() {
     let mut router = ResponseRouter::new(std::time::Duration::from_millis(5));
     let at = now();
     router.route(
-        i2pr_irc_core::SessionId(1),
-        i2pr_irc_core::ClientId(1),
-        "WHO",
-        &["#c".to_owned()],
-        Some("l"),
-        true,
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(1),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHO",
+            params: &["#c".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
     );
     let later = at + std::time::Duration::from_millis(100);
@@ -390,13 +440,15 @@ fn a_route_times_out_and_releases_its_slot_deterministically() {
     assert!(router.is_empty());
     assert!(matches!(
         router.route(
-            i2pr_irc_core::SessionId(2),
-            i2pr_irc_core::ClientId(1),
-            "WHO",
-            &["#c".to_owned()],
-            Some("l"),
-            true,
-            later
+            RoutingRequest {
+                session: i2pr_irc_core::SessionId(2),
+                client: i2pr_irc_core::ClientId(1),
+                command: "WHO",
+                params: &["#c".to_owned()],
+                downstream_label: Some("l"),
+                labeled_upstream: true,
+            },
+            later,
         ),
         Routed::Frame { .. }
     ));
@@ -408,13 +460,15 @@ fn an_over_long_client_label_is_refused_before_the_wire() {
     let long = "x".repeat(MAX_DOWNSTREAM_LABEL_BYTES + 1);
     assert_eq!(
         router.route(
-            i2pr_irc_core::SessionId(1),
-            i2pr_irc_core::ClientId(1),
-            "WHOIS",
-            &["alice".to_owned()],
-            Some(&long),
-            true,
-            now()
+            RoutingRequest {
+                session: i2pr_irc_core::SessionId(1),
+                client: i2pr_irc_core::ClientId(1),
+                command: "WHOIS",
+                params: &["alice".to_owned()],
+                downstream_label: Some(&long),
+                labeled_upstream: true,
+            },
+            now(),
         ),
         Routed::Refused(RouteRefusal::Unsupported)
     );
@@ -437,29 +491,37 @@ fn fallback_correlation_follows_the_specified_completion_matrix() {
         let session = i2pr_irc_core::SessionId(9);
         assert!(matches!(
             router.route(
-                session,
-                i2pr_irc_core::ClientId(1),
-                class.as_str(),
-                &["x".to_owned()],
-                None,
-                false,
-                at
+                RoutingRequest {
+                    session,
+                    client: i2pr_irc_core::ClientId(1),
+                    command: class.as_str(),
+                    params: &["x".to_owned()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                at,
             ),
             Routed::Frame { .. }
         ));
         assert_eq!(
-            router.deliver(None, Some(unrelated), None, |_| Vec::new(), at),
-            RouteOutcome::Unmatched,
-            "{unrelated} must not complete a {} route",
+            router.deliver(
+                Incoming {
+                    numeric: Some(unrelated),
+                    ..Incoming::default()
+                },
+                |_| Vec::new()
+            ),
+            RouteOutcome::Fanout,
+            "{unrelated} belongs to another family, so it must not complete a {} route",
             class.as_str()
         );
         assert_eq!(router.open_routes(), 1);
         let RouteOutcome::Completed(delivered) = router.deliver(
-            None,
-            Some(terminator),
-            Some(class),
-            |route| format!("{}\\r\\n", route.session.0).into_bytes(),
-            at,
+            Incoming {
+                numeric: Some(terminator),
+                ..Incoming::default()
+            },
+            |route| format!("{}\r\n", route.session.0).into_bytes(),
         ) else {
             panic!("{terminator} must complete a {} route", class.as_str())
         };
@@ -474,26 +536,30 @@ fn a_competing_fallback_query_gets_a_deterministic_busy_disposition() {
     let at = now();
     assert!(matches!(
         router.route(
-            i2pr_irc_core::SessionId(1),
-            i2pr_irc_core::ClientId(1),
-            "WHOIS",
-            &["alice".to_owned()],
-            None,
-            false,
-            at
+            RoutingRequest {
+                session: i2pr_irc_core::SessionId(1),
+                client: i2pr_irc_core::ClientId(1),
+                command: "WHOIS",
+                params: &["alice".to_owned()],
+                downstream_label: None,
+                labeled_upstream: false,
+            },
+            at,
         ),
         Routed::Frame { .. }
     ));
     for _ in 0..5 {
         assert_eq!(
             router.route(
-                i2pr_irc_core::SessionId(2),
-                i2pr_irc_core::ClientId(2),
-                "WHOIS",
-                &["bob".to_owned()],
-                None,
-                false,
-                at
+                RoutingRequest {
+                    session: i2pr_irc_core::SessionId(2),
+                    client: i2pr_irc_core::ClientId(2),
+                    command: "WHOIS",
+                    params: &["bob".to_owned()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                at,
             ),
             Routed::Refused(RouteRefusal::Busy),
             "an ambiguous query is never queued without limit"
@@ -505,19 +571,20 @@ fn a_competing_fallback_query_gets_a_deterministic_busy_disposition() {
 #[test]
 fn there_is_no_generic_fifo_for_unlabeled_responses() {
     let mut router = ResponseRouter::default();
-    let at = now();
-    // No route is open, so an unlabeled numeric has nothing to belong to.
+    // No route is open, so an unlabeled numeric has nothing to belong to. A reply with
+    // no open route is ordinary unsolicited upstream traffic and fans out; what must
+    // never happen is one being guessed onto a client that did not ask for it.
     for numeric in ["318", "315", "366", "323", "372", "001"] {
         assert_eq!(
             router.deliver(
-                None,
-                Some(numeric),
-                None,
-                |route| panic!("{numeric} must not be attributed to {}", route.session.0),
-                at
+                Incoming {
+                    numeric: Some(numeric),
+                    ..Incoming::default()
+                },
+                |route| panic!("{numeric} must not be attributed to {}", route.session.0)
             ),
-            RouteOutcome::Unmatched,
-            "an unattributable reply must be dropped, never guessed onto a client"
+            RouteOutcome::Fanout,
+            "an unattributable reply must never be guessed onto a client"
         );
     }
     assert!(router.is_empty());
@@ -529,13 +596,15 @@ fn a_command_family_without_specified_semantics_creates_no_route() {
     for command in ["VERSION", "MOTD", "LUSERS", "TIME", "LINKS"] {
         assert_eq!(
             router.route(
-                i2pr_irc_core::SessionId(1),
-                i2pr_irc_core::ClientId(1),
-                command,
-                &["x".to_owned()],
-                Some("l"),
-                true,
-                now()
+                RoutingRequest {
+                    session: i2pr_irc_core::SessionId(1),
+                    client: i2pr_irc_core::ClientId(1),
+                    command,
+                    params: &["x".to_owned()],
+                    downstream_label: Some("l"),
+                    labeled_upstream: true,
+                },
+                now(),
             ),
             Routed::Unlabeled,
             "{command} has no specified correlation and must not create a route"
@@ -566,46 +635,86 @@ fn batch_tracking_is_bounded_and_identifiers_are_ephemeral() {
 fn a_batch_route_follows_replies_until_its_terminator() {
     let mut router = ResponseRouter::default();
     let at = now();
-    let Routed::Frame { line } = router.route(
-        i2pr_irc_core::SessionId(1),
-        i2pr_irc_core::ClientId(1),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("l"),
-        true,
+    let Routed::Frame { line, .. } = router.route(
+        RoutingRequest {
+            session: i2pr_irc_core::SessionId(1),
+            client: i2pr_irc_core::ClientId(1),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
     ) else {
         panic!("expected a routed frame")
     };
-    let label = line.split(' ').next().expect("label").to_owned();
-    assert!(router.expect_batch(label.trim_start_matches('@')));
-    // Non-terminating replies keep the route open.
+    let label = frame_label(&line).expect("label").to_owned();
+    // The server opens the reply batch, carrying the response label.
     assert!(matches!(
         router.deliver(
-            Some(label.trim_start_matches('@')),
-            Some("311"),
-            None,
-            |_| b"partial\r\n".to_vec(),
-            at
+            Incoming {
+                label: Some(&label),
+                batch: Some("ref"),
+                batch_role: BatchRole::Open,
+                ..Incoming::default()
+            },
+            |_| b"batch open\r\n".to_vec()
+        ),
+        RouteOutcome::Continued(_)
+    ));
+    // Non-terminating replies keep the route open, including the messages inside the
+    // batch, which carry only `batch=ref` and never repeat the label.
+    assert!(matches!(
+        router.deliver(
+            Incoming {
+                label: Some(&label),
+                numeric: Some("311"),
+                ..Incoming::default()
+            },
+            |_| b"partial\r\n".to_vec()
+        ),
+        RouteOutcome::Continued(_)
+    ));
+    // A batched route ends at its batch terminator, not at the numeric: ending early
+    // would leave the unlabeled closing frame orphaned and fanned out to every client.
+    assert!(matches!(
+        router.deliver(
+            Incoming {
+                batch: Some("ref"),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
+            |_| b"end of whois\r\n".to_vec()
         ),
         RouteOutcome::Continued(_)
     ));
     // The batch terminator closes it.
-    router.finish_batch(label.trim_start_matches('@'));
+    assert!(matches!(
+        router.deliver(
+            Incoming {
+                batch: Some("ref"),
+                batch_role: BatchRole::Close,
+                ..Incoming::default()
+            },
+            |_| b"batch close\r\n".to_vec()
+        ),
+        RouteOutcome::Completed(_)
+    ));
     assert!(router.is_empty());
+    assert_eq!(router.open_batches(), 0);
     assert_eq!(
         router.deliver(
-            Some(label.trim_start_matches('@')),
-            Some("318"),
-            None,
-            |_| b"late\r\n".to_vec(),
-            at
+            Incoming {
+                label: Some(&label),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
+            |_| b"late\r\n".to_vec()
         ),
-        RouteOutcome::Unmatched,
+        RouteOutcome::Dropped,
         "a reply after the batch completed reaches nobody"
     );
 }
-
 #[test]
 fn an_unknown_batch_reference_is_refused() {
     let mut tracker = BatchTracker::default();

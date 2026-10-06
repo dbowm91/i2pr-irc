@@ -1589,30 +1589,28 @@ async fn a_read_marker_round_trips_through_the_live_path() {
 
 #[tokio::test]
 async fn concurrent_labeled_queries_from_several_sessions_route_correctly() {
-    use i2pr_irc_runtime::routing::{RequestClass, ResponseRouter, RouteOutcome, Routed};
+    use i2pr_irc_runtime::routing::{
+        Incoming, ResponseRouter, RouteOutcome, Routed, RoutingRequest, frame_label,
+    };
 
     let mut router = ResponseRouter::default();
     let at = std::time::Instant::now();
     let mut labels = Vec::new();
     for session in 1..=3u64 {
-        let Routed::Frame { line } = router.route(
-            SessionId(session),
-            ClientId(session),
-            "WHOIS",
-            &[format!("target{session}")],
-            Some("same-label"),
-            true,
+        let Routed::Frame { line, .. } = router.route(
+            RoutingRequest {
+                session: SessionId(session),
+                client: ClientId(session),
+                command: "WHOIS",
+                params: &[format!("target{session}")],
+                downstream_label: Some("same-label"),
+                labeled_upstream: true,
+            },
             at,
         ) else {
             panic!("expected a routed frame")
         };
-        labels.push(
-            line.split(' ')
-                .next()
-                .expect("label")
-                .trim_start_matches('@')
-                .to_owned(),
-        );
+        labels.push(frame_label(&line).expect("label").to_owned());
     }
     // Identical downstream labels must produce distinct upstream labels, or the
     // second query's replies would be indistinguishable from the first's.
@@ -1625,11 +1623,12 @@ async fn concurrent_labeled_queries_from_several_sessions_route_correctly() {
     // Replies arrive out of order; each must reach the session that asked.
     for index in [2usize, 0, 1] {
         let RouteOutcome::Completed(delivered) = router.deliver(
-            Some(&labels[index]),
-            Some("318"),
-            Some(RequestClass::Whois),
+            Incoming {
+                label: Some(&labels[index]),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
             |route| format!("reply for {}\r\n", route.session.0).into_bytes(),
-            at,
         ) else {
             panic!("terminator must complete")
         };
@@ -1640,28 +1639,27 @@ async fn concurrent_labeled_queries_from_several_sessions_route_correctly() {
 
 #[tokio::test]
 async fn a_generation_replacement_discards_every_route() {
-    use i2pr_irc_runtime::routing::{ResponseRouter, RouteOutcome, Routed};
+    use i2pr_irc_runtime::routing::{
+        Incoming, ResponseRouter, RouteOutcome, Routed, RoutingRequest, frame_label,
+    };
 
     // Routes live in generation-owned state, so a replacement cannot inherit them.
     let mut first = ResponseRouter::default();
     let at = std::time::Instant::now();
-    let Routed::Frame { line } = first.route(
-        SessionId(1),
-        ClientId(1),
-        "WHOIS",
-        &["alice".to_owned()],
-        Some("l"),
-        true,
+    let Routed::Frame { line, .. } = first.route(
+        RoutingRequest {
+            session: SessionId(1),
+            client: ClientId(1),
+            command: "WHOIS",
+            params: &["alice".to_owned()],
+            downstream_label: Some("l"),
+            labeled_upstream: true,
+        },
         at,
     ) else {
         panic!("expected a routed frame")
     };
-    let stale = line
-        .split(' ')
-        .next()
-        .expect("label")
-        .trim_start_matches('@')
-        .to_owned();
+    let stale = frame_label(&line).expect("label").to_owned();
     assert_eq!(first.open_routes(), 1);
 
     // A new generation means a new router.
@@ -1669,13 +1667,14 @@ async fn a_generation_replacement_discards_every_route() {
     assert!(second.is_empty());
     assert_eq!(
         second.deliver(
-            Some(&stale),
-            Some("318"),
-            None,
-            |route| panic!("must not rebuild for {}", route.session.0),
-            at
+            Incoming {
+                label: Some(&stale),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
+            |route| panic!("must not rebuild for {}", route.session.0)
         ),
-        RouteOutcome::Unmatched,
+        RouteOutcome::Dropped,
         "a reply tagged for a previous generation reaches nobody"
     );
 }
@@ -1685,11 +1684,21 @@ async fn a_generation_replacement_discards_every_route() {
 #[test]
 fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
     let upstream = UpstreamCapabilities::default();
-    let advertised = DownstreamCapabilities::default().advertise(&upstream);
-    // The foundational set is exactly what M003-D froze; the history capabilities are
-    // advertised by the adapter that implements them, never mixed in here.
+    let advertised = DownstreamCapabilities::advertisement(&upstream);
+    // The advertisement is exactly what the live SessionReader serves. It must never be
+    // a superset: a capability a client cannot rely on is a claim it cannot challenge.
+    assert!(
+        advertised
+            .iter()
+            .all(|name| i2pr_irc_runtime::downstream::downstream_supported()
+                .contains(&name.as_str())),
+        "advertisement: {advertised:?}"
+    );
+    // The label surface is withheld until the client-tag mediator is live, even though
+    // upstream negotiation does have it: serving a client's labels downstream needs
+    // mediation and a truthful CLIENTTAGDENY that do not exist yet.
     for name in ["message-tags", "server-time", "batch", "labeled-response"] {
-        assert!(advertised.contains(&name.to_owned()), "{name}");
+        assert!(!advertised.contains(&name.to_owned()), "{name}");
     }
     let history = i2pr_irc_runtime::chathistory::capability_advertisement(false);
     assert_eq!(
@@ -1698,6 +1707,12 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
             i2pr_irc_runtime::chathistory::CHATHISTORY_CAPABILITY.to_owned(),
             i2pr_irc_runtime::chathistory::READ_MARKER_CAPABILITY.to_owned()
         ]
+    );
+    assert!(
+        advertised
+            .iter()
+            .all(|name| history.iter().any(|served| served == name)),
+        "the history adapter's capabilities are the ones served live"
     );
 }
 

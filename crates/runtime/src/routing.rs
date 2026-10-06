@@ -21,7 +21,17 @@
 //! An unlabeled reply arriving with no matching route belongs to *no known request*.
 //! Guessing it onto the oldest outstanding query would deliver one client's answer to
 //! another client, which is worse than refusing. Unlabeled correlation therefore exists
-//! only for the explicitly specified command families in [`FallbackRouter`].
+//! only for the explicitly specified command families in [`RequestClass`], with at most
+//! one outstanding query per family so that attribution is unambiguous.
+//!
+//! # Why an unknown label is dropped rather than fanned out
+//!
+//! A `label` tag on an upstream frame is a *response* label: it exists only to answer a
+//! request. If it matches no live route the request is stale or was never ours, and the
+//! frame belongs to nobody. Fanning it out would hand one client's orphaned reply to
+//! every other client. An unknown *batch* reference is the opposite case — the server
+//! opens batches of its own (`server-time` batching, for example) — so it fans out
+//! normally.
 use crate::{RuntimeError, capability::CapabilityError};
 use i2pr_irc_core::{ClientId, SessionId};
 use std::collections::HashMap;
@@ -31,6 +41,12 @@ use std::collections::HashMap;
 /// A full table refuses new correlated requests with a local busy disposition rather
 /// than growing without limit.
 pub const MAX_ROUTES: usize = 128;
+/// Ceiling on tracked upstream batch references for one generation.
+///
+/// A batch is tracked only to attribute it to a labeled route, so this bounds how much
+/// batch state a generation can hold. Exhaustion fails the route closed rather than
+/// leaving its batch contents unattributable.
+pub const MAX_ROUTE_BATCHES: usize = MAX_ROUTES;
 /// Ceiling on one generated upstream label.
 pub const MAX_LABEL_BYTES: usize = 64;
 /// Ceiling on one downstream label the bouncer will accept in translation.
@@ -39,6 +55,10 @@ pub const MAX_DOWNSTREAM_LABEL_BYTES: usize = 64;
 pub const ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Ceiling on how many times a route may absorb additional replies.
 pub const MAX_MULTIPART_REPLIES: usize = 64;
+
+/// The IRCv3 response-label tag. It carries a required value, so a routed frame is
+/// emitted as `@label=<opaque>` rather than a valueless tag.
+pub const LABEL_TAG: &str = "label";
 
 /// What kind of reply ends a route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +108,50 @@ impl RequestClass {
             Self::List => "323",
         }
     }
+    /// Every numeric reply that belongs to this family, terminator included.
+    ///
+    /// An unlabeled reply carries no request identity at all, so the whole family —
+    /// not just its terminator — is what a single outstanding query can claim. Routing
+    /// only the terminator would leave `RPL_WHOISUSER` and friends fanning out to every
+    /// attached client, which is exactly the disclosure this module exists to prevent.
+    ///
+    /// The sets are disjoint, which is what makes "at most one outstanding query per
+    /// family" sufficient: a numeric can belong to only one family, so attributing it
+    /// to that family's open route is never a guess.
+    pub fn numerics(self) -> &'static [&'static str] {
+        match self {
+            Self::Whois => &["311", "312", "313", "314", "317", "318", "319"],
+            Self::Who => &["315", "352", "354"],
+            Self::Names => &["353", "366"],
+            Self::List => &["321", "322", "323"],
+        }
+    }
+    /// The family a numeric reply belongs to, if any.
+    pub fn family_of(numeric: &str) -> Option<Self> {
+        [Self::Whois, Self::Who, Self::Names, Self::List]
+            .into_iter()
+            .find(|class| class.numerics().contains(&numeric))
+    }
+}
+
+/// Who is asking, and what, for one routed request.
+///
+/// Grouping these keeps [`ResponseRouter::route`]'s signature to a single argument
+/// object, so adding a field later does not silently widen a seven-parameter call.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingRequest<'a> {
+    /// The live attachment making the request.
+    pub session: SessionId,
+    /// The durable lineage that attachment belongs to.
+    pub client: ClientId,
+    /// The uppercase command.
+    pub command: &'a str,
+    /// Its parameters, with any label already removed.
+    pub params: &'a [String],
+    /// The client's own label, if it sent one.
+    pub downstream_label: Option<&'a str>,
+    /// Whether upstream negotiated `labeled-response`.
+    pub labeled_upstream: bool,
 }
 
 /// One outstanding correlated request.
@@ -119,8 +183,12 @@ pub enum RouteRefusal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Routed {
     /// The upstream frame to write, with the label already translated.
+    ///
+    /// `upstream_label` is the opaque token that was allocated, so the caller can
+    /// cancel exactly this route if the upstream queue then refuses the frame.
     Frame {
         line: String,
+        upstream_label: Option<String>,
     },
     /// The request needs no routing and may be forwarded as-is.
     Unlabeled,
@@ -141,12 +209,43 @@ pub struct Delivered {
 /// What a reply did to the routing table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteOutcome {
-    /// No route matched. The reply is not delivered to any client.
-    Unmatched,
+    /// The frame is not a correlated reply: ordinary fanout to every session.
+    Fanout,
+    /// The frame looks like a correlated reply but belongs to no live route. It is
+    /// dropped rather than delivered to a client that did not ask for it.
+    Dropped,
     /// A reply was delivered and the route remains open (multipart/batch).
     Continued(Delivered),
     /// A reply was delivered and the route is now closed.
     Completed(Delivered),
+}
+
+/// Whether an upstream `BATCH` frame opens or closes a batch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BatchRole {
+    /// Not a `BATCH` command frame.
+    #[default]
+    None,
+    /// `BATCH +<reference>`.
+    Open,
+    /// `BATCH -<reference>`.
+    Close,
+}
+
+/// One upstream message, as the router sees it.
+///
+/// The owner derives this from a parsed frame so the router never re-parses wire text
+/// and never has to guess what a tag contained.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Incoming<'a> {
+    /// The `label` tag value, when the server sent one.
+    pub label: Option<&'a str>,
+    /// The batch reference: the `batch` tag, or the reference of a `BATCH` command.
+    pub batch: Option<&'a str>,
+    /// The three-digit numeric, when this frame is one.
+    pub numeric: Option<&'a str>,
+    /// Whether this frame opens or closes a batch.
+    pub batch_role: BatchRole,
 }
 
 /// Generation-local response routing.
@@ -158,6 +257,12 @@ pub struct ResponseRouter {
     next_label: u64,
     /// One outstanding unlabeled fallback query per family.
     fallback: HashMap<RequestClass, Route>,
+    /// Upstream batch reference -> the upstream label whose route owns it.
+    ///
+    /// This exists so the messages *inside* a labeled-response batch, which carry only
+    /// `batch=<reference>` and no label of their own, still reach the session that
+    /// asked the question.
+    batches: HashMap<String, String>,
     /// Lifetime applied to new routes.
     timeout: std::time::Duration,
 }
@@ -174,6 +279,7 @@ impl ResponseRouter {
             routes: HashMap::new(),
             next_label: 1,
             fallback: HashMap::new(),
+            batches: HashMap::new(),
             timeout,
         }
     }
@@ -184,6 +290,10 @@ impl ResponseRouter {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty() && self.fallback.is_empty()
     }
+    /// Batch references currently attributed to an open route.
+    pub fn open_batches(&self) -> usize {
+        self.batches.len()
+    }
 
     /// Removes every expired route, releasing its fallback slot deterministically.
     pub fn expire(&mut self, now: std::time::Instant) -> usize {
@@ -192,6 +302,7 @@ impl ResponseRouter {
             .retain(|_, route| now.duration_since(route.created) < self.timeout);
         self.fallback
             .retain(|_, route| now.duration_since(route.created) < self.timeout);
+        self.prune_batches();
         before - self.open_routes()
     }
 
@@ -203,24 +314,20 @@ impl ResponseRouter {
         let before = self.open_routes();
         self.routes.retain(|_, route| route.session != session);
         self.fallback.retain(|_, route| route.session != session);
+        self.prune_batches();
         before - self.open_routes()
     }
 
     /// Routes one client command, translating its label when present.
-    ///
-    /// `command` is the uppercase command; `params` are its parameters with any label
-    /// already removed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn route(
-        &mut self,
-        session: SessionId,
-        client: ClientId,
-        command: &str,
-        params: &[String],
-        label: Option<&str>,
-        labeled_upstream: bool,
-        now: std::time::Instant,
-    ) -> Routed {
+    pub fn route(&mut self, request: RoutingRequest<'_>, now: std::time::Instant) -> Routed {
+        let RoutingRequest {
+            session,
+            client,
+            command,
+            params,
+            downstream_label: label,
+            labeled_upstream,
+        } = request;
         let Some(class) = RequestClass::parse(command) else {
             // Not a correlated family. Forwarding it untouched is correct: the bouncer
             // makes no claim about it and creates no route for it.
@@ -235,9 +342,8 @@ impl ResponseRouter {
             return Routed::Refused(RouteRefusal::Busy);
         }
         if labeled_upstream {
-            let upstream_label = match self.allocate_label() {
-                Some(label) => label,
-                None => return Routed::Refused(RouteRefusal::Busy),
+            let Some(upstream_label) = self.allocate_label() else {
+                return Routed::Refused(RouteRefusal::Busy);
             };
             let route = Route {
                 session,
@@ -251,10 +357,12 @@ impl ResponseRouter {
             if self.routes.insert(upstream_label.clone(), route).is_some() {
                 // The allocator is monotonic, so this is unreachable. Refusing is
                 // still better than overwriting a live route.
+                self.routes.remove(&upstream_label);
                 return Routed::Refused(RouteRefusal::Busy);
             }
             return Routed::Frame {
                 line: render(command, params, Some(&upstream_label)),
+                upstream_label: Some(upstream_label),
             };
         }
         // No labeled-response upstream: fall back to explicit family correlation.
@@ -278,45 +386,100 @@ impl ResponseRouter {
         );
         Routed::Frame {
             line: render(command, params, None),
+            upstream_label: None,
         }
     }
 
-    /// Routes one upstream reply back to its requesting session.
+    /// Cancels one labeled route, used when the upstream queue refuses its frame.
     ///
-    /// A label that matches no live route is dropped: it is stale, belongs to a
-    /// previous generation, or was never ours. Delivering it to another client would
-    /// be the failure this whole module exists to prevent.
+    /// A frame that was never admitted definitely did not reach the server, so the
+    /// route that was opened for it must not survive: it would otherwise consume a
+    /// route slot and, worse, capture a later reply that belongs to nobody.
+    pub fn cancel_labeled(&mut self, upstream_label: &str) -> bool {
+        self.remove_labeled(upstream_label).is_some()
+    }
+
+    /// Cancels one unlabeled fallback route for the same reason.
+    pub fn cancel_fallback(&mut self, class: RequestClass) -> bool {
+        self.fallback.remove(&class).is_some()
+    }
+
+    /// Routes one upstream reply back to its requesting session.
     pub fn deliver(
         &mut self,
-        label: Option<&str>,
-        numeric: Option<&str>,
-        class_hint: Option<RequestClass>,
+        incoming: Incoming<'_>,
         rebuild: impl FnOnce(&Route) -> Vec<u8>,
-        // Expiry is driven separately by [`Self::expire`], so this call only matches a
-        // live route and never ages one.
-        _now: std::time::Instant,
     ) -> RouteOutcome {
-        if let Some(label) = label {
-            let Some(route) = self.routes.get(label) else {
-                return RouteOutcome::Unmatched;
-            };
-            let class = route.class;
-            let session = route.session;
-            let client = route.client;
-            let line = rebuild(route);
-            let terminating = numeric.is_some_and(|value| value == class.terminator());
-            let entry = self.routes.get_mut(label).expect("route is live");
-            entry.replies = entry.replies.saturating_add(1);
-            let completed = terminating || entry.replies as usize >= MAX_MULTIPART_REPLIES;
-            if !completed {
-                return RouteOutcome::Continued(Delivered {
-                    session,
-                    client,
-                    line,
-                    completed: false,
-                });
+        if let Some(label) = incoming.label {
+            // A response label identifies one request. No live route means the reply
+            // is orphaned, and delivering it anywhere would be a misdelivery.
+            if !self.routes.contains_key(label) {
+                return RouteOutcome::Dropped;
             }
-            self.routes.remove(label);
+            return self.deliver_labeled(label, incoming, rebuild);
+        }
+        if let Some(reference) = incoming.batch {
+            if let Some(label) = self.batches.get(reference).cloned() {
+                return self.deliver_batch(&label, incoming, rebuild);
+            }
+            // An untracked batch reference belongs to the server, not to a route: the
+            // server opens batches of its own and those fan out normally.
+            return RouteOutcome::Fanout;
+        }
+        let Some(numeric) = incoming.numeric else {
+            return RouteOutcome::Fanout;
+        };
+        let Some(class) = RequestClass::family_of(numeric) else {
+            return RouteOutcome::Fanout;
+        };
+        if !self.fallback.contains_key(&class) {
+            return RouteOutcome::Fanout;
+        }
+        self.deliver_fallback(class, incoming, rebuild)
+    }
+
+    /// Delivers a frame that carried the route's own label.
+    fn deliver_labeled(
+        &mut self,
+        label: &str,
+        incoming: Incoming<'_>,
+        rebuild: impl FnOnce(&Route) -> Vec<u8>,
+    ) -> RouteOutcome {
+        if incoming.batch_role == BatchRole::Open {
+            let Some(reference) = incoming.batch else {
+                return RouteOutcome::Dropped;
+            };
+            if self.batches.len() >= MAX_ROUTE_BATCHES {
+                // Fail closed: an untrackable batch would leave its contents
+                // unattributable, so the route is abandoned rather than half-tracked.
+                self.remove_labeled(label);
+                return RouteOutcome::Dropped;
+            }
+            self.batches.insert(reference.to_owned(), label.to_owned());
+            if let Some(route) = self.routes.get_mut(label) {
+                route.kind = RouteKind::Batched;
+            }
+        }
+        let Some(route) = self.routes.get(label).cloned() else {
+            return RouteOutcome::Dropped;
+        };
+        let line = rebuild(&route);
+        let session = route.session;
+        let client = route.client;
+        let batched = route.kind == RouteKind::Batched;
+        let terminating = incoming
+            .numeric
+            .is_some_and(|value| value == route.class.terminator());
+        let capped = self.charge_reply(label, RouteKey::Labeled);
+        // A batched response ends when its batch closes: the closing frame carries no
+        // label, so ending earlier would leave it orphaned and fanned out to everyone.
+        let completed = if batched {
+            incoming.batch_role == BatchRole::Close || capped
+        } else {
+            terminating || capped
+        };
+        if completed {
+            self.remove_labeled(label);
             return RouteOutcome::Completed(Delivered {
                 session,
                 client,
@@ -324,61 +487,132 @@ impl ResponseRouter {
                 completed: true,
             });
         }
-        // Unlabeled: only the specified families may correlate, and only when the
-        // reply's numeric terminator closes them.
-        let Some(numeric) = numeric else {
-            return RouteOutcome::Unmatched;
-        };
-        // A terminator for a family this router did not open a route for is dropped:
-        // the family is located first so the map is not borrowed while being mutated.
-        let Some(class) = self
-            .fallback
-            .keys()
-            .find(|class| class.terminator() == numeric)
-            .copied()
-        else {
-            return RouteOutcome::Unmatched;
-        };
-        let Some(route) = self.fallback.remove(&class) else {
-            return RouteOutcome::Unmatched;
-        };
-        let _ = class_hint;
-        let line = rebuild(&route);
-        RouteOutcome::Completed(Delivered {
-            session: route.session,
-            client: route.client,
+        RouteOutcome::Continued(Delivered {
+            session,
+            client,
             line,
-            completed: true,
+            completed: false,
         })
     }
 
-    /// Promotes one open route to batch-following, so it continues until the
-    /// upstream `BATCH` terminator arrives.
-    pub fn expect_batch(&mut self, label: &str) -> bool {
-        match self.routes.get_mut(label) {
-            Some(route) => {
-                route.kind = RouteKind::Batched;
-                true
-            }
-            None => false,
+    /// Delivers a frame that belongs to a batch opened by a labeled route.
+    fn deliver_batch(
+        &mut self,
+        label: &str,
+        incoming: Incoming<'_>,
+        rebuild: impl FnOnce(&Route) -> Vec<u8>,
+    ) -> RouteOutcome {
+        let Some(route) = self.routes.get(label).cloned() else {
+            return RouteOutcome::Dropped;
+        };
+        let line = rebuild(&route);
+        let session = route.session;
+        let client = route.client;
+        let capped = self.charge_reply(label, RouteKey::Labeled);
+        let completed = incoming.batch_role == BatchRole::Close || capped;
+        if completed {
+            self.remove_labeled(label);
+            return RouteOutcome::Completed(Delivered {
+                session,
+                client,
+                line,
+                completed: true,
+            });
         }
+        RouteOutcome::Continued(Delivered {
+            session,
+            client,
+            line,
+            completed: false,
+        })
     }
 
-    /// Ends a batched route when its terminator arrives.
-    pub fn finish_batch(&mut self, label: &str) {
-        self.routes.remove(label);
+    /// Delivers an unlabeled reply to the one outstanding query of its family.
+    fn deliver_fallback(
+        &mut self,
+        class: RequestClass,
+        incoming: Incoming<'_>,
+        rebuild: impl FnOnce(&Route) -> Vec<u8>,
+    ) -> RouteOutcome {
+        let Some(route) = self.fallback.get(&class).cloned() else {
+            return RouteOutcome::Fanout;
+        };
+        let line = rebuild(&route);
+        let session = route.session;
+        let client = route.client;
+        let capped = self.charge_reply(class.as_str(), RouteKey::Fallback(class));
+        let terminating = incoming
+            .numeric
+            .is_some_and(|value| value == class.terminator());
+        if terminating || capped {
+            self.fallback.remove(&class);
+            return RouteOutcome::Completed(Delivered {
+                session,
+                client,
+                line,
+                completed: true,
+            });
+        }
+        RouteOutcome::Continued(Delivered {
+            session,
+            client,
+            line,
+            completed: false,
+        })
+    }
+
+    /// Counts one absorbed reply and reports whether the route hit its ceiling.
+    fn charge_reply(&mut self, key: &str, kind: RouteKey) -> bool {
+        let entry = match kind {
+            RouteKey::Labeled => self.routes.get_mut(key),
+            RouteKey::Fallback(_) => {
+                let class = match kind {
+                    RouteKey::Fallback(class) => class,
+                    RouteKey::Labeled => unreachable!("labeled key with fallback key"),
+                };
+                self.fallback.get_mut(&class)
+            }
+        };
+        let Some(entry) = entry else {
+            return true;
+        };
+        entry.replies = entry.replies.saturating_add(1);
+        entry.replies as usize >= MAX_MULTIPART_REPLIES
+    }
+
+    /// Removes one labeled route together with every batch attributed to it.
+    fn remove_labeled(&mut self, label: &str) -> Option<Route> {
+        let route = self.routes.remove(label)?;
+        self.batches.retain(|_, owner| owner.as_str() != label);
+        Some(route)
+    }
+
+    /// Drops batch references whose owning route no longer exists.
+    fn prune_batches(&mut self) {
+        let Self {
+            routes, batches, ..
+        } = self;
+        batches.retain(|_, owner| routes.contains_key(owner));
     }
 
     /// Monotonic, collision-free within a generation.
     ///
-    /// The value embeds the generation-scoped counter and the SessionId so a label is
-    /// self-describing for diagnostics without encoding a ClientId.
+    /// The value embeds the generation-scoped counter only. It never encodes a
+    /// ClientId, SessionId, network name or nick, because this string is visible to the
+    /// upstream server.
     fn allocate_label(&mut self) -> Option<String> {
         let value = self.next_label;
         self.next_label = self.next_label.checked_add(1)?;
         let label = format!("i2p{value:016x}");
         (label.len() <= MAX_LABEL_BYTES).then_some(label)
     }
+}
+
+/// Which table a charged reply belongs to.
+#[derive(Clone, Copy)]
+enum RouteKey {
+    Labeled,
+    Fallback(RequestClass),
 }
 
 impl CapabilityError {
@@ -392,10 +626,16 @@ impl CapabilityError {
 }
 
 /// Renders a command with an optional upstream label inserted before its parameters.
+///
+/// The `label` tag carries a required value under the reviewed specification, so the
+/// opaque token is emitted as `label=<value>`; a valueless `@label` would be a tag the
+/// server cannot correlate against.
 fn render(command: &str, params: &[String], label: Option<&str>) -> String {
     let mut line = String::new();
     if let Some(label) = label {
         line.push('@');
+        line.push_str(LABEL_TAG);
+        line.push('=');
         line.push_str(label);
         line.push(' ');
     }
@@ -408,13 +648,23 @@ fn render(command: &str, params: &[String], label: Option<&str>) -> String {
     line
 }
 
+/// The opaque upstream label a routed frame carries, for diagnostics and tests.
+pub fn frame_label(frame: &str) -> Option<&str> {
+    frame
+        .strip_prefix("@")?
+        .split_once('=')?
+        .1
+        .split(' ')
+        .next()
+}
+
 /// Refuses an over-long label before it reaches the wire.
 pub fn validate_label(label: &str) -> Result<(), RuntimeError> {
     if label.is_empty()
         || label.len() > MAX_DOWNSTREAM_LABEL_BYTES
         || label
             .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte == 0)
+            .any(|byte| byte.is_ascii_whitespace() || byte == 0 || byte == b';' || byte == b'=')
     {
         return Err(RuntimeError::Protocol);
     }
@@ -430,6 +680,30 @@ mod tests {
         ResponseRouter::new(ROUTE_TIMEOUT)
     }
 
+    fn open(router: &mut ResponseRouter, session: u64, command: &str, label: &str) -> String {
+        let Routed::Frame { line, .. } = router.route(
+            RoutingRequest {
+                session: SessionId(session),
+                client: ClientId(session),
+                command,
+                params: &["alice".into()],
+                downstream_label: Some(label),
+                labeled_upstream: true,
+            },
+            std::time::Instant::now(),
+        ) else {
+            panic!("expected a routed frame")
+        };
+        line
+    }
+
+    fn labeled(label: Option<&str>) -> Incoming<'_> {
+        Incoming {
+            label,
+            ..Incoming::default()
+        }
+    }
+
     #[test]
     fn only_specified_command_families_correlate() {
         let mut routes = router();
@@ -437,13 +711,15 @@ mod tests {
         // An unsupported command family must not create a route.
         assert_eq!(
             routes.route(
-                SessionId(1),
-                ClientId(1),
-                "VERSION",
-                &["bouncer".into()],
-                Some("lbl"),
-                true,
-                now
+                RoutingRequest {
+                    session: SessionId(1),
+                    client: ClientId(1),
+                    command: "VERSION",
+                    params: &["bouncer".into()],
+                    downstream_label: Some("lbl"),
+                    labeled_upstream: true,
+                },
+                now,
             ),
             Routed::Unlabeled
         );
@@ -454,12 +730,14 @@ mod tests {
         for command in ["WHOIS", "WHO", "NAMES", "LIST"] {
             let mut fresh = router();
             let outcome = fresh.route(
-                SessionId(1),
-                ClientId(1),
-                command,
-                &["target".into()],
-                Some("lbl"),
-                true,
+                RoutingRequest {
+                    session: SessionId(1),
+                    client: ClientId(1),
+                    command,
+                    params: &["target".into()],
+                    downstream_label: Some("lbl"),
+                    labeled_upstream: true,
+                },
                 now,
             );
             assert!(matches!(outcome, Routed::Frame { .. }), "{command}");
@@ -470,41 +748,10 @@ mod tests {
     #[test]
     fn the_same_downstream_label_from_two_sessions_never_collides_upstream() {
         let mut router = router();
-        let now = std::time::Instant::now();
-        let Routed::Frame { line: first } = router.route(
-            SessionId(1),
-            ClientId(1),
-            "WHOIS",
-            &["alice".into()],
-            Some("same"),
-            true,
-            now,
-        ) else {
-            panic!("expected a routed frame")
-        };
-        let Routed::Frame { line: second } = router.route(
-            SessionId(2),
-            ClientId(2),
-            "WHOIS",
-            &["bob".into()],
-            Some("same"),
-            true,
-            now,
-        ) else {
-            panic!("expected a routed frame")
-        };
-        let first_label = first
-            .split(' ')
-            .next()
-            .expect("labeled line")
-            .trim_start_matches('@')
-            .to_owned();
-        let second_label = second
-            .split(' ')
-            .next()
-            .expect("labeled line")
-            .trim_start_matches('@')
-            .to_owned();
+        let first = open(&mut router, 1, "WHOIS", "same");
+        let second = open(&mut router, 2, "WHOIS", "same");
+        let first_label = frame_label(&first).expect("upstream label").to_owned();
+        let second_label = frame_label(&second).expect("upstream label").to_owned();
         assert_ne!(
             first_label, second_label,
             "identical client labels must never collide upstream"
@@ -513,39 +760,88 @@ mod tests {
             !first.contains("same"),
             "the client label must never appear upstream: {first}"
         );
-        assert!(
-            !second_label.contains("ClientId"),
-            "a ClientId must never be encoded into an upstream label"
+    }
+
+    #[test]
+    fn an_upstream_label_never_encodes_a_session_or_client_identity() {
+        // The label is a generation-local counter. It must be identical for identical
+        // positions regardless of which client occupies them, which is only possible if
+        // ClientId and SessionId are not inputs to its construction.
+        let mut first_router = router();
+        let a = open(&mut first_router, 1, "WHOIS", "l");
+        let b = open(&mut first_router, 2, "WHOIS", "l");
+
+        let mut other = router();
+        let Routed::Frame { line: c, .. } = other.route(
+            RoutingRequest {
+                session: SessionId(4242),
+                client: ClientId(4242),
+                command: "WHOIS",
+                params: &["alice".into()],
+                downstream_label: Some("l"),
+                labeled_upstream: true,
+            },
+            std::time::Instant::now(),
+        ) else {
+            panic!("expected a routed frame")
+        };
+        let Routed::Frame { line: d, .. } = other.route(
+            RoutingRequest {
+                session: SessionId(9_999_999),
+                client: ClientId(7_777_777),
+                command: "WHOIS",
+                params: &["alice".into()],
+                downstream_label: Some("l"),
+                labeled_upstream: true,
+            },
+            std::time::Instant::now(),
+        ) else {
+            panic!("expected a routed frame")
+        };
+
+        assert_eq!(
+            frame_label(&a),
+            frame_label(&c),
+            "the first label must not depend on who asked"
         );
+        assert_eq!(
+            frame_label(&b),
+            frame_label(&d),
+            "the second label must not depend on who asked"
+        );
+        for label in [a, b, c, d] {
+            let rendered = label.clone();
+            assert!(
+                !rendered.contains("4242") && !rendered.contains("9999999"),
+                "no session or client identity may appear in an upstream label: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generated_label_carries_the_value_the_specification_requires() {
+        let mut router = router();
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        assert!(
+            frame.starts_with("@label=i2p"),
+            "the label tag must carry a value: {frame}"
+        );
+        assert!(frame_label(&frame).is_some());
+        assert!(validate_label(frame_label(&frame).expect("label")).is_ok());
     }
 
     #[test]
     fn a_reply_is_delivered_to_the_session_that_asked_and_no_other() {
         let mut router = router();
-        let now = std::time::Instant::now();
-        let Routed::Frame { line } = router.route(
-            SessionId(1),
-            ClientId(1),
-            "WHOIS",
-            &["alice".into()],
-            Some("mine"),
-            true,
-            now,
-        ) else {
-            panic!("expected a routed frame")
-        };
-        let label = line
-            .split(' ')
-            .next()
-            .expect("label")
-            .trim_start_matches('@')
-            .to_owned();
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        let label = frame_label(&frame).expect("label").to_owned();
         let outcome = router.deliver(
-            Some(&label),
-            Some("318"),
-            Some(RequestClass::Whois),
+            Incoming {
+                label: Some(&label),
+                numeric: Some("318"),
+                ..Incoming::default()
+            },
             |route| format!("WHOIS reply for session {}\r\n", route.session.0).into_bytes(),
-            now,
         );
         let RouteOutcome::Completed(delivered) = outcome else {
             panic!("terminator must complete the route")
@@ -555,37 +851,17 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_label_matches_no_route_and_is_never_delivered() {
+    fn a_stale_label_is_dropped_and_never_fanned_out() {
         let mut router = router();
-        let now = std::time::Instant::now();
-        let Routed::Frame { line } = router.route(
-            SessionId(1),
-            ClientId(1),
-            "WHOIS",
-            &["alice".into()],
-            Some("mine"),
-            true,
-            now,
-        ) else {
-            panic!("expected a routed frame")
-        };
-        let label = line
-            .split(' ')
-            .next()
-            .expect("label")
-            .trim_start_matches('@')
-            .to_owned();
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        let label = frame_label(&frame).expect("label").to_owned();
         router.drop_session(SessionId(1));
-        // The same label arriving afterwards belongs to nobody.
         assert_eq!(
-            router.deliver(
-                Some(&label),
-                Some("318"),
-                None,
-                |route| panic!("no route may be rebuilt for {}", route.class.as_str()),
-                now
-            ),
-            RouteOutcome::Unmatched
+            router.deliver(labeled(Some(&label)), |route| {
+                panic!("no route may be rebuilt for {}", route.class.as_str())
+            }),
+            RouteOutcome::Dropped,
+            "an orphaned labeled reply belongs to nobody"
         );
         assert!(router.is_empty());
     }
@@ -597,12 +873,14 @@ mod tests {
         for index in 0..MAX_ROUTES {
             let session = SessionId(index as u64 + 1);
             let Routed::Frame { .. } = router.route(
-                session,
-                ClientId(1),
-                "WHO",
-                &["#c".into()],
-                Some("l"),
-                true,
+                RoutingRequest {
+                    session,
+                    client: ClientId(1),
+                    command: "WHO",
+                    params: &["#c".into()],
+                    downstream_label: Some("l"),
+                    labeled_upstream: true,
+                },
                 now,
             ) else {
                 panic!("route {index} should have been accepted")
@@ -611,13 +889,15 @@ mod tests {
         assert_eq!(router.open_routes(), MAX_ROUTES);
         assert_eq!(
             router.route(
-                SessionId(9999),
-                ClientId(1),
-                "WHO",
-                &["#c".into()],
-                Some("l"),
-                true,
-                now
+                RoutingRequest {
+                    session: SessionId(9999),
+                    client: ClientId(1),
+                    command: "WHO",
+                    params: &["#c".into()],
+                    downstream_label: Some("l"),
+                    labeled_upstream: true,
+                },
+                now,
             ),
             Routed::Refused(RouteRefusal::Busy)
         );
@@ -631,51 +911,43 @@ mod tests {
     #[test]
     fn detaching_a_session_drops_only_its_routes() {
         let mut router = router();
-        let now = std::time::Instant::now();
-        for session in [SessionId(1), SessionId(2)] {
-            router.route(
-                session,
-                ClientId(1),
-                "WHO",
-                &["#c".into()],
-                Some("l"),
-                true,
-                now,
-            );
-        }
+        open(&mut router, 1, "WHO", "l");
+        open(&mut router, 2, "WHO", "l");
         assert_eq!(router.drop_session(SessionId(1)), 1);
         assert_eq!(router.open_routes(), 1);
+    }
+
+    #[test]
+    fn a_refused_upstream_admission_leaves_no_route_behind() {
+        let mut router = router();
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        let label = frame_label(&frame).expect("label").to_owned();
+        assert_eq!(router.open_routes(), 1);
+        // The upstream queue refused the frame, so the query definitely never reached
+        // the server and nothing may still be waiting to claim its reply.
+        assert!(router.cancel_labeled(&label));
+        assert!(router.is_empty());
+        assert_eq!(
+            router.deliver(labeled(Some(&label)), |_| panic!("must not rebuild")),
+            RouteOutcome::Dropped
+        );
+        assert!(
+            !router.cancel_labeled(&label),
+            "cancelling twice is a no-op"
+        );
     }
 
     #[test]
     fn a_timed_out_route_releases_its_slot_deterministically() {
         let mut router = ResponseRouter::new(std::time::Duration::from_millis(1));
         let now = std::time::Instant::now();
-        router.route(
-            SessionId(1),
-            ClientId(1),
-            "WHO",
-            &["#c".into()],
-            Some("l"),
-            true,
-            now,
-        );
+        open(&mut router, 1, "WHO", "l");
         assert_eq!(router.open_routes(), 1);
         let later = now + std::time::Duration::from_millis(50);
         assert_eq!(router.expire(later), 1);
         assert!(router.is_empty());
-        // The slot is reusable, so a timeout cannot wedge the router.
-        let Routed::Frame { .. } = router.route(
-            SessionId(2),
-            ClientId(1),
-            "WHO",
-            &["#c".into()],
-            Some("l"),
-            true,
-            later,
-        ) else {
-            panic!("a released slot must be reusable")
-        };
+        let later_frame = open(&mut router, 2, "WHO", "l");
+        assert!(frame_label(&later_frame).is_some());
     }
 
     #[test]
@@ -684,39 +956,82 @@ mod tests {
         let now = std::time::Instant::now();
         assert!(matches!(
             router.route(
-                SessionId(1),
-                ClientId(1),
-                "WHOIS",
-                &["alice".into()],
-                None,
-                false,
-                now
+                RoutingRequest {
+                    session: SessionId(1),
+                    client: ClientId(1),
+                    command: "WHOIS",
+                    params: &["alice".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                now,
             ),
             Routed::Frame { .. }
         ));
         // A competing request for the same family gets a deterministic busy result.
         assert_eq!(
             router.route(
-                SessionId(2),
-                ClientId(2),
-                "WHOIS",
-                &["bob".into()],
-                None,
-                false,
-                now
+                RoutingRequest {
+                    session: SessionId(2),
+                    client: ClientId(2),
+                    command: "WHOIS",
+                    params: &["bob".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                now,
             ),
             Routed::Refused(RouteRefusal::Busy)
         );
         // A different family is unaffected.
         assert!(matches!(
             router.route(
-                SessionId(2),
-                ClientId(2),
-                "WHO",
-                &["#c".into()],
-                None,
-                false,
-                now
+                RoutingRequest {
+                    session: SessionId(2),
+                    client: ClientId(2),
+                    command: "WHO",
+                    params: &["#c".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                now,
+            ),
+            Routed::Frame { .. }
+        ));
+    }
+
+    #[test]
+    fn a_refused_fallback_admission_frees_the_family_slot() {
+        let mut router = router();
+        let now = std::time::Instant::now();
+        assert!(matches!(
+            router.route(
+                RoutingRequest {
+                    session: SessionId(1),
+                    client: ClientId(1),
+                    command: "WHOIS",
+                    params: &["alice".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                now,
+            ),
+            Routed::Frame { .. }
+        ));
+        assert!(router.cancel_fallback(RequestClass::Whois));
+        assert!(router.is_empty());
+        // The family slot is reusable, so a refused send cannot wedge the router.
+        assert!(matches!(
+            router.route(
+                RoutingRequest {
+                    session: SessionId(2),
+                    client: ClientId(1),
+                    command: "WHOIS",
+                    params: &["bob".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                now,
             ),
             Routed::Frame { .. }
         ));
@@ -734,26 +1049,34 @@ mod tests {
             let now = std::time::Instant::now();
             let session = SessionId(1);
             router.route(
-                session,
-                ClientId(1),
-                class.as_str(),
-                &["x".into()],
-                None,
-                false,
+                RoutingRequest {
+                    session,
+                    client: ClientId(1),
+                    command: class.as_str(),
+                    params: &["x".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
                 now,
             );
-            // An unrelated numeric must not complete it.
+            // A numeric outside every family is not ours and still fans out.
             assert_eq!(
-                router.deliver(None, Some("372"), None, |_| Vec::new(), now),
-                RouteOutcome::Unmatched
+                router.deliver(
+                    Incoming {
+                        numeric: Some("372"),
+                        ..Incoming::default()
+                    },
+                    |_| Vec::new()
+                ),
+                RouteOutcome::Fanout
             );
             assert_eq!(router.open_routes(), 1, "{terminator} must still be open");
             let RouteOutcome::Completed(delivered) = router.deliver(
-                None,
-                Some(terminator),
-                Some(class),
+                Incoming {
+                    numeric: Some(terminator),
+                    ..Incoming::default()
+                },
                 |route| format!("reply {}\r\n", route.session.0).into_bytes(),
-                now,
             ) else {
                 panic!("{terminator} must complete the route")
             };
@@ -763,28 +1086,196 @@ mod tests {
     }
 
     #[test]
-    fn an_unlabeled_reply_with_no_open_route_is_dropped() {
+    fn every_numeric_of_an_open_family_stays_with_its_asking_client() {
+        // Routing only the terminator would let RPL_WHOISUSER fan out to every
+        // attached client, disclosing one client's query to the others.
+        for class in [
+            RequestClass::Whois,
+            RequestClass::Who,
+            RequestClass::Names,
+            RequestClass::List,
+        ] {
+            let mut router = router();
+            let now = std::time::Instant::now();
+            router.route(
+                RoutingRequest {
+                    session: SessionId(7),
+                    client: ClientId(7),
+                    command: class.as_str(),
+                    params: &["x".into()],
+                    downstream_label: None,
+                    labeled_upstream: false,
+                },
+                now,
+            );
+            // Every non-terminator numeric must stay with the asking session, and the
+            // terminator is checked last because reaching it ends the route.
+            for numeric in class
+                .numerics()
+                .iter()
+                .copied()
+                .filter(|value| *value != class.terminator())
+            {
+                let outcome = router.deliver(
+                    Incoming {
+                        numeric: Some(numeric),
+                        ..Incoming::default()
+                    },
+                    |route| format!("reply for {}\r\n", route.session.0).into_bytes(),
+                );
+                let RouteOutcome::Continued(delivered) = outcome else {
+                    panic!("{numeric} must stay with the asking session")
+                };
+                assert_eq!(delivered.session, SessionId(7));
+                assert_eq!(router.open_routes(), 1, "{numeric} must not complete");
+            }
+            let terminator = class.terminator();
+            let RouteOutcome::Completed(delivered) = router.deliver(
+                Incoming {
+                    numeric: Some(terminator),
+                    ..Incoming::default()
+                },
+                |route| format!("reply for {}\r\n", route.session.0).into_bytes(),
+            ) else {
+                panic!("{terminator} must complete {}", class.as_str())
+            };
+            assert_eq!(delivered.session, SessionId(7));
+            assert!(router.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_family_numeric_sets_are_disjoint() {
+        // Disjointness is what makes "one outstanding query per family" sufficient to
+        // attribute an unlabeled reply without guessing.
+        let mut seen: Vec<&str> = Vec::new();
+        for class in [
+            RequestClass::Whois,
+            RequestClass::Who,
+            RequestClass::Names,
+            RequestClass::List,
+        ] {
+            for numeric in class.numerics() {
+                assert!(
+                    !seen.contains(numeric),
+                    "{numeric} belongs to more than one family"
+                );
+                seen.push(numeric);
+            }
+        }
+        assert_eq!(RequestClass::family_of("372"), None);
+        assert_eq!(RequestClass::family_of("318"), Some(RequestClass::Whois));
+    }
+
+    #[test]
+    fn an_unlabeled_reply_with_no_open_route_fans_out() {
         let mut router = router();
-        let now = std::time::Instant::now();
         assert_eq!(
             router.deliver(
-                None,
-                Some("366"),
-                None,
-                |route| panic!("must not rebuild for {}", route.class.as_str()),
-                now
+                Incoming {
+                    numeric: Some("366"),
+                    ..Incoming::default()
+                },
+                |route| panic!("must not rebuild for {}", route.class.as_str())
             ),
-            RouteOutcome::Unmatched
+            RouteOutcome::Fanout
         );
         assert_eq!(
+            router.deliver(Incoming::default(), |_| panic!("must not rebuild")),
+            RouteOutcome::Fanout
+        );
+    }
+
+    #[test]
+    fn a_labeled_batch_reaches_its_owner_and_closes_on_the_terminator() {
+        let mut router = router();
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        let label = frame_label(&frame).expect("label").to_owned();
+
+        // `@label=X BATCH +ref labeled-response` opens the reply batch.
+        let RouteOutcome::Continued(opened) = router.deliver(
+            Incoming {
+                label: Some(&label),
+                batch: Some("ref"),
+                batch_role: BatchRole::Open,
+                ..Incoming::default()
+            },
+            |_| b"BATCH open\r\n".to_vec(),
+        ) else {
+            panic!("the batch opener belongs to the route")
+        };
+        assert_eq!(opened.session, SessionId(1));
+        assert_eq!(router.open_batches(), 1);
+
+        // The messages inside carry only `batch=ref`, never the label.
+        let RouteOutcome::Continued(inner) = router.deliver(
+            Incoming {
+                batch: Some("ref"),
+                numeric: Some("311"),
+                ..Incoming::default()
+            },
+            |route| format!("311 for {}\r\n", route.session.0).into_bytes(),
+        ) else {
+            panic!("a batched message must keep reaching the asking session")
+        };
+        assert_eq!(inner.session, SessionId(1));
+        assert!(
+            !router.is_empty(),
+            "a batched reply does not end at its own terminator"
+        );
+
+        // The closing frame is unlabeled and ends the route.
+        let RouteOutcome::Completed(closed) = router.deliver(
+            Incoming {
+                batch: Some("ref"),
+                batch_role: BatchRole::Close,
+                ..Incoming::default()
+            },
+            |_| b"BATCH close\r\n".to_vec(),
+        ) else {
+            panic!("the batch terminator must close the route")
+        };
+        assert_eq!(closed.session, SessionId(1));
+        assert!(router.is_empty());
+        assert_eq!(router.open_batches(), 0, "a closed batch must not linger");
+    }
+
+    #[test]
+    fn a_server_initiated_batch_still_fans_out() {
+        let mut router = router();
+        assert_eq!(
             router.deliver(
-                None,
-                None,
-                None,
-                |route| panic!("must not rebuild for {}", route.class.as_str()),
-                now
+                Incoming {
+                    batch: Some("serverbatch"),
+                    batch_role: BatchRole::Open,
+                    ..Incoming::default()
+                },
+                |_| panic!("must not rebuild")
             ),
-            RouteOutcome::Unmatched
+            RouteOutcome::Fanout
+        );
+    }
+
+    #[test]
+    fn dropping_a_session_releases_its_batches() {
+        let mut router = router();
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        let label = frame_label(&frame).expect("label").to_owned();
+        router.deliver(
+            Incoming {
+                label: Some(&label),
+                batch: Some("ref"),
+                batch_role: BatchRole::Open,
+                ..Incoming::default()
+            },
+            |_| Vec::new(),
+        );
+        assert_eq!(router.open_batches(), 1);
+        router.drop_session(SessionId(1));
+        assert_eq!(
+            router.open_batches(),
+            0,
+            "batch state must not outlive the route that owns it"
         );
     }
 
@@ -795,13 +1286,15 @@ mod tests {
         let long = "x".repeat(MAX_DOWNSTREAM_LABEL_BYTES + 1);
         assert_eq!(
             router.route(
-                SessionId(1),
-                ClientId(1),
-                "WHOIS",
-                &["alice".into()],
-                Some(&long),
-                true,
-                now
+                RoutingRequest {
+                    session: SessionId(1),
+                    client: ClientId(1),
+                    command: "WHOIS",
+                    params: &["alice".into()],
+                    downstream_label: Some(&long),
+                    labeled_upstream: true,
+                },
+                now,
             ),
             Routed::Refused(RouteRefusal::Unsupported)
         );
@@ -809,29 +1302,15 @@ mod tests {
         assert!(validate_label(&long).is_err());
         assert!(validate_label("has space").is_err());
         assert!(validate_label("").is_err());
+        assert!(validate_label("semi;colon").is_err());
         assert!(validate_label("ok-label_1").is_ok());
     }
 
     #[test]
     fn a_generated_label_is_bounded_and_opaque() {
         let mut router = router();
-        let now = std::time::Instant::now();
-        let Routed::Frame { line } = router.route(
-            SessionId(1),
-            ClientId(1),
-            "WHOIS",
-            &["alice".into()],
-            Some("mine"),
-            true,
-            now,
-        ) else {
-            panic!("expected a routed frame")
-        };
-        let label = line
-            .split(' ')
-            .next()
-            .expect("label")
-            .trim_start_matches('@');
+        let frame = open(&mut router, 1, "WHOIS", "mine");
+        let label = frame_label(&frame).expect("label");
         assert!(label.len() <= MAX_LABEL_BYTES);
         assert!(
             !label.contains("mine"),

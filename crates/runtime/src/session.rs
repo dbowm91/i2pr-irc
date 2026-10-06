@@ -567,7 +567,7 @@ impl<D: ByteStream> SessionReader<D> {
                     let requested = crate::downstream::requested_capabilities(message);
                     let supported = !requested.is_empty()
                         && requested.iter().all(|name| {
-                            crate::downstream::DOWNSTREAM_ADVERTISED.contains(&name.as_str())
+                            crate::downstream::downstream_supported().contains(&name.as_str())
                         });
                     if !supported {
                         return self.handle.queue_normal(&format!(
@@ -589,7 +589,7 @@ impl<D: ByteStream> SessionReader<D> {
                 }
                 self.handle.queue_normal(&format!(
                     ":bouncer CAP {target} LS :{}\r\n",
-                    crate::downstream::DOWNSTREAM_ADVERTISED.join(" ")
+                    crate::downstream::downstream_supported().join(" ")
                 ))
             }
             "END" => {
