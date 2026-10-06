@@ -26,20 +26,22 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active prerequisite corrective | plans/subsystems/bouncer-core-roadmap.md | Corrective 014 ready | M004 is fully decomposed in Plans 015-018, but UF-013-1 must close under Corrective 014 first. After 014, M004-A and M004-B may proceed in parallel. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M004-A ready | Corrective 014 closed with UF-013-1 resolved. M004-A and M004-B are unblocked and may proceed in parallel; M004-C waits on both. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core Corrective 014 — Live Multi-Client Response Routing | ready | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/014-status.md |
+| Bouncer Core M004-A / Plan 015 — Anonymity Protocol Mediation | ready | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/015-status.md |
+| Bouncer Core M004-B / Plan 016 — Global Reconnect Budget | ready | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/016-status.md |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core Corrective 014 — Live Multi-Client Response Routing | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/014-status.md |
 | Bouncer Core Corrective 013 — Post-M003 IRCv3 Time/History and Queue-Integrity Conformance | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/013-status.md |
 | Bouncer Core M003-F — Integrated Qualification and M003 Closure | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/012-status.md |
 | Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/011-status.md |
