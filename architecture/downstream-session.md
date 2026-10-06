@@ -9,13 +9,15 @@ A `DownstreamSession` is a disposable view of a live upstream generation. It hol
 | client `QUIT` | detached | continues | none |
 | client EOF | detached | continues | none |
 | client prefix, framing, or tag-budget violation | detached | continues | none |
-| client queue overload | detached | continues | none |
+| client queue overload | attached; that frame dropped and counted | continues | none |
 | client writer failure | detached | continues | none |
 | local accept failure | not attached | continues | none |
 | upstream failure | terminated with the generation | discarded | none |
 | explicit supervisor stop | terminated | stopped | one bounded `QUIT` |
 
 Only the last two rows may coincide with upstream shutdown. Client detach, protocol violation, and overload never send upstream `QUIT`; the runtime has regression evidence for each.
+
+Queue overload is deliberately *not* a detach. A saturated queue is the bouncer's own bound, not client misbehaviour, so the bounded response is to lose that one frame for that one client and count it. Detachment stays reserved for what the client actually did — `QUIT`, EOF, a protocol violation, or a writer failure.
 
 Registration requires NICK and USER before sending 001; the NICK must match the configured current upstream network nick under negotiated casemapping. The runtime answers client PING locally, handles CAP LS/REQ/END with an empty advertised capability set, and routes a bounded command allowlist upstream. Unsupported commands receive 421. Client-supplied prefixes are rejected, and client tag budgets are checked before re-encoding.
 

@@ -36,15 +36,25 @@ A session submits bytes and an intent class. The **owner** stamps the live `Conn
 
 The generation writer drops any intent stamped by an earlier generation rather than writing it. A disconnect after an outbound command leaves delivery ambiguous, so replaying user chat across a reconnect would risk duplicating a message whose delivery is unknown.
 
-## Bounded fanout, local detachment
+## Bounded fanout, local loss
 
 One upstream event is normalized and applied once, then fanned out to every attached session.
 
 - Control traffic uses a control queue, so a saturated normal queue cannot delay a keepalive answer.
-- A session whose queue is full is refused. The owner detaches *that* client; it does not stall upstream processing or another client.
+- A session whose queue is full is refused. The owner **does not wait for it**: that one client loses that one frame, the loss is counted in `fanout_dropped`, and every other session and the upstream are unaffected.
 - A slow reader applies backpressure at its own bounded queue rather than growing memory.
 
+A full queue is *not* grounds for ending the attachment. The queue is the bouncer's own, not the client's misbehaviour, so dropping one frame is the bounded response; detaching a client over an internal queue would turn a momentary hiccup into a disconnect. Detachment stays reserved for what the client actually did: `QUIT`, EOF, a protocol violation, or a writer failure.
+
+The refusal is counted rather than silent. A saturation that is invisible is indistinguishable from a healthy Network in the snapshot, which would make the only available diagnostic useless exactly when it is needed.
+
 Teardown is deterministic: the owner takes ownership of every session task and shuts each one down before the generation ends, so no client task outlives the generation that created it.
+
+## The snapshot is sampled every turn, not at teardown
+
+`attached_sessions`, `upstream_normal_queue_depth`, `upstream_control_queue_depth`, and `response_routes` describe the live generation, so the owner republishes them after every turn of its loop rather than only when the generation ends.
+
+Publishing only at teardown would report a healthy Network as having no sessions, an empty queue, and no open routes for its entire working life — an untruthful diagnostic that is worst precisely when an operator is watching. The write is conditional, so a busy but unchanged generation does not wake every subscriber once per line. Because these are sampled gauges, a reader that needs a settled value should compare against a later turn rather than assume atomicity.
 
 ## Persistence-first DesiredState
 

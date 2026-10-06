@@ -103,6 +103,12 @@ type Reply<T> = oneshot::Sender<T>;
 struct Shared {
     health: Mutex<StoreHealth>,
     closing: AtomicBool,
+    /// Test-only: an artificial per-request delay, used to simulate a slow or
+    /// stalling disk so liveness under storage pressure can be qualified.
+    ///
+    /// This is a `#[doc(hidden)]` fixture affordance, not a production setting. It is
+    /// never settable from a production path and defaults to zero.
+    stall: Mutex<Option<std::time::Duration>>,
 }
 
 impl Shared {
@@ -287,6 +293,12 @@ impl StoreHandle {
     pub async fn flush(&self) -> Result<(), StoreError> {
         self.submit(Request::Flush).await
     }
+    /// Installs or clears the test-only per-request stall.
+    #[doc(hidden)]
+    pub fn set_stall(&self, stall: Option<std::time::Duration>) {
+        *self.shared.stall.lock().expect("stall lock poisoned") = stall;
+    }
+
     /// Remaining ingress capacity, for bounded-load assertions.
     pub fn queue_capacity(&self) -> usize {
         self.sender.capacity()
@@ -314,6 +326,20 @@ impl Store {
     }
 
     pub fn open_with(path: &StorePath, busy_timeout_ms: u32) -> Result<Self, StoreError> {
+        Self::open_stalled(path, busy_timeout_ms, None)
+    }
+
+    /// Opens a store that delays every request by `stall`.
+    ///
+    /// Test-only: it exists so integrated qualification can prove that a stalled
+    /// store degrades storage without starving IRC control traffic. It is not part of
+    /// the production request surface and no production path can set it.
+    #[doc(hidden)]
+    pub fn open_stalled(
+        path: &StorePath,
+        busy_timeout_ms: u32,
+        stall: Option<std::time::Duration>,
+    ) -> Result<Self, StoreError> {
         let mut connection = match path {
             StorePath::Memory => Connection::open_in_memory(),
             StorePath::File(location) => {
@@ -331,6 +357,7 @@ impl Store {
         let shared = Arc::new(Shared {
             health: Mutex::new(StoreHealth::Ready),
             closing: AtomicBool::new(false),
+            stall: Mutex::new(stall),
         });
         let (sender, mut receiver) = mpsc::channel::<Request>(STORE_QUEUE_CAPACITY);
         // A dedicated capacity-1 wakeup channel guarantees shutdown can always reach
@@ -431,6 +458,13 @@ fn run_worker(
                 execute(connection, queued);
             }
             break;
+        }
+        // A test-only stall simulates a slow disk. It is applied after a request has
+        // actually been received, so it slows real work rather than parking the
+        // worker in a way a shutdown could not interrupt.
+        if let Some(stall) = *shared.stall.lock().expect("stall lock poisoned") {
+            let _ = shutdown.try_recv();
+            std::thread::sleep(stall);
         }
         // A canceled caller, a typed storage error, and an overload rejection are
         // ordinary outcomes: none of them may look like a dead store.

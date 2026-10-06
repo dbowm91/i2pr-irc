@@ -26,20 +26,22 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003-F / Plan 012 ready | M003 is decomposed into Plans 007-012. ADR-0002 and Research 004 freeze the storage/identity/history architecture. | Plans 007-011 are closed; Plan 012 is the executable final M003 milestone. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003 closed; M004 ready to decompose | M003 is decomposed into Plans 007-012 and all six are closed. ADR-0002 and Research 004 froze the storage/identity/history architecture. | M003 is evidence-closed in `plans/closure/bouncer-core/012-status.md`; M004 is unblocked and not yet decomposed. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M003-F — Integrated Qualification and M003 Closure | ready | capability | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/012-status.md |
+
+No implementation plan is currently dependency-ready. Bouncer Core M003 is closed and M004 is unblocked, but it has no implementation decomposition yet; writing M004's plan set is the next planning action.
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M003-F — Integrated Qualification and M003 Closure | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/012-status.md |
 | Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/011-status.md |
 | Bouncer Core M003-D — Response Routing and Foundational IRCv3 Mediation | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/010-status.md |
 | Bouncer Core M003-C — History Journal, Cursors, and Legacy Playback | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/009-status.md |
@@ -59,7 +61,7 @@ Canonical direction:
 
 ## Unplanned later milestones
 
-M003 now has complete sequenced implementation handoffs. Later roadmap milestones remain intentionally unplanned.
+M003 is closed. Later roadmap milestones remain intentionally unplanned; M004 in particular is unblocked but not yet decomposed into implementation handoffs.
 
 - Bouncer Core M004 — anonymity and adverse-network qualification;
 - Bouncer Core M005 — mature operator feature set;
@@ -95,12 +97,8 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Implement only:
+Implement nothing until a plan is written.
 
-- `plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md`
+Bouncer Core M003 is fully closed: Plans 007-011 froze the durable substrate and identity split, multi-network/multi-client ownership, durable history with acknowledged legacy playback, response routing with truthful capability negotiation, and bounded history/read-marker adapters; Plan 012 qualified the integrated system and closed the milestone in `plans/closure/bouncer-core/012-status.md`.
 
-Plans 007-011 froze the durable substrate and identity split, multi-network/multi-client ownership, durable history with acknowledged legacy playback, response routing with truthful capability negotiation, and bounded history/read-marker adapters. All five are closed.
-
-Plan 012 is the final M003 milestone: it qualifies the integrated system and closes the milestone.
-
-M004 and M005 remain sequenced behind full M003 closure, and router integration remains blocked behind M005.
+The next planning action is to decompose Bouncer Core M004 (anonymity and adverse-network qualification) into implementation handoffs against the then-current repository state. M005 remains sequenced behind M004, and router integration remains blocked behind M005.

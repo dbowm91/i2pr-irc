@@ -16,7 +16,7 @@ This plan stores **no** history for a local outgoing PRIVMSG/NOTICE.
 
 A local socket write is not evidence of upstream delivery. A disconnect can leave delivery ambiguous, so storing it would label an unconfirmed write as history. Omission is the only choice that cannot produce a false confirmation claim.
 
-When `echo-message` arrives (M003-D), the upstream echo becomes the canonical confirmed event instead. This is why the journal exposes no path that could mark a local write as delivered.
+When `echo-message` is negotiated, the upstream echo becomes the canonical confirmed event instead, and `echo-message` is advertised downstream only in that case. This is why the journal exposes no path that could mark a local write as delivered.
 
 ## Stored payloads carry no terminator
 
@@ -34,6 +34,14 @@ upstream line  --try_send-->  bounded queue (256)  --owner loop-->  store append
 A full queue drops the event and increments a counter rather than buffering. An unbounded retry buffer would only trade memory pressure for history that arrives too late to matter, and history work never delays a keepalive answer.
 
 A refused append is never reported as recorded. History loss shows up in bounded counters (`appended`, `append_refused`, `store_unavailable`, `history_dropped`), so it is visible rather than silent. History degradation never affects network delivery semantics.
+
+The owner drains at most a batch per turn and never spins to catch up, so under sustained load the bounded queue drains at whatever rate the loop is already taking turns. Every line handed to ingestion is accounted for exactly once — recorded, skipped, or dropped and counted — because a line that simply vanished would leave no trace anywhere.
+
+## A buffer is resolved after the line that creates it
+
+A line is history-eligible only for a channel whose `BufferId` the owner already knows. That buffer is resolved from an *observed self JOIN*, so the check has to run **after** the line has been applied to generation-owned state: the self JOIN is the line that creates the membership.
+
+Checking before applying means the one line that confirms a channel never resolves that channel's buffer, and the channel would record no history until the server happened to send a second, redundant JOIN. Every line of a channel is therefore processed after its buffer is known, including later lines in the same read.
 
 ## Playback is bounded in both dimensions
 

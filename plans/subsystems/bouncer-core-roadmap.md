@@ -313,13 +313,13 @@ Dependencies:
 Implementation decomposition:
 
 1. M003-A / Plan 007 — durable storage and identity foundation. **Closed**; see `plans/closure/bouncer-core/007-status.md`.
-2. M003-B / Plan 008 — multi-Network and multi-client ownership.
-3. M003-C / Plan 009 — history journal, cursors, and legacy playback.
-4. M003-D / Plan 010 — response routing and foundational IRCv3 mediation.
-5. M003-E / Plan 011 — chathistory/read-marker adapters.
-6. M003-F / Plan 012 — integrated qualification and M003 closure.
+2. M003-B / Plan 008 — multi-Network and multi-client ownership. **Closed**; see `plans/closure/bouncer-core/008-status.md`.
+3. M003-C / Plan 009 — history journal, cursors, and legacy playback. **Closed**; see `plans/closure/bouncer-core/009-status.md`.
+4. M003-D / Plan 010 — response routing and foundational IRCv3 mediation. **Closed**; see `plans/closure/bouncer-core/010-status.md`.
+5. M003-E / Plan 011 — chathistory/read-marker adapters. **Closed**; see `plans/closure/bouncer-core/011-status.md`.
+6. M003-F / Plan 012 — integrated qualification and M003 closure. **Closed**; see `plans/closure/bouncer-core/012-status.md`.
 
-Only the earliest dependency-ready plan is executable at a time. Plans 007-011 are closed in `plans/closure/bouncer-core/007-status.md` through `011-status.md`; Plan 012 is the current executable plan and is the final M003 milestone.
+Only the earliest dependency-ready plan is executable at a time. All six M003 plans are closed; M003 is evidence-closed as a whole in `plans/closure/bouncer-core/012-status.md`.
 
 Deliverable boundary:
 
@@ -542,12 +542,12 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | C002 / Corrective 005 | closed | plans/implementation/bouncer-core/005-pre-m003-observed-membership-and-downstream-cap-corrective.md | plans/closure/bouncer-core/005-status.md | none |
 | Research 002 | closed | plans/research/002-rust-irc-crate-conformance-plan.md | plans/research/003-rust-irc-crate-conformance-results.md | none |
 | C003 / Corrective 006 | closed | plans/implementation/bouncer-core/006-framing-recovery-corrective.md | plans/closure/bouncer-core/006-status.md | none |
-| M003 | planned / active handoff sequence | plans 007-012 | plans/closure/bouncer-core/012-status.md | Plan 007 ready; later M003 plans sequenced |
-| M003-A / Plan 007 | ready | plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md | plans/closure/bouncer-core/007-status.md | none |
-| M003-B / Plan 008 | blocked | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md | plans/closure/bouncer-core/008-status.md | Plan 007 closure |
-| M003-C / Plan 009 | blocked | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md | plans/closure/bouncer-core/009-status.md | Plan 008 closure |
-| M003-D / Plan 010 | blocked | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md | plans/closure/bouncer-core/010-status.md | Plan 009 closure |
-| M003-E / Plan 011 | blocked | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md | plans/closure/bouncer-core/011-status.md | Plan 010 closure |
-| M003-F / Plan 012 | blocked | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | Plan 011 closure |
-| M004 | not started | future | future | M003 closure |
+| M003 | closed | plans 007-012 | plans/closure/bouncer-core/012-status.md | none |
+| M003-A / Plan 007 | closed | plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md | plans/closure/bouncer-core/007-status.md | none |
+| M003-B / Plan 008 | closed | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md | plans/closure/bouncer-core/008-status.md | none |
+| M003-C / Plan 009 | closed | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md | plans/closure/bouncer-core/009-status.md | none |
+| M003-D / Plan 010 | closed | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md | plans/closure/bouncer-core/010-status.md | none |
+| M003-E / Plan 011 | closed | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md | plans/closure/bouncer-core/011-status.md | none |
+| M003-F / Plan 012 | closed | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | none |
+| M004 | unblocked | future | future | M003 closed; plan not yet decomposed |
 | M005 | not started | future | future | M004 |

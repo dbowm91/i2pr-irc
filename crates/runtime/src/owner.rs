@@ -7,8 +7,9 @@
 //!
 //! Two properties drive the shape of this loop:
 //!
-//! - A client that is slow or overflowing must be detached on its own. Its full queue
-//!   detaches that session; it never stalls upstream processing or another client.
+//! - A client that is slow or overflowing affects only itself. Its queue is bounded
+//!   and nothing waits on it, so its pressure never reaches upstream processing or
+//!   another client; the frames it loses are counted rather than buffered.
 //! - A disconnect after an outbound command leaves delivery ambiguous. Nothing user
 //!   typed is ever retained for replay into a later generation.
 use crate::{
@@ -176,6 +177,9 @@ pub struct NetworkSnapshot {
     pub history_skipped: u64,
     /// Lines dropped because the ingestion queue was full.
     pub history_dropped: u64,
+    /// Lines dropped for one attached client because *that client's* bounded normal
+    /// queue was full. Counted per client-loss, never per line, and never blocking.
+    pub fanout_dropped: u64,
     /// Events confirmed delivered to clients by automatic backlog.
     /// Negotiated upstream capabilities, as a bounded fingerprint. Never a payload.
     pub upstream_capabilities: String,
@@ -253,6 +257,42 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             snapshot.channels = state.joined_channels();
             snapshot.pending_joins = state.pending_joins();
             snapshot.rejected_joins = state.rejected_joins();
+        });
+    }
+
+    /// Publishes the gauges that describe the *live* generation.
+    ///
+    /// These change on every turn of the generation loop, so they are written on every
+    /// turn rather than only at teardown. A snapshot refreshed only when the
+    /// generation ends would report a healthy Network as having no sessions, an empty
+    /// upstream queue, and no open routes, which is precisely the kind of untruthful
+    /// diagnostic this subsystem exists to avoid.
+    ///
+    /// The write is conditional so a busy but unchanged generation does not wake
+    /// every subscriber once per line.
+    fn publish_gauges(
+        &self,
+        sessions: usize,
+        router: &ResponseRouter,
+        normal_tx: &mpsc::Sender<OutboundIntent>,
+        control_tx: &mpsc::Sender<Vec<u8>>,
+    ) {
+        let normal_depth = NORMAL_QUEUE_CAPACITY - normal_tx.capacity();
+        let control_depth = CONTROL_QUEUE_CAPACITY - control_tx.capacity();
+        let routes = router.open_routes();
+        self.snapshot.send_if_modified(|snapshot| {
+            if snapshot.attached_sessions == sessions
+                && snapshot.upstream_normal_queue_depth == normal_depth
+                && snapshot.upstream_control_queue_depth == control_depth
+                && snapshot.response_routes == routes
+            {
+                return false;
+            }
+            snapshot.attached_sessions = sessions;
+            snapshot.upstream_normal_queue_depth = normal_depth;
+            snapshot.upstream_control_queue_depth = control_depth;
+            snapshot.response_routes = routes;
+            true
         });
     }
 
@@ -743,9 +783,24 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 _ => { failure = Some(RuntimeError::Protocol); break; }
                             }
                         }
-                        // Resolve a newly confirmed channel to a durable buffer before
-                        // any of its lines become history-eligible. Membership is only
-                        // what the state already observed, so this adds nothing.
+                        match self.apply_upstream_line(
+                            &raw,
+                            &message,
+                            &mut state,
+                            &sessions,
+                            &control_tx,
+                            &buffers,
+                            &ingest_tx,
+                        ) {
+                            Ok(()) => {}
+                            Err(error) => { failure = Some(error); break; }
+                        }
+                        // Resolve a channel to its durable buffer *after* this line has
+                        // been applied, because the line that creates membership is the
+                        // self JOIN itself. Checking before applying would mean the very
+                        // line that confirms the channel never resolves its buffer, and
+                        // the channel would record no history until a server sent a
+                        // second, redundant JOIN.
                         if confirmed_self_channel(&state, &message).is_some_and(|channel| {
                             !buffers.contains_key(&casemapped(&channel))
                         }) && let Some(channel) = confirmed_self_channel(&state, &message) {
@@ -761,30 +816,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 }
                             }
                         }
-                        match self.apply_upstream_line(
-                            &raw,
-                            &message,
-                            &mut state,
-                            &sessions,
-                            &control_tx,
-                            &buffers,
-                            &ingest_tx,
-                        ) {
-                            Ok(()) => {}
-                            Err(error) => { failure = Some(error); break; }
-                        }
                     }
                     self.publish_state(&state);
                     if let Some(error) = failure { break Err(error); }
                 }
             }
-            self.snapshot.send_modify(|snapshot| {
-                snapshot.response_routes = router.open_routes();
-                snapshot.upstream_normal_queue_depth = NORMAL_QUEUE_CAPACITY - normal_tx.capacity();
-                snapshot.upstream_control_queue_depth =
-                    CONTROL_QUEUE_CAPACITY - control_tx.capacity();
-                snapshot.attached_sessions = sessions.len();
-            });
+            // Published after the turn so the snapshot reflects settled state. The
+            // upstream writer drains on its own task, so publishing before the turn
+            // would always report the queue exactly as the turn found it.
+            self.publish_gauges(sessions.len(), &router, &normal_tx, &control_tx);
         };
 
         // Deterministic teardown: every session and the writer are owned here, so no
@@ -895,7 +935,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     /// Applies one upstream line, then fans it out to every attached session.
     ///
     /// The event is normalized and applied once; fanout then decides per session. A
-    /// session whose queue is full is detached on its own.
+    /// session whose queue is full loses this frame and nothing else: the owner never
+    /// blocks on a client, so pressure on one attachment cannot reach the Network or
+    /// any other attachment.
     ///
     /// A history-eligible line is also queued for durable ingestion. That queue is
     /// bounded and non-blocking: a full queue drops the event and counts it, so
@@ -927,11 +969,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             untagged.tags.clear();
             untagged.encode().map_err(|_| RuntimeError::Protocol)?
         };
-        for (session, task) in sessions {
+        for task in sessions.values() {
             if task.handle().fanout(outgoing.clone()).is_err() {
-                // Reported so the owner detaches this session; the loop below does not
-                // act on it inline because teardown owns the task.
-                let _ = session;
+                // Bounded fanout, mirroring bounded ingestion: a client that cannot
+                // keep up loses *this* frame only. The owner never awaits the session,
+                // so a stalled client cannot delay the Network or any other client.
+                // The loss is counted rather than silent, and the session is kept: the
+                // queue is the bouncer's own, so a momentary stall is not grounds for
+                // ending an attachment the way a refused backlog ends one delivery.
+                self.snapshot.send_modify(|snapshot| {
+                    snapshot.fanout_dropped = snapshot.fanout_dropped.saturating_add(1)
+                });
             }
         }
         // Only a message with a known buffer target is history-eligible. Eligibility

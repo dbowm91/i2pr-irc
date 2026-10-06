@@ -71,7 +71,7 @@ new_marker = max(old_marker, resolved_event)
 
 A second client reporting an older message cannot un-mark what the operator has already read. Read state is never sent upstream.
 
-When retention removes the range a marker named, M003-C's clamp rule applies unchanged: the marker moves to the newest surviving event below the removed range, or `0` when none exists. It stays valid rather than dangling.
+When retention removes the range a marker named, the cursor clamp rule applies unchanged to the marker: it moves to the newest surviving event below the removed range, or `0` when none exists. It stays valid rather than dangling.
 
 ## Refusals are typed
 

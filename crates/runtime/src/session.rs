@@ -141,7 +141,8 @@ impl SessionHandle {
         queue_line(&self.normal_tx, line)
     }
     /// Queues one normalized upstream line for fanout. A full queue is reported so the
-    /// owner can detach *this* client rather than stalling upstream or other clients.
+    /// owner can count the loss; it never blocks, so a slow client cannot stall
+    /// upstream or any other client, and it is not grounds for ending the attachment.
     pub fn fanout(&self, bytes: Vec<u8>) -> Result<(), RuntimeError> {
         self.normal_tx
             .try_send(crate::downstream::QueuedFrame::Fire(bytes))
