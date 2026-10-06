@@ -6,13 +6,21 @@
 //! Desired intent and unconfirmed join attempts are deliberately excluded, so a
 //! projection can never claim a channel the bouncer is not actually in.
 use crate::{RuntimeError, session::SessionHandle, state::NetworkState};
-use i2pr_irc_wire::MAX_LINE_BYTES;
+use i2pr_irc_wire::{IrcTimestamp, MAX_LINE_BYTES};
+use std::collections::BTreeMap;
 
 /// Sends the whole projection to one session handle.
+///
+/// `read_markers` is `Some` only for a client that negotiated `draft/read-marker`, and
+/// carries the current marker per channel. Passing `None` suppresses the draft's
+/// initial-marker frame entirely, so the bouncer never sends a command a client did
+/// not negotiate.
+#[allow(clippy::too_many_arguments)]
 pub fn project(
     handle: &SessionHandle,
     state: &NetworkState,
     target: &str,
+    read_markers: Option<&BTreeMap<String, IrcTimestamp>>,
 ) -> Result<(), RuntimeError> {
     handle.queue_normal(&format!(":bouncer 001 {target} :Welcome\r\n"))?;
     for token in &state.isupport {
@@ -33,6 +41,17 @@ pub fn project(
     }
     for channel in state.joined_channels() {
         handle.queue_normal(&format!(":{} JOIN {channel}\r\n", state.nick))?;
+        // The read-marker draft requires the server to send the channel's marker after
+        // the JOIN and before RPL_ENDOFNAMES. It is emitted from the JOIN rather than
+        // from the NAMES block so it still arrives when membership is incomplete, and
+        // a channel with no marker yet is announced as `*` -- the draft's own
+        // unknown-marker sentinel, which is also what a client would receive from a
+        // `MARKREAD` get.
+        if let Some(markers) = read_markers {
+            handle.queue_normal(&crate::owner::frame(
+                crate::chathistory::render_marker_reply(&channel, markers.get(&channel).copied()),
+            ))?;
+        }
         let Some(channel_state) = state.channels.get(&channel) else {
             continue;
         };

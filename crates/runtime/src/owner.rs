@@ -55,9 +55,30 @@ pub const INGEST_QUEUE_CAPACITY: usize = 256;
 /// How many queued ingestion items one loop turn may drain, so history work cannot
 /// monopolize the owner and delay PING/PONG.
 pub const INGEST_BATCH_PER_TURN: usize = 16;
+/// How many upstream lines one read may apply before yielding to the scheduler.
+///
+/// A single read can carry hundreds of lines. Applying all of them before returning to
+/// the scheduler starves every session writer task, and under ordered delivery that is
+/// not cosmetic: healthy clients would exhaust their own bounded queues without ever
+/// being read and would be detached for pressure they did not cause. Yielding keeps a
+/// burst arriving as several slices, so unrelated tasks always get to run.
+///
+/// The bound sits well under the per-session normal queue on purpose: an attachment
+/// that is keeping up must be able to drain within one window, so a burst can never
+/// desynchronize a client that never stopped reading.
+///
+/// This is a cooperative handoff, not a spin: the turn returns control and waits for
+/// the executor, so an idle owner still sleeps rather than burning a core.
+pub const UPSTREAM_LINES_PER_TURN: usize = 32;
 /// Ceiling on buffers whose backlog one session may receive in one pass, so a client
 /// attached to many channels still receives a bounded total amount of history.
 pub const MAX_BACKLOG_BUFFERS: usize = 32;
+/// Ceiling on deferred desired-membership intents awaiting upstream queue capacity.
+///
+/// This matches the observed-membership ceiling on purpose. The set can only ever hold
+/// channels the Operator already asked the bouncer to track, so a distinct ceiling
+/// would either be larger than the state it reconciles or needlessly force a restart.
+pub const MAX_DESIRED_RECONCILE: usize = crate::state::MAX_CHANNELS;
 
 /// Delivers the bounded legacy backlog for every resolved buffer this session can see.
 ///
@@ -200,13 +221,22 @@ async fn answer_targets(
 }
 
 /// Answers one `MARKREAD` request: a client get or a client set.
+///
+/// Read state belongs to the Operator rather than to one attachment, so a set that
+/// actually advances the marker is propagated to every *other* attached session that
+/// negotiated `draft/read-marker`. Propagation stays inside this Network: markers are
+/// the bouncer's own state and are never written upstream.
 async fn answer_marker_update(
     journal: &mut crate::journal::HistoryJournal,
-    handle: &SessionHandle,
+    sessions: &BTreeMap<SessionId, SessionTask>,
+    session: SessionId,
     wire: &[u8],
     buffers: &BTreeMap<String, BufferId>,
 ) {
     let Some(message) = i2pr_irc_wire::Message::parse(wire).ok() else {
+        return;
+    };
+    let Some(handle) = sessions.get(&session).map(SessionTask::handle) else {
         return;
     };
     let parsed = crate::chathistory::parse_markread(&message);
@@ -243,6 +273,10 @@ async fn answer_marker_update(
                 )));
                 return;
             };
+            // Read before writing so an advance can be distinguished from a retained
+            // marker. A set that changes nothing must not look like an update to the
+            // Operator's other sessions.
+            let previous = journal.read_marker(buffer).await.ok().flatten();
             // Resolving the client timestamp to a durable position keeps the marker
             // monotonic: a client cannot name an arbitrary instant to skip ahead.
             let reference = crate::chathistory::MessageReference::Timestamp(timestamp);
@@ -260,6 +294,11 @@ async fn answer_marker_update(
                             let _ = handle.queue_normal(&frame(
                                 crate::chathistory::render_marker_reply(&target, stored),
                             ));
+                            if previous != Some(applied) {
+                                let line =
+                                    frame(crate::chathistory::render_marker_reply(&target, stored));
+                                broadcast_marker(sessions, session, &line);
+                            }
                         }
                         Err(_) => {
                             let _ = handle.queue_normal(&frame(
@@ -288,12 +327,29 @@ async fn answer_marker_update(
     }
 }
 
+/// Propagates one marker update to the Operator's other read-marker sessions.
+///
+/// A session that did not negotiate the draft is skipped rather than sent the frame:
+/// an unnegotiated command is a protocol violation for a strict client, and the
+/// broadcast is an optimization the requesting session already has directly.
+fn broadcast_marker(sessions: &BTreeMap<SessionId, SessionTask>, origin: SessionId, line: &str) {
+    for (id, task) in sessions {
+        if *id == origin {
+            continue;
+        }
+        let handle = task.handle();
+        if handle.capabilities().manages_read_markers() {
+            let _ = handle.queue_normal(line);
+        }
+    }
+}
+
 /// Frames an already-rendered line for the session queue.
 ///
 /// Accepts either raw bytes or an already-formatted string; both paths are ASCII or
 /// lossy-converted, and the session writer is the component that decides whether a
 /// frame is well formed enough to send.
-fn frame(line: impl AsRef<[u8]>) -> String {
+pub(crate) fn frame(line: impl AsRef<[u8]>) -> String {
     String::from_utf8_lossy(line.as_ref()).into_owned()
 }
 
@@ -385,6 +441,88 @@ struct IngestItem {
     message: Message,
 }
 
+/// Which attached sessions lost a live upstream frame during one line.
+struct FanoutReport {
+    /// Sessions whose own normal queue refused this frame.
+    ///
+    /// The caller detaches exactly these. There is deliberately no "drop the chat and
+    /// keep the MODE" refinement: an IRC line's importance is not knowable from its
+    /// command alone -- a MODE, a NICK, a JOIN or a BATCH boundary can all leave the
+    /// client holding state that later frames depend on -- so ordered delivery is the
+    /// contract, and breaking it ends that one attachment.
+    desynchronized: Vec<SessionId>,
+}
+
+/// Direction of a durable membership intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesiredIntent {
+    Join,
+    Part,
+}
+
+/// Desired membership this generation could not hand to the upstream queue.
+///
+/// A JOIN or PART is committed to SQLite *before* any wire bytes exist, so a refused
+/// enqueue leaves durable operator intent and live state divergent. The bouncer owes
+/// the Operator a convergent live state, but it may not build an unbounded retry queue
+/// and it may never carry client chat along with the retry. So this set holds only a
+/// channel name and the direction of intent, is capped by the same ceiling as observed
+/// membership, and is drained as soon as the upstream queue has capacity again.
+///
+/// It is generation-local. A new generation rebuilds desired membership from storage
+/// anyway, so nothing here needs to survive a reconnect.
+#[derive(Default)]
+struct DesiredReconcile {
+    pending: BTreeMap<String, DesiredIntent>,
+}
+
+impl DesiredReconcile {
+    /// Records one deferred intent, replacing any earlier intent for the same channel.
+    ///
+    /// The latest intent wins because the database already committed that one: a
+    /// deferred JOIN for a channel whose PART was later committed would otherwise
+    /// re-join it, contradicting the Operator.
+    ///
+    /// Returns false when the set is already at its ceiling. The durable intent is
+    /// still correct -- it lives in SQLite -- so the caller reports that this
+    /// generation cannot converge in place rather than dropping the operator's intent.
+    fn defer(&mut self, channel: String, intent: DesiredIntent) -> bool {
+        if self.pending.len() >= MAX_DESIRED_RECONCILE && !self.pending.contains_key(&channel) {
+            return false;
+        }
+        self.pending.insert(channel, intent);
+        true
+    }
+
+    /// Hands deferred intents to the upstream queue while it has room.
+    ///
+    /// Stops at the first refusal so the remaining entries keep their relative order.
+    /// Only channel names and directions are ever replayed: an ordinary client command
+    /// that was refused is never retried, because a later generation could not know
+    /// whether writing it again would duplicate it.
+    fn drain(
+        &mut self,
+        sender: &mpsc::Sender<OutboundIntent>,
+        generation: ConnectionGeneration,
+    ) -> u64 {
+        let mut drained: u64 = 0;
+        let mut blocked = Vec::new();
+        for (channel, intent) in std::mem::take(&mut self.pending) {
+            let line = match intent {
+                DesiredIntent::Join => format!("JOIN {channel}\r\n"),
+                DesiredIntent::Part => format!("PART {channel}\r\n"),
+            };
+            if queue_upstream(sender, generation, &line).is_ok() {
+                drained = drained.saturating_add(1);
+            } else {
+                blocked.push((channel, intent));
+            }
+        }
+        self.pending = blocked.into_iter().collect();
+        drained
+    }
+}
+
 /// Bounded, non-secret diagnostic projection of one Network owner.
 #[derive(Clone, Debug, Default)]
 pub struct NetworkSnapshot {
@@ -411,9 +549,32 @@ pub struct NetworkSnapshot {
     pub history_skipped: u64,
     /// Lines dropped because the ingestion queue was full.
     pub history_dropped: u64,
-    /// Lines dropped for one attached client because *that client's* bounded normal
-    /// queue was full. Counted per client-loss, never per line, and never blocking.
+    /// Live upstream frames refused by one attached client's own bounded normal queue.
+    ///
+    /// Each refusal means that client lost a frame and was therefore desynchronized, so
+    /// this counter is always paired with `fanout_detached`. It is counted per refused
+    /// frame; the detach is counted per session.
     pub fanout_dropped: u64,
+    /// Sessions detached because they could not keep up with live upstream.
+    ///
+    /// A live IRC stream is ordered, so a skipped frame is unrecoverable: the client
+    /// cannot be left attached claiming to be synchronized with state it never saw.
+    pub fanout_detached: u64,
+    /// Client commands the bounded upstream queue refused before admission.
+    ///
+    /// A refused command was definitely not accepted for delivery and is never
+    /// retried, so this counter is the only record that it happened.
+    pub upstream_rejected: u64,
+    /// Desired channel intents deferred because their immediate upstream enqueue was
+    /// refused. Bounded by the observed-membership ceiling.
+    pub desired_reconcile_pending: usize,
+    /// Desired channel intents handed to the upstream queue by reconciliation.
+    pub desired_reconcile_drained: u64,
+    /// Times the bounded reconciliation set could not hold another deferred intent.
+    ///
+    /// Non-zero means this generation cannot converge in place, and the Network was
+    /// deliberately restarted instead so durable DesiredState is rebuilt from storage.
+    pub desired_reconcile_overflowed: u64,
     /// Events confirmed delivered to clients by automatic backlog.
     /// Negotiated upstream capabilities, as a bounded fingerprint. Never a payload.
     pub upstream_capabilities: String,
@@ -881,6 +1042,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // Batch identifiers are generation-local, exactly like response routes: a
         // batch id from an earlier connection must never be referencable later.
         let mut batches = crate::ircv3::BatchTracker::default();
+        // Desired membership this generation could not hand to the upstream queue.
+        // Generation-local like every other piece of live bookkeeping: a new
+        // generation rebuilds desired membership from durable storage anyway.
+        let mut reconcile = DesiredReconcile::default();
         // Attachments that arrived while this generation was starting.
         for (session, client, stream) in pending_attach.drain(..).take(MAX_SESSIONS_PER_NETWORK) {
             attach_session(
@@ -921,7 +1086,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     // A closed queue means the owner is being torn down; the loop's
                     // own stop path ends the generation.
                     let Some(event) = event else { break Ok(()) };
-                    self.handle_session_event(
+                    if let Err(error) = self.handle_session_event(
                         event,
                         &mut sessions,
                         &mut state,
@@ -932,8 +1097,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &buffers,
                         &mut router,
                         &mut batches,
+                        &mut reconcile,
                     )
-                    .await;
+                    .await
+                    {
+                        // The only error this path reports is durable DesiredState that
+                        // this generation provably cannot converge to in place. A
+                        // controlled reconnect rebuilds membership from storage, which
+                        // is the honest way to honour intent the bounded set cannot hold.
+                        break Err(error);
+                    }
                 }
                 writer = writer_exit => {
                     match writer {
@@ -981,6 +1154,19 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                 }
                 _ = probe.tick() => {
+                    // Deferred desired membership converges here, on a tick that is
+                    // already bounded and already guaranteed not to spin. It is not
+                    // drained inline in the intent path, so reconciliation never
+                    // competes with the client commands it exists to relieve.
+                    let drained = reconcile.drain(&normal_tx, generation);
+                    if drained > 0 {
+                        let pending = reconcile.pending.len();
+                        self.snapshot.send_modify(|snapshot| {
+                            snapshot.desired_reconcile_drained =
+                                snapshot.desired_reconcile_drained.saturating_add(drained);
+                            snapshot.desired_reconcile_pending = pending;
+                        });
+                    }
                     // Expired routes release their slots deterministically, so a slow
                     // server cannot wedge the router.
                     let expired = router.expire(std::time::Instant::now());
@@ -1003,7 +1189,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     let count = match count { Ok(count) => count, Err(error) => break Err(RuntimeError::Io(error)) };
                     if count == 0 { break Err(RuntimeError::Protocol); }
                     let mut failure = None;
+                    // Lines applied since this chunk last handed the scheduler back.
+                    let mut lines_since_yield = 0usize;
                     for line in decoder.push(&ubuf[..count]) {
+                        lines_since_yield += 1;
+                        // Hand the scheduler back periodically so session writers get to
+                        // drain during a burst. Decoding is already complete for this
+                        // chunk, so yielding here loses nothing.
+                        if lines_since_yield >= UPSTREAM_LINES_PER_TURN {
+                            lines_since_yield = 0;
+                            tokio::task::yield_now().await;
+                        }
                         let raw = match line { Ok(raw) => raw, Err(_) => { failure = Some(RuntimeError::Protocol); break } };
                         let message = match Message::parse(&raw) { Ok(message) => message, Err(_) => { failure = Some(RuntimeError::Protocol); break } };
                         if message.validate_tag_budget(TagDirection::ServerOutput).is_err() {
@@ -1030,7 +1226,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &buffers,
                             &ingest_tx,
                         ) {
-                            Ok(()) => {}
+                            Ok(report) => {
+                                // A session that lost a live frame is detached before
+                                // the next line is applied, so it cannot be handed a
+                                // later frame and resume as if nothing was missed. Only
+                                // the sessions named here are removed.
+                                for id in report.desynchronized {
+                                    self.detach_overloaded(&mut sessions, &mut router, id).await;
+                                }
+                            }
                             Err(error) => { failure = Some(error); break; }
                         }
                         // Resolve a channel to its durable buffer *after* this line has
@@ -1172,14 +1376,19 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
 
     /// Applies one upstream line, then fans it out to every attached session.
     ///
-    /// The event is normalized and applied once; fanout then decides per session. A
-    /// session whose queue is full loses this frame and nothing else: the owner never
-    /// blocks on a client, so pressure on one attachment cannot reach the Network or
-    /// any other attachment.
+    /// The event is normalized and applied once; fanout then decides per session.
+    ///
+    /// A session whose queue refuses the frame is reported as desynchronized rather
+    /// than quietly skipped: a downstream IRC stream is ordered, so the bouncer cannot
+    /// claim such a client is still in step with upstream, and there is no way to tell
+    /// it which frames it missed. The caller detaches exactly those sessions. The
+    /// owner never blocks on a client, so pressure on one attachment cannot reach the
+    /// Network or any other attachment.
     ///
     /// A history-eligible line is also queued for durable ingestion. That queue is
     /// bounded and non-blocking: a full queue drops the event and counts it, so
-    /// history pressure can never delay control traffic.
+    /// history pressure can never delay control traffic. That is deliberately a
+    /// different policy -- durable history is best effort, while a live frame is not.
     #[allow(clippy::too_many_arguments)]
     fn apply_upstream_line(
         &self,
@@ -1190,7 +1399,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         control_tx: &mpsc::Sender<Vec<u8>>,
         buffers: &BTreeMap<String, BufferId>,
         ingest_tx: &mpsc::Sender<IngestItem>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<FanoutReport, RuntimeError> {
+        let mut desynchronized = Vec::new();
         match state.apply_line(message) {
             LineOutcome::Quiet => {}
             LineOutcome::ReplyPong(token) => {
@@ -1207,14 +1417,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             untagged.tags.clear();
             untagged.encode().map_err(|_| RuntimeError::Protocol)?
         };
-        for task in sessions.values() {
+        for (id, task) in sessions {
             if task.handle().fanout(outgoing.clone()).is_err() {
-                // Bounded fanout, mirroring bounded ingestion: a client that cannot
-                // keep up loses *this* frame only. The owner never awaits the session,
-                // so a stalled client cannot delay the Network or any other client.
-                // The loss is counted rather than silent, and the session is kept: the
-                // queue is the bouncer's own, so a momentary stall is not grounds for
-                // ending an attachment the way a refused backlog ends one delivery.
+                // Bounded fanout: the owner never awaits the session, so a stalled
+                // client cannot delay the Network or any other client. What it cannot
+                // do is keep the client: it has now skipped a live frame, so it is
+                // detached by the caller and counted here.
+                desynchronized.push(*id);
                 self.snapshot.send_modify(|snapshot| {
                     snapshot.fanout_dropped = snapshot.fanout_dropped.saturating_add(1)
                 });
@@ -1232,15 +1441,47 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 .is_err()
         {
             // Bounded ingestion: a refused item is dropped and counted rather than
-            // buffered. Retrying into an unbounded queue would be worse.
+            // buffered. Retrying into an unbounded queue would be worse. This loss is
+            // never reported to a client: durable history is not part of the live
+            // stream's ordering guarantee.
             self.snapshot.send_modify(|snapshot| {
                 snapshot.history_dropped = snapshot.history_dropped.saturating_add(1)
             });
         }
-        Ok(())
+        Ok(FanoutReport { desynchronized })
+    }
+
+    /// Detaches one session that could not keep up with live upstream, and only that one.
+    ///
+    /// Its response routes go with it, so a reply that arrives after the gap can never
+    /// be delivered into the middle of a stream the client believes is complete. The
+    /// upstream connection, the Network and every other attachment continue untouched.
+    async fn detach_overloaded(
+        &self,
+        sessions: &mut BTreeMap<SessionId, SessionTask>,
+        router: &mut ResponseRouter,
+        session: SessionId,
+    ) {
+        if let Some(task) = sessions.remove(&session) {
+            task.shutdown().await;
+        }
+        router.drop_session(session);
+        let attached = sessions.len();
+        let open_routes = router.open_routes();
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.fanout_detached = snapshot.fanout_detached.saturating_add(1);
+            snapshot.sessions_ended = snapshot.sessions_ended.saturating_add(1);
+            snapshot.last_session_disposition = Some(DownstreamDisposition::QueueOverload.class());
+            snapshot.attached_sessions = attached;
+            snapshot.response_routes = open_routes;
+        });
     }
 
     /// Applies one session event to network, durable, and upstream state.
+    ///
+    /// Returns `Err` only when this generation provably cannot converge to durable
+    /// DesiredState in place, which the caller turns into a controlled restart. Every
+    /// other failure is reported to the originating session and never to the Network.
     #[allow(clippy::too_many_arguments)]
     async fn handle_session_event(
         &self,
@@ -1254,7 +1495,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         buffers: &BTreeMap<String, BufferId>,
         router: &mut ResponseRouter,
         batches: &mut crate::ircv3::BatchTracker,
-    ) {
+        reconcile: &mut DesiredReconcile,
+    ) -> Result<(), RuntimeError> {
         match event {
             SessionEvent::Ended {
                 session,
@@ -1277,12 +1519,27 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 // must not create intents upstream, because the client it belonged to
                 // no longer exists.
                 if !sessions.contains_key(&session) {
-                    return;
+                    return Ok(());
                 }
                 match intent {
                     SessionIntent::RequestProjection => {
                         if let Some(task) = sessions.get(&session) {
-                            let _ = projection::project(task.handle(), state, &state.nick);
+                            let handle = task.handle();
+                            // A client that negotiated the read-marker draft is owed
+                            // its current marker per channel, in the projection, before
+                            // RPL_ENDOFNAMES. A client that did not negotiate it is
+                            // never sent a MARKREAD it did not ask for.
+                            let read_markers = if handle.capabilities().manages_read_markers() {
+                                Some(initial_read_markers(journal, buffers, state).await)
+                            } else {
+                                None
+                            };
+                            let _ = projection::project(
+                                handle,
+                                state,
+                                &state.nick,
+                                read_markers.as_ref(),
+                            );
                         }
                         // Legacy automatic backlog runs only after the projection, so a
                         // client sees current state before retained history.
@@ -1321,18 +1578,30 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         }
                     }
                     SessionIntent::MarkerUpdate { wire } => {
-                        if let Some(task) = sessions.get(&session) {
-                            answer_marker_update(journal, task.handle(), &wire, buffers).await;
-                        }
+                        answer_marker_update(journal, sessions, session, &wire, buffers).await;
                     }
                     SessionIntent::Forward { wire, class } => {
                         // The owner stamps the generation, so a session cannot forge a
                         // frame as belonging to a live generation.
-                        let _ = normal_tx.try_send(OutboundIntent {
-                            generation,
-                            class,
-                            wire,
-                        });
+                        //
+                        // A refusal is a definite local failure, not a hiccup: the frame
+                        // was rejected before admission, so it definitely was not
+                        // accepted for upstream delivery and is never retried or
+                        // replayed into a later generation. No response route survives a
+                        // refusal because this path allocates none -- route allocation
+                        // and send happen in the same owner turn, and nothing is opened
+                        // for a frame that was not admitted.
+                        let class_label = class.as_str();
+                        if normal_tx
+                            .try_send(OutboundIntent {
+                                generation,
+                                class,
+                                wire,
+                            })
+                            .is_err()
+                        {
+                            self.report_upstream_overload(sessions, session, class_label);
+                        }
                     }
                     SessionIntent::Join { channel } => {
                         // Persistence first: durable intent is committed before any
@@ -1340,12 +1609,29 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         // leave an upstream JOIN with no durable record.
                         match self.store.add_desired_channel(self.network, &channel).await {
                             Ok(_) => {
-                                if state.begin_desired_join(&channel) {
-                                    let _ = queue_upstream(
+                                if state.begin_desired_join(&channel)
+                                    && queue_upstream(
                                         normal_tx,
                                         generation,
                                         &format!("JOIN {channel}\r\n"),
-                                    );
+                                    )
+                                    .is_err()
+                                {
+                                    // The commit stands and the join attempt stays
+                                    // recorded; only the wire write was refused. The
+                                    // bouncer now owes the Operator a live state that
+                                    // matches what it already promised to store.
+                                    if !reconcile.defer(channel.clone(), DesiredIntent::Join) {
+                                        self.snapshot.send_modify(|snapshot| {
+                                            snapshot.desired_reconcile_overflowed = snapshot
+                                                .desired_reconcile_overflowed
+                                                .saturating_add(1)
+                                        });
+                                        return Err(RuntimeError::QueueOverloaded);
+                                    }
+                                    self.snapshot.send_modify(|snapshot| {
+                                        snapshot.desired_reconcile_pending = reconcile.pending.len()
+                                    });
                                 }
                             }
                             Err(error) => {
@@ -1364,11 +1650,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             Ok(_) => {
                                 // Observed membership still changes only from an
                                 // authoritative network event or generation loss.
-                                let _ = queue_upstream(
+                                if queue_upstream(
                                     normal_tx,
                                     generation,
                                     &format!("PART {channel}\r\n"),
-                                );
+                                )
+                                .is_err()
+                                    && !reconcile.defer(channel.clone(), DesiredIntent::Part)
+                                {
+                                    self.snapshot.send_modify(|snapshot| {
+                                        snapshot.desired_reconcile_overflowed =
+                                            snapshot.desired_reconcile_overflowed.saturating_add(1)
+                                    });
+                                    return Err(RuntimeError::QueueOverloaded);
+                                }
                             }
                             Err(error) => self.report_local_error(sessions, session, &error),
                         }
@@ -1377,6 +1672,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 let _ = control_tx;
             }
         }
+        Ok(())
     }
 
     /// Tells one client its durable operation failed, without touching the Network.
@@ -1397,6 +1693,59 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         self.snapshot
             .send_modify(|snapshot| snapshot.last_error = Some("store-refused"));
     }
+
+    /// Tells one client its command was refused by the bounded upstream queue.
+    ///
+    /// The text is fixed and carries no client bytes and no secret: echoing the
+    /// rejected command back would only invite injection, and the intent class is the
+    /// whole of what the client needs to know. It goes on the control queue, because the
+    /// normal queue is the thing that just demonstrated it is under pressure.
+    fn report_upstream_overload(
+        &self,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        session: SessionId,
+        class: &'static str,
+    ) {
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.upstream_rejected = snapshot.upstream_rejected.saturating_add(1);
+            snapshot.last_error = Some("upstream-queue-refused");
+        });
+        let Some(task) = sessions.get(&session) else {
+            return;
+        };
+        let nick = self.snapshot.borrow().nick.clone().unwrap_or_default();
+        let _ = task.handle().queue_control(&format!(
+            ":bouncer NOTICE {nick} :Bouncer could not accept that command for upstream delivery ({} refused)\r\n",
+            class
+        ));
+    }
+}
+
+/// Current read marker per channel, for a client's initial MARKREAD set.
+///
+/// Only channels with a *known* marker appear, so an absent entry renders as the
+/// draft's `*` sentinel rather than as a fabricated instant. The set is bounded by
+/// observed membership, so this cannot grow with retained history.
+async fn initial_read_markers(
+    journal: &mut crate::journal::HistoryJournal,
+    buffers: &BTreeMap<String, BufferId>,
+    state: &NetworkState,
+) -> BTreeMap<String, i2pr_irc_wire::IrcTimestamp> {
+    let mut markers = BTreeMap::new();
+    for channel in state.joined_channels() {
+        let Some(buffer) = buffers.get(&casemapped(&channel)).copied() else {
+            continue;
+        };
+        let Ok(Some(event)) = journal.read_marker(buffer).await else {
+            continue;
+        };
+        // The durable marker is an event id. If that event can no longer be read back,
+        // the marker is reported as unknown rather than as a guessed timestamp.
+        if let Ok(Some(stamp)) = journal.event_timestamp(buffer, event).await {
+            markers.insert(channel, stamp);
+        }
+    }
+    markers
 }
 
 /// The conversation target a history-eligible line belongs to.

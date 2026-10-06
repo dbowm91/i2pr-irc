@@ -91,12 +91,20 @@ pub struct SessionCapabilities {
     pub legacy_backlog: bool,
     /// The client will fetch history itself, so automatic backlog is suppressed.
     pub explicit_history: bool,
+    /// The client negotiated `draft/read-marker`, so the bouncer owes it the server
+    /// side of that draft: the initial marker after JOIN, and marker updates made by
+    /// the Operator's other sessions.
+    ///
+    /// This is tracked separately from `explicit_history` because the two drafts are
+    /// independent: a client may negotiate either, both, or neither.
+    pub read_markers: bool,
 }
 impl Default for SessionCapabilities {
     fn default() -> Self {
         Self {
             legacy_backlog: true,
             explicit_history: false,
+            read_markers: false,
         }
     }
 }
@@ -116,12 +124,19 @@ impl SessionCapabilities {
         self.explicit_history
     }
 
+    /// True when this client negotiated `draft/read-marker` and therefore expects the
+    /// bouncer to behave as that draft's server.
+    pub fn manages_read_markers(&self) -> bool {
+        self.read_markers
+    }
+
     /// Applies a client's successful `CAP REQ`, recording that it manages history.
     pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
         Self {
             legacy_backlog: self.legacy_backlog,
             explicit_history: self.explicit_history
                 || crate::chathistory::session_manages_history(enabled),
+            read_markers: self.read_markers || crate::chathistory::session_manages_markers(enabled),
         }
     }
 }
@@ -186,9 +201,13 @@ impl SessionHandle {
     pub fn queue_normal(&self, line: &str) -> Result<(), RuntimeError> {
         queue_line(&self.normal_tx, line)
     }
-    /// Queues one normalized upstream line for fanout. A full queue is reported so the
-    /// owner can count the loss; it never blocks, so a slow client cannot stall
-    /// upstream or any other client, and it is not grounds for ending the attachment.
+    /// Queues one normalized upstream line for fanout.
+    ///
+    /// A refusal is reported rather than swallowed, and it means the session is
+    /// desynchronized: a downstream IRC stream is ordered, so once a live frame is
+    /// skipped the bouncer can no longer claim this client is in step with upstream.
+    /// The owner detaches that one session. It never blocks, so a slow client cannot
+    /// stall the Network or any other client.
     pub fn fanout(&self, bytes: Vec<u8>) -> Result<(), RuntimeError> {
         self.normal_tx
             .try_send(crate::downstream::QueuedFrame::Fire(bytes))

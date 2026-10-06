@@ -905,6 +905,15 @@ pub fn session_manages_history(enabled: &BTreeSet<String>) -> bool {
     enabled.contains(CHATHISTORY_CAPABILITY)
 }
 
+/// Whether this session negotiated the read-marker draft.
+///
+/// Tracked separately from [`session_manages_history`] because the drafts are
+/// independently negotiable: the bouncer owes initial markers and update propagation
+/// to a client that asked for them, and owes neither to one that did not.
+pub fn session_manages_markers(enabled: &BTreeSet<String>) -> bool {
+    enabled.contains(READ_MARKER_CAPABILITY)
+}
+
 /// Advances a read marker monotonically.
 ///
 /// The marker never moves backwards, even when a client reports an older message:

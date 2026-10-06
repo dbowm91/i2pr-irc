@@ -202,6 +202,26 @@ impl Online {
     async fn settle(&mut self) {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+
+    /// Blocks until the owner has applied at least `count` upstream events.
+    ///
+    /// Writing upstream only fills the fixture's buffer, so a test that asserts on the
+    /// consequence of a flood has to wait for the owner to actually work through it.
+    async fn wait_for_upstream_events(&mut self, count: u64) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while self.snapshot.borrow().upstream_events_seen < count {
+                self.snapshot.changed().await.expect("owner alive");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "owner applied only {} of {count} upstream events: {:?}",
+                self.snapshot.borrow().upstream_events_seen,
+                self.snapshot.borrow()
+            )
+        });
+    }
 }
 
 impl Drop for Online {
@@ -302,60 +322,6 @@ async fn drain_upstream(owner: &mut Online) {
     }
 }
 
-/// Waits until the owner's upstream intent queues are empty.
-///
-/// The gauges are sampled by the owner loop, so a turn is forced first: otherwise an
-/// idle owner never republishes and a drained queue would still read as full.
-async fn wait_upstream_queues_drained(
-    owner: &mut Online,
-    client: &mut tokio::io::DuplexStream,
-    nonce: &mut u32,
-) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let drained = {
-            let snapshot = owner.snapshot.borrow();
-            snapshot.upstream_normal_queue_depth == 0 && snapshot.upstream_control_queue_depth == 0
-        };
-        if drained {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "upstream intent queues did not drain: {:?}",
-            owner.snapshot.borrow()
-        );
-        // Each keepalive is forwarded upstream, so the fake server side must be read
-        // or the owner would be waiting on a fixture that refuses to consume.
-        drain_upstream(owner).await;
-        keepalive(owner, client, nonce).await;
-    }
-}
-
-/// Round-trips a uniquely identified client PING.
-///
-/// The owner's generation loop only samples its gauges and drains its bounded
-/// ingestion queue on a turn, and it never spins for the sake of either. A client
-/// PING is therefore the honest way to *ask* for a turn: it is ordinary control
-/// traffic, and answering it promptly is itself an invariant under test.
-///
-/// The token is unique per call. Reusing one would let the read match the previous
-/// PONG still sitting in the socket buffer, which would turn this into a busy loop
-/// that never actually waits for the owner.
-async fn keepalive(owner: &mut Online, client: &mut tokio::io::DuplexStream, nonce: &mut u32) {
-    *nonce += 1;
-    let marker = format!("keepalive-{}-{nonce}", owner.network.0);
-    client
-        .write_all(format!("PING :{marker}\r\n").as_bytes())
-        .await
-        .expect("client writable");
-    let answered = client_read_until(client, marker.as_bytes()).await;
-    assert!(
-        answered.contains("PONG"),
-        "a client PING must always be answered promptly, even under storage pressure"
-    );
-}
-
 /// Confirms upstream self-membership, which is what makes a channel's lines
 /// history-eligible: a buffer exists only for a channel the Network has observed.
 async fn join_upstream(owner: &mut Online, nick: &str, channel: &str) {
@@ -372,6 +338,136 @@ async fn client_register(client: &mut tokio::io::DuplexStream, nick: &str) -> St
         .await
         .expect("client writable");
     client_read_until(client, b"001 ").await
+}
+
+/// Registers a client after negotiating the given draft capabilities.
+///
+/// `CAP REQ` only takes effect once registration completes, so negotiation and
+/// `NICK`/`USER` go out together and the whole exchange is read back at `001`.
+async fn client_register_with_caps(
+    client: &mut tokio::io::DuplexStream,
+    nick: &str,
+    caps: &[&str],
+) -> String {
+    let list = caps.join(" ");
+    client
+        .write_all(
+            format!("CAP REQ :{list}\r\nCAP END\r\nNICK {nick}\r\nUSER {nick} 0 * :phone\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("client writable");
+    let welcome = client_read_until(client, b"001 ").await;
+    for cap in caps {
+        assert!(
+            welcome.contains(&format!("ACK :{list}")) || welcome.contains(&format!(" {cap}")),
+            "a supported capability must be acknowledged: {welcome}"
+        );
+    }
+    welcome
+}
+
+/// An attached client whose read half is consumed continuously.
+///
+/// Several tests exercise upstream, storage, or routing pressure. In those, a fixture
+/// that merely stops reading *is* an overloaded client: its bounded queue fills and the
+/// bouncer detaches it for missing a live frame. That is the correct behaviour, but in
+/// a test about something else it is a confound, so this reader keeps the live stream
+/// healthy and leaves client slowness to the one test that is specifically about it.
+struct DrainingClient {
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl DrainingClient {
+    /// Takes over an already-registered attachment and keeps reading it.
+    fn start(client: tokio::io::DuplexStream) -> Self {
+        let (mut read_half, writer) = tokio::io::split(client);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            while let Ok(count) = read_half.read(&mut buf).await {
+                if count == 0 {
+                    break;
+                }
+                sink.lock()
+                    .expect("client sink not poisoned")
+                    .extend_from_slice(&buf[..count]);
+            }
+        });
+        Self { writer, seen }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.seen.lock().expect("client sink not poisoned").clone()
+    }
+
+    fn saw(&self, needle: &[u8]) -> bool {
+        self.bytes()
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Blocks until `needle` has been received, or fails with what was received.
+    async fn wait_for(&self, needle: &[u8]) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self.saw(needle) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "client never received {}; received {}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&self.bytes())
+            )
+        });
+    }
+
+    async fn write_line(&mut self, line: &str) {
+        self.writer
+            .write_all(line.as_bytes())
+            .await
+            .expect("client writable");
+    }
+
+    /// Round-trips a uniquely identified PING, which is the honest way to ask the
+    /// owner for a turn: it is control traffic, and answering it is itself an
+    /// invariant under test.
+    async fn keepalive(&mut self, owner: &mut Online, nonce: &mut u32) {
+        *nonce += 1;
+        let marker = format!("keepalive-{}-{nonce}", owner.network.0);
+        self.write_line(&format!("PING :{marker}\r\n")).await;
+        self.wait_for(marker.as_bytes()).await;
+        assert!(
+            self.saw(b"PONG"),
+            "a client PING must always be answered promptly, even under storage pressure"
+        );
+    }
+
+    /// Waits until the owner's upstream intent queues are empty.
+    async fn wait_upstream_queues_drained(&mut self, owner: &mut Online, nonce: &mut u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let drained = {
+                let snapshot = owner.snapshot.borrow();
+                snapshot.upstream_normal_queue_depth == 0
+                    && snapshot.upstream_control_queue_depth == 0
+            };
+            if drained {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upstream intent queues did not drain: {:?}",
+                owner.snapshot.borrow()
+            );
+            drain_upstream(owner).await;
+            self.keepalive(owner, nonce).await;
+        }
+    }
 }
 
 // ================================================================ MULTI-NETWORK
@@ -536,7 +632,7 @@ async fn the_per_network_session_ceiling_refuses_the_attach_it_cannot_serve() {
 // ================================================================== MULTI-CLIENT
 
 #[tokio::test]
-async fn one_clients_queue_pressure_never_starves_the_others() {
+async fn one_clients_queue_pressure_costs_only_its_own_attachment() {
     let store = Store::open(&StorePath::Memory).expect("store opens");
     let handle = store.handle_clone();
     handle
@@ -552,29 +648,137 @@ async fn one_clients_queue_pressure_never_starves_the_others() {
     client_register(&mut slow, "bot").await;
     let (_fast_session, mut fast) = owner.attach(ClientId(2)).await;
     client_register(&mut fast, "bot").await;
+    // From here on the healthy client is drained continuously, so the only attachment
+    // that can be desynchronized is the deliberately slow one.
+    let fast = DrainingClient::start(fast);
 
     // Enough upstream volume to overrun a 64-frame queue behind a 2 KiB socket.
-    flood_upstream(&mut owner, 2_000).await;
+    const FLOOD: u32 = 2_000;
+    flood_upstream(&mut owner, FLOOD).await;
 
-    let received = client_read_until(&mut fast, b"PRIVMSG").await;
+    fast.wait_for(b"PRIVMSG").await;
     assert!(
-        received.contains("PRIVMSG"),
-        "a slow client must never starve a healthy one: {received}"
+        fast.saw(b"PRIVMSG"),
+        "a slow client must never starve a healthy one"
     );
-    // The healthy attachment was not ended to make room for the slow one.
+
+    // Wait for the flood to be fully processed rather than asserting against whatever
+    // happens to have arrived when the first frame reaches the healthy client.
+    owner.wait_for_upstream_events(FLOOD as u64).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while owner.snapshot.borrow().fanout_detached == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the slow client is eventually detached");
+
+    let snapshot = owner.snapshot.borrow().clone();
+    // The slow client is detached rather than left attached having silently skipped a
+    // frame. An ordered IRC stream cannot be repaired in place: once a live frame is
+    // missed, the client cannot be told which state it never received.
     assert!(
-        owner.snapshot.borrow().attached_sessions >= 1,
-        "one saturated client cost only its own frames"
+        snapshot.fanout_dropped > 0,
+        "the refused frame is counted, never silent"
     );
     assert!(
-        owner.snapshot.borrow().fanout_dropped > 0,
-        "the loss to the slow client is counted, never silent"
+        snapshot.fanout_detached > 0,
+        "a client that missed a live frame is detached, not left half-synchronized"
     );
     assert_eq!(
-        owner.snapshot.borrow().phase,
+        snapshot.last_session_disposition,
+        Some("downstream-overload"),
+        "the detach records an explicit disposition"
+    );
+    assert_eq!(
+        snapshot.attached_sessions, 1,
+        "only the overloaded attachment is removed"
+    );
+    assert_eq!(
+        snapshot.sessions_ended, 1,
+        "exactly one session ended, and it ended for overload"
+    );
+    assert_eq!(
+        snapshot.phase,
         Some(Phase::Online),
         "client pressure never ends the upstream Network"
     );
+    // The detached client's stream is closed, so the bouncer does not leave a task
+    // writing into a socket nobody will ever read again.
+    let mut closed = Vec::new();
+    let mut buf = [0; 256];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match slow.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(count) => closed.extend_from_slice(&buf[..count]),
+                Err(_) => break,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the detached client was never closed: {closed:?}"));
+}
+
+#[tokio::test]
+async fn a_detached_client_can_reattach_and_is_told_the_truth_again() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    join_upstream(&mut owner, "bot", "#room").await;
+    owner.settle().await;
+
+    let (_session, mut first) = owner.attach_with(ClientId(1), 2048).await;
+    client_register(&mut first, "bot").await;
+    flood_upstream(&mut owner, 2_000).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while owner.snapshot.borrow().fanout_detached == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the overloaded client is eventually detached");
+    drop(first);
+
+    // A replacement is a fresh ephemeral attachment under the same durable lineage. It
+    // gets a full projection rather than a resumption, because the bouncer cannot know
+    // what the previous attachment already saw.
+    let (replacement, mut reattached) = owner
+        .attach_as(SessionId(9_001), ClientId(1), 64 * 1024)
+        .await;
+    let welcome = client_register_with_caps(&mut reattached, "bot", &["draft/read-marker"]).await;
+    assert!(
+        welcome.contains("JOIN #room"),
+        "the replacement is told current observed membership again: {welcome}"
+    );
+    // A read-marker client is told its current marker as part of that projection, after
+    // the JOIN. No marker has been set for this channel yet, so the draft's own `*`
+    // unknown-marker sentinel is the truthful answer.
+    assert!(
+        welcome.contains("MARKREAD #room *"),
+        "the replacement is told its read marker again: {welcome}"
+    );
+    let marker_at = welcome.find("MARKREAD").expect("marker present");
+    let join_at = welcome.find("JOIN #room").expect("join present");
+    assert!(
+        marker_at > join_at,
+        "the marker must follow the JOIN it annotates: {welcome}"
+    );
+    let reattached = DrainingClient::start(reattached);
+    flood_upstream(&mut owner, 2).await;
+    reattached.wait_for(b"flood 0").await;
+    assert_eq!(
+        owner.snapshot.borrow().fanout_detached,
+        1,
+        "a client that keeps reading is never detached"
+    );
+    let _ = replacement;
 }
 
 #[tokio::test]
@@ -777,6 +981,11 @@ async fn store_pressure_degrades_storage_only_and_creates_no_side_queue() {
     owner.wait_phase(Phase::Online).await;
     let (_session, mut client) = owner.attach(ClientId(1)).await;
     client_register(&mut client, "bot").await;
+    // The client keeps reading throughout. Its subject here is storage pressure alone:
+    // if the fixture stopped reading it would become an overloaded client, the bouncer
+    // would detach it for missing live frames, and the two pressures would be
+    // indistinguishable.
+    let mut client = DrainingClient::start(client);
 
     // Every one of these messages is history-eligible, so a stalled store turns them
     // into ingestion pressure. The bounded ingress queue must absorb that pressure by
@@ -792,11 +1001,15 @@ async fn store_pressure_degrades_storage_only_and_creates_no_side_queue() {
         Some(Phase::Online),
         "storage pressure must never end the upstream Network"
     );
-
-    let received = client_read_until(&mut client, b"PRIVMSG").await;
+    client.wait_for(b"PRIVMSG").await;
     assert!(
-        received.contains("PRIVMSG"),
+        client.saw(b"PRIVMSG"),
         "the client still receives live traffic while storage is degraded"
+    );
+    assert_eq!(
+        owner.snapshot.borrow().fanout_detached,
+        0,
+        "a client that keeps reading must never be detached, whatever the store is doing"
     );
 
     // Nothing accumulated behind the slow store: every upstream intent the owner
@@ -804,7 +1017,9 @@ async fn store_pressure_degrades_storage_only_and_creates_no_side_queue() {
     handle.set_stall(None);
     drain_upstream(&mut owner).await;
     let mut nonce = 0u32;
-    wait_upstream_queues_drained(&mut owner, &mut client, &mut nonce).await;
+    client
+        .wait_upstream_queues_drained(&mut owner, &mut nonce)
+        .await;
 
     // Every history-eligible line is *accounted for*: recorded, skipped, or dropped
     // and counted. A line that simply vanished would leave no trace, which is the
@@ -824,7 +1039,7 @@ async fn store_pressure_degrades_storage_only_and_creates_no_side_queue() {
             owner.snapshot.borrow()
         );
         drain_upstream(&mut owner).await;
-        keepalive(&mut owner, &mut client, &mut nonce).await;
+        client.keepalive(&mut owner, &mut nonce).await;
     }
     let snapshot = owner.snapshot.borrow();
     assert_eq!(

@@ -449,10 +449,19 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
     assert!(!playback::wants_backlog(SessionCapabilities {
         legacy_backlog: false,
         explicit_history: false,
+        read_markers: false,
     }));
     assert!(!playback::wants_backlog(SessionCapabilities {
         legacy_backlog: true,
         explicit_history: true,
+        read_markers: false,
+    }));
+    // The drafts are independently negotiable, so a read-marker client that does not
+    // manage its own history still receives the automatic backlog.
+    assert!(playback::wants_backlog(SessionCapabilities {
+        legacy_backlog: true,
+        explicit_history: false,
+        read_markers: true,
     }));
 }
 

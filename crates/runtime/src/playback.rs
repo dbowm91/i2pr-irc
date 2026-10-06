@@ -237,10 +237,23 @@ mod tests {
         let explicit = SessionCapabilities {
             legacy_backlog: true,
             explicit_history: true,
+            read_markers: false,
         };
         assert!(
             !wants_backlog(explicit),
             "a client that fetches history itself must not also receive an automatic backlog"
+        );
+        // The two drafts are independent: managing history says nothing about whether
+        // the bouncer owes this client a read marker, so suppressing the backlog must
+        // not be inferred from read-marker negotiation either.
+        let markers_only = SessionCapabilities {
+            legacy_backlog: true,
+            explicit_history: false,
+            read_markers: true,
+        };
+        assert!(
+            wants_backlog(markers_only),
+            "negotiating only read-marker must not suppress the legacy backlog"
         );
     }
 }

@@ -952,6 +952,22 @@ impl OutboundIntent {
         self.class == IntentClass::DesiredState
     }
 }
+impl IntentClass {
+    /// A stable, non-secret label for this class.
+    ///
+    /// It appears in a local NOTICE when the bounded upstream queue refuses a client
+    /// command, so the client learns which kind of request was dropped without the
+    /// bouncer echoing the command itself. These names are fixed strings rather than
+    /// derived from anything the client sent.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::DesiredState => "desired-state",
+            Self::NonReplayable => "client-command",
+            Self::GenerationQuery => "query",
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Backoff {
     pub attempt: u32,
