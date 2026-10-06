@@ -12,10 +12,12 @@ Long-term references:
 Related ADRs:
 
 - plans/adrs/ADR-0001-i2p-only-upstream-and-router-adapter-boundary.md
+- plans/adrs/ADR-0002-bounded-sqlite-persistence-history-order-and-session-identity.md
 
 Post-closure corrective authority:
 
 - plans/subsystems/bouncer-core-m002-lifecycle-corrective-addendum.md
+- plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md
 
 Pre-M003 gates:
 
@@ -108,19 +110,21 @@ It does not require Proposal 170.
 
 ## 4. Current state
 
-M001 protocol/domain/fault foundations are evidence-closed. M002 has a historical evidence-based closure, and Corrective 004 closed its upstream-lifecycle/state-fidelity defects in `plans/closure/bouncer-core/004-status.md`.
+M001 and M002 are evidence-closed, with Correctives 004-006 preserving the post-closure findings that had to be resolved before persistence and multi-client work.
 
-A subsequent source review found two narrower defects that had to be corrected before M003 persists or extends the state/protocol model: configured JOIN commands were promoted to observed membership before server confirmation, and downstream CAP negotiation did not suspend registration until CAP END. Corrective 005 owned those issues plus the related RPL_NAMREPLY visibility gap and is closed in `plans/closure/bouncer-core/005-status.md`.
+M003 was implemented through Plans 007-012 and historically closed in `plans/closure/bouncer-core/012-status.md`. That line delivered the owned bounded SQLite store, durable/live identity split, many independent Network owners and downstream sessions, bounded durable history/cursors, SessionId-scoped response routing, and draft history/read-marker adapters. ADR-0002 remains the durable storage/identity authority.
 
-Research 002 compared the owned IRC wire/state/CAP behavior against current Rust IRC crates and primary specifications, and its disposition is recorded in `plans/research/003-rust-irc-crate-conformance-results.md`. That research found two further conformance defects — framing recovery after an over-long line, and the unrecognized Modern IRC `CASEMAPPING=rfc1459-strict` spelling — which Corrective 006 corrected and closed in `plans/closure/bouncer-core/006-status.md`. Both pre-M003 gates are now closed; see the readiness decisions in those records.
+A post-closure source/specification review against the current IRCv3 documents found that the M003 closure overstated protocol and queue-integrity readiness:
 
-Canonical product/security direction and terminology are frozen. ADR-0001 establishes I2P-only upstream authority through I2pStreamProvider.
+- the owned `server-time` path parses/renders integer epoch seconds instead of the ratified UTC millisecond timestamp grammar;
+- the advertised CHATHISTORY parser/adapter does not match the current draft parameter/reference grammar and TARGETS semantics;
+- MARKREAD does not implement the current get/set/server semantics;
+- several downstream-to-upstream bounded queue failures are ignored, permitting silent command loss and possible DesiredState/live divergence;
+- a saturated live downstream fanout queue currently drops one arbitrary frame while leaving the session attached, which can leave an IRC client desynchronized.
 
-Research has identified ZNC as a mature feature-envelope reference and soju as the closer conceptual reference for persistent multi-network/multi-client/history behavior. Current IRCv3 specifications establish the need for explicit capability mediation, labeled-response routing, message-tag bounds, and draft-isolated history/read-marker behavior.
+Corrective 013 owns these findings. Historical M003 evidence remains useful and is not rewritten, but M004 is blocked until `plans/closure/bouncer-core/013-status.md` closes the corrective.
 
-The runtime contains the corrected single-network owner: registration, CAP/SASL, liveness, observed state, and the upstream writer task are owned by the upstream generation, while a zero-or-one local client attachment is handled as data, so local-client absence no longer gates or ends an upstream session. Observed channel, member, and mode state is bounded and driven by advertised `CHANTYPES`, `PREFIX`, and `CHANMODES`; state that cannot be represented truthfully is marked incomplete and omitted from synthesized projections rather than projected falsely.
-
-Corrective 005 finished the DesiredState/ObservedState boundary: self-channel membership is server-confirmed rather than command-implied, written joins are tracked as bounded generation-local attempts, standard join-failure numerics are classified without creating membership, and downstream CAP registration waits for CAP END when negotiation is active. Research 002 then confirmed the resulting wire/state behavior against primary specifications and current maintained Rust IRC implementations, retained the owned layers, and produced the durable conformance corpus in `research/irc-conformance/` that is now the regression gate for those layers.
+Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
 ## 5. Target architecture
 
@@ -191,7 +195,10 @@ M003-D / 010 response routing + IRCv3 foundation
 M003-E / 011 chathistory + read-marker adapters
   |
   v
-M003-F / 012 integrated qualification + M003 closure
+M003-F / 012 integrated qualification + historical M003 closure
+  |
+  v
+C004 / Corrective 013 IRCv3 time/history + queue integrity
   |
   v
 M004 anonymity + adverse-network qualification
@@ -361,7 +368,8 @@ Prove the bouncer behaves safely under anonymity-sensitive protocol inputs, high
 
 Dependencies:
 
-- M003 closed.
+- historical M003 closure accepted;
+- Corrective 013 closed with no unresolved M004-blocking finding.
 
 Deliverable boundary:
 
@@ -542,12 +550,13 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | C002 / Corrective 005 | closed | plans/implementation/bouncer-core/005-pre-m003-observed-membership-and-downstream-cap-corrective.md | plans/closure/bouncer-core/005-status.md | none |
 | Research 002 | closed | plans/research/002-rust-irc-crate-conformance-plan.md | plans/research/003-rust-irc-crate-conformance-results.md | none |
 | C003 / Corrective 006 | closed | plans/implementation/bouncer-core/006-framing-recovery-corrective.md | plans/closure/bouncer-core/006-status.md | none |
-| M003 | closed | plans 007-012 | plans/closure/bouncer-core/012-status.md | none |
+| M003 | historical closure; corrective active | plans 007-012 | plans/closure/bouncer-core/012-status.md | Strict current readiness authority is Corrective 013 |
 | M003-A / Plan 007 | closed | plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md | plans/closure/bouncer-core/007-status.md | none |
 | M003-B / Plan 008 | closed | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md | plans/closure/bouncer-core/008-status.md | none |
 | M003-C / Plan 009 | closed | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md | plans/closure/bouncer-core/009-status.md | none |
 | M003-D / Plan 010 | closed | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md | plans/closure/bouncer-core/010-status.md | none |
 | M003-E / Plan 011 | closed | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md | plans/closure/bouncer-core/011-status.md | none |
 | M003-F / Plan 012 | closed | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | none |
-| M004 | unblocked | future | future | M003 closed; plan not yet decomposed |
+| C004 / Corrective 013 | ready | plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md | future plans/closure/bouncer-core/013-status.md | none |
+| M004 | blocked | future | future | Corrective 013 closure |
 | M005 | not started | future | future | M004 |
