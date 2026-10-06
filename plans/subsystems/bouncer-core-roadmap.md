@@ -396,7 +396,7 @@ Dependencies:
 Implementation decomposition:
 
 1. Corrective 014 — live multi-client response routing. **Closed**; see `plans/closure/bouncer-core/014-status.md`. UF-013-1 is closed and downstream `labeled-response` is withheld until M004-A's client-tag mediator exists.
-2. M004-A / Plan 015 — anonymity protocol mediation. **Ready**.
+2. M004-A / Plan 015 — anonymity protocol mediation. **Closed**; see `plans/closure/bouncer-core/015-status.md`.
 3. M004-B / Plan 016 — global reconnect budget and fair scheduling. **Ready**.
 4. M004-C / Plan 017 — adverse-network/resource qualification. **Blocked on 015 + 016**.
 5. M004-D / Plan 018 — integrated anonymity qualification and M004 closure. **Blocked on 017**.
@@ -593,8 +593,8 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M003-F / Plan 012 | closed | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | none |
 | C004 / Corrective 013 | closed | plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md | plans/closure/bouncer-core/013-status.md | UF-013-1 promoted to Corrective 014 |
 | C005 / Corrective 014 | ready | plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md | future plans/closure/bouncer-core/014-status.md | none |
-| M004 | active | plans 015-018 | future plans/closure/bouncer-core/018-status.md | Corrective 014 closed; sequenced M004 handoffs in progress |
-| M004-A / Plan 015 | ready | plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md | future plans/closure/bouncer-core/015-status.md | Corrective 014 closed |
+| M004 | active | plans 016-018 | future plans/closure/bouncer-core/018-status.md | Corrective 014 and M004-A closed |
+| M004-A / Plan 015 | closed | plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md | plans/closure/bouncer-core/015-status.md | Corrective 014 closed |
 | M004-B / Plan 016 | ready | plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md | future plans/closure/bouncer-core/016-status.md | Corrective 014 closed |
 | M004-C / Plan 017 | blocked | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | future plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closure |
 | M004-D / Plan 018 | blocked | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | future plans/closure/bouncer-core/018-status.md | Plan 017 closure |
