@@ -26,12 +26,15 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003 planning-eligible, unplanned | M001, M002, and Corrective 004 are closed. Post-closure lifecycle/state-fidelity defects were closed in plans/closure/bouncer-core/004-status.md. M003 is no longer blocked but still has no implementation handoff. |
+| Bouncer core | active pre-M003 gates | plans/subsystems/bouncer-core-roadmap.md | Corrective 005 + Research 002 ready | M001, M002, and Corrective 004 are closed. Corrective 005 must close the desired-vs-observed JOIN and downstream CAP registration defects; Research 002 must record the Rust IRC crate/spec conformance disposition. M003 is blocked on both. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
-None. No implementation plan is currently ready for handoff.
+| Plan | Status | Class | Source | Closure/result |
+|---|---|---|---|---|
+| Bouncer Core Corrective 005 — Pre-M003 Observed Membership and Downstream CAP Correctness | ready | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/005-status.md |
+| Research 002 — Rust IRC Crate Conformance and Reuse Decision | ready for research | research/decision gate | plans/research/002-rust-irc-crate-conformance-plan.md | future plans/research/003-rust-irc-crate-conformance-results.md |
 
 ## Recently closed implementation plans
 
@@ -43,13 +46,15 @@ None. No implementation plan is currently ready for handoff.
 
 ## Blocked implementation plans
 
-None. Corrective 004 closure removed the only hard blocker in the bouncer-core roadmap.
+| Plan | Status | Blocker | Handoff |
+|---|---|---|---|
+| Bouncer Core M003 — durable multi-network/multi-client/history | blocked | Corrective 005 closure + Research 002 disposition | Do not write/activate the M003 implementation handoff until both gates complete without an unresolved M003-affecting correctness defect |
 
 ## Unplanned later milestones
 
-These have roadmap authority but intentionally do not yet have implementation handoffs. M003 is planning-eligible again because Corrective 004 is closed, but it remains unplanned and therefore not implementation-ready; the next handoff must be written against the current closure baseline.
+These have roadmap authority but intentionally do not yet have implementation handoffs. M003 is blocked again by the newly registered pre-M003 correctness/conformance gates. Its implementation handoff must be written against the eventual Corrective-005 closure and Research-003 result baseline.
 
-- Bouncer Core M003 — durable multi-network/multi-client/history (planning-eligible, unplanned);
+- Bouncer Core M003 — durable multi-network/multi-client/history (blocked on Corrective 005 + Research 002);
 - Bouncer Core M004 — anonymity and adverse-network qualification;
 - Bouncer Core M005 — mature operator feature set;
 - Router R001 — portable SAM adapter/cross-router qualification;
@@ -82,6 +87,13 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-M001's corrective qualification is closed in `plans/closure/bouncer-core/003-status.md`, M002 in `plans/closure/bouncer-core/002-status.md`, and the M002 post-closure lifecycle/state-fidelity corrective in `plans/closure/bouncer-core/004-status.md`.
+Two pre-M003 gates are ready and may proceed in parallel:
 
-No implementation plan is active. The next handoff is a Bouncer Core M003 implementation plan written against the current baseline: persistence may store the generation-owned state model, but it must not reintroduce coupled upstream/downstream lifetime, must not treat state the runtime marked incomplete as trustworthy, and must not use persistence to compensate for current-state ownership. Router integration remains blocked behind M005, and M004/M005 remain sequenced behind M003.
+1. `plans/implementation/bouncer-core/005-pre-m003-observed-membership-and-downstream-cap-corrective.md`
+2. `plans/research/002-rust-irc-crate-conformance-plan.md`
+
+Corrective 005 must establish server-confirmed observed channel membership, bounded join-failure disposition, proper downstream CAP registration gating, and complete RPL_NAMREPLY visibility handling.
+
+Research 002 must compare the resulting owned wire/state/CAP behavior against primary specifications and the current `ircv3_parse`, `irc-proto`, `vinezombie`, and `obby-proto` families, then record a production/dev-only/reference/excluded disposition in `plans/research/003-rust-irc-crate-conformance-results.md`.
+
+M003 remains blocked until both are complete. Router integration remains blocked behind M005.
