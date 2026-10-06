@@ -26,20 +26,21 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | corrective closed; M004 unblocked | plans/subsystems/bouncer-core-roadmap.md | Corrective 013 closed | M003 retains its historical closure; Corrective 013 repaired the post-closure IRCv3 time/history and queue-integrity findings without weakening it, so M004 may now be decomposed. |
+| Bouncer core | active prerequisite corrective | plans/subsystems/bouncer-core-roadmap.md | Corrective 014 ready | M004 is fully decomposed in Plans 015-018, but UF-013-1 must close under Corrective 014 first. After 014, M004-A and M004-B may proceed in parallel. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core Corrective 013 — Post-M003 IRCv3 Time/History and Queue-Integrity Conformance | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/013-status.md |
+| Bouncer Core Corrective 014 — Live Multi-Client Response Routing | ready | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/014-status.md |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core Corrective 013 — Post-M003 IRCv3 Time/History and Queue-Integrity Conformance | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/013-status.md |
 | Bouncer Core M003-F — Integrated Qualification and M003 Closure | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/012-status.md |
 | Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/011-status.md |
 | Bouncer Core M003-D — Response Routing and Foundational IRCv3 Mediation | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/010-status.md |
@@ -57,13 +58,15 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M004 — Anonymity and Adverse-Network Qualification | ready to decompose | Corrective 013 closure | Corrective 013 closed without an M004-blocking finding; M004 may now be decomposed, but not implemented before that decomposition is registered |
+| Bouncer Core M004-A — Anonymity Protocol Mediation | blocked | Corrective 014 closure | plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md |
+| Bouncer Core M004-B — Global Reconnect Budget and Fair Scheduling | blocked | Corrective 014 closure | plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md |
+| Bouncer Core M004-C — Adverse-Network and Resource Qualification | blocked | Plans 015 and 016 closure | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md |
+| Bouncer Core M004-D — Integrated Anonymity Qualification and M004 Closure | blocked | Plan 017 closure | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md |
 
 ## Unplanned later milestones
 
-M003 retains its historical closure. Corrective 013 has now closed against it and is the strict current readiness gate; M004 is unblocked for decomposition. Later roadmap milestones remain intentionally unplanned.
+M004 is now fully decomposed and registered. Only later roadmap milestones remain intentionally unplanned.
 
-- Bouncer Core M004 — anonymity and adverse-network qualification (unblocked; awaiting decomposition);
 - Bouncer Core M005 — mature operator feature set;
 - Router R001 — portable SAM adapter/cross-router qualification;
 - Router R002 — i2pr managed-app adapter;
@@ -84,6 +87,7 @@ Current foundation research:
 
 - plans/research/001-bouncer-and-i2p-foundation.md
 - plans/research/004-m003-storage-multiclient-history-research.md
+- plans/research/005-m004-anonymity-and-adverse-network-research.md
 
 Important retained conclusions:
 
@@ -99,10 +103,15 @@ Important retained conclusions:
 
 Implement only:
 
-- `plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md`
+- `plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md`
 
-Corrective 013 owned the post-M003 findings around spec-correct `server-time`, CHATHISTORY and MARKREAD behavior, explicit upstream queue-overload disposition, bounded DesiredState reconciliation after committed JOIN/PART, and live downstream fanout integrity. All five are closed; see `plans/closure/bouncer-core/013-status.md`.
+Corrective 014 owns UF-013-1 and makes the existing ResponseRouter live on the real client/upstream path. It must prove labeled-response translation and bounded WHOIS/WHO/NAMES/LIST fallback deliver replies only to the requesting SessionId.
 
-The historical M003 closure remains preserved at `plans/closure/bouncer-core/012-status.md`; it was not rewritten to pretend these defects were known at closure. `plans/closure/bouncer-core/013-status.md` is the current authority for M004 readiness and records one unresolved non-blocking finding.
+After Corrective 014 closes, Plans 015 and 016 may proceed independently/in parallel:
 
-M005 remains sequenced behind M004, and router integration remains blocked behind M005.
+- `plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md`
+- `plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md`
+
+Plan 017 waits on both, and Plan 018 is the integrated M004 qualification/closure pass.
+
+M005 remains sequenced behind full M004 closure, and router integration remains blocked behind M005.
