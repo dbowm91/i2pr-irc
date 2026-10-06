@@ -39,8 +39,8 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub use crate::state::{
-    MAX_CHANNEL_NAME_BYTES, MAX_CHANNELS, MAX_ISUPPORT_TOKENS, MAX_MEMBERS_PER_CHANNEL,
-    MAX_TOTAL_MEMBERS,
+    JOIN_FAILURE_NUMERICS, JoinAttempt, MAX_CHANNEL_NAME_BYTES, MAX_CHANNELS, MAX_ISUPPORT_TOKENS,
+    MAX_MEMBERS_PER_CHANNEL, MAX_TOTAL_MEMBERS,
 };
 
 pub const NORMAL_QUEUE_CAPACITY: usize = 64;
@@ -181,6 +181,12 @@ pub struct NetworkSnapshot {
     pub downstream_last_disposition: Option<&'static str>,
     pub upstream_events_seen: u64,
     pub last_error: Option<&'static str>,
+    /// Desired channels this generation has written a JOIN for but the server has
+    /// neither confirmed nor rejected. Never membership.
+    pub pending_joins: Vec<String>,
+    /// Desired channels this generation failed to join, with the numeric that
+    /// refused them. Operator intent is unchanged by any entry here.
+    pub rejected_joins: Vec<(String, &'static str)>,
 }
 
 type AcceptFuture<'a, A> = Pin<
@@ -222,7 +228,11 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
     fn publish_state(&self, state: &NetworkState) {
         self.snapshot.send_modify(|snapshot| {
             snapshot.nick = Some(state.nick.clone());
+            // Observed membership only, so a diagnostics reader cannot mistake an
+            // outstanding or rejected attempt for a live channel.
             snapshot.channels = state.joined_channels();
+            snapshot.pending_joins = state.pending_joins();
+            snapshot.rejected_joins = state.rejected_joins();
         });
     }
 
@@ -473,11 +483,13 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
                 }
             }
             // Desired state is re-sent only after a fresh registration, never
-            // carried across a generation boundary.
+            // carried across a generation boundary. Writing a JOIN proves nothing
+            // about membership: each attempt is recorded as outstanding and only an
+            // authoritative self JOIN closes it as confirmed.
             for channel in self.config.desired_channels.iter().take(MAX_CHANNELS) {
+                state.begin_desired_join(channel);
                 send(&mut uw, &format!("JOIN {channel}\r\n")).await?;
             }
-            state.mark_desired_joined();
             Ok::<(), RuntimeError>(())
         };
         tokio::select! {
@@ -1046,10 +1058,11 @@ mod tests {
     }
 
     /// Registers one client and returns every byte it received, waiting for the
-    /// last frame of its expected projection.
+    /// last frame of its expected projection. `CAP END` is part of the flow because
+    /// a client that started CAP negotiation must close it before registration.
     async fn register_client(client: &mut ScriptedStream, last_frame: &[u8]) -> String {
         client
-            .write_all(b"CAP LS 302\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+            .write_all(b"CAP LS 302\r\nNICK bot\r\nUSER bot 0 * :phone\r\nCAP END\r\n")
             .await
             .unwrap();
         let projection = read_until(client, last_frame).await;
@@ -1058,6 +1071,7 @@ mod tests {
 
     const WELCOME: &[u8] = b"001 bot :Welcome\r\n";
     const END_OF_NAMES: &[u8] = b"366 bot #room :End of NAMES list\r\n";
+    const SECRET_END_OF_NAMES: &[u8] = b"366 bot #secret :End of NAMES list\r\n";
 
     #[test]
     fn secret_debug_is_redacted() {
@@ -1175,7 +1189,9 @@ mod tests {
         wait_online(&mut state).await;
         assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
         assert!(!state.borrow().downstream_attached);
-        assert_eq!(state.borrow().channels, vec!["#room".to_owned()]);
+        // The JOIN was written, but nothing is observed until the server confirms.
+        assert!(state.borrow().channels.is_empty());
+        assert_eq!(state.borrow().pending_joins, vec!["#room".to_owned()]);
         // Upstream liveness and state processing continue with zero clients.
         upstream.write_all(b"PING :alive\r\n").await.unwrap();
         let pong = read_until(&mut upstream, b"PONG :alive\r\n").await;
@@ -1187,6 +1203,10 @@ mod tests {
         while state.borrow().upstream_events_seen < 3 {
             state.changed().await.unwrap();
         }
+        // The authoritative self JOIN is what creates observed membership.
+        assert_eq!(state.borrow().channels, vec!["#room".to_owned()]);
+        assert!(state.borrow().pending_joins.is_empty());
+        assert!(state.borrow().rejected_joins.is_empty());
         assert!(!state.borrow().downstream_attached);
         // A local client attaches later to the same generation.
         local
@@ -1832,6 +1852,196 @@ mod tests {
         );
         assert!(
             projection.contains("353 bot = #room :@Alice bot ~Quiet"),
+            "{projection}"
+        );
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_desired_join_is_never_projected_and_retried_by_a_new_generation() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(70), FaultScript::default())))
+            .unwrap();
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#locked".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #locked\r\n").await;
+        assert_eq!(state.borrow().pending_joins, vec!["#locked".to_owned()]);
+        assert!(state.borrow().channels.is_empty());
+        // The server refuses the join.
+        upstream
+            .write_all(b":srv 473 bot #locked :Cannot join channel (+i)\r\n")
+            .await
+            .unwrap();
+        while state.borrow().rejected_joins.is_empty() {
+            state.changed().await.unwrap();
+        }
+        assert_eq!(
+            state.borrow().rejected_joins,
+            vec![("#locked".to_owned(), "473")]
+        );
+        assert!(state.borrow().pending_joins.is_empty());
+        assert!(state.borrow().channels.is_empty());
+        // A client attaching after the failure receives no synthetic JOIN, and the
+        // generation is still healthy.
+        let mut client = local.take_peer().await;
+        let projection = register_client(&mut client, WELCOME).await;
+        assert!(projection.contains("001 bot"), "{projection}");
+        assert!(!projection.contains("JOIN #locked"), "{projection}");
+        upstream.write_all(b"PING :alive\r\n").await.unwrap();
+        read_until(&mut upstream, b"PONG :alive\r\n").await;
+        // A fresh generation re-attempts the same desired configuration.
+        client.shutdown().await.unwrap();
+        upstream.shutdown().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        let mut replacement = provider.take_peer().await;
+        let _ = read_until(&mut replacement, b"USER user 0 * :bouncer\r\n").await;
+        replacement
+            .write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+            .await
+            .unwrap();
+        let retried = read_until(&mut replacement, b"JOIN #locked\r\n").await;
+        assert!(String::from_utf8_lossy(&retried).contains("JOIN #locked"));
+        wait_online(&mut state).await;
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(2)));
+        assert!(state.borrow().rejected_joins.is_empty());
+        assert_eq!(state.borrow().pending_joins, vec!["#locked".to_owned()]);
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_cap_negotiation_holds_the_welcome_until_cap_end() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(71), FaultScript::default())))
+            .unwrap();
+        let supervisor =
+            NetworkSupervisor::new(SharedProvider(provider.clone()), config(vec![])).unwrap();
+        let state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let mut client = local.take_peer().await;
+        client
+            .write_all(
+                b"CAP LS 302\r\nCAP REQ :message-tags\r\nNICK bot\r\nUSER bot 0 * :phone\r\n",
+            )
+            .await
+            .unwrap();
+        let local_reply = read_until(&mut client, b"CAP * NAK :Unsupported capabilities\r\n").await;
+        let local_text = String::from_utf8_lossy(&local_reply).into_owned();
+        assert!(local_text.contains("CAP * NAK"), "{local_text}");
+        // No welcome, ISUPPORT, or channel projection before CAP END.
+        let mut buf = [0u8; 512];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), client.read(&mut buf))
+                .await
+                .is_err(),
+            "no frame may be queued before CAP END"
+        );
+        assert!(state.borrow().downstream_attached);
+        assert_eq!(state.borrow().generation, Some(ConnectionGeneration(1)));
+        client.write_all(b"CAP END\r\n").await.unwrap();
+        let welcome = read_until(&mut client, WELCOME).await;
+        let projection = String::from_utf8_lossy(&welcome).into_owned();
+        assert_eq!(projection.matches("001 bot").count(), 1, "{projection}");
+        // The client is now registered and its traffic is routed upstream.
+        client.write_all(b"NAMES #room\r\n").await.unwrap();
+        let query = read_until(&mut upstream, b"NAMES #room\r\n").await;
+        assert!(String::from_utf8_lossy(&query).contains("NAMES #room"));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn downstream_detach_during_cap_negotiation_leaves_upstream_online() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(72), FaultScript::default())))
+            .unwrap();
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#room".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #room\r\n").await;
+        let mut client = local.take_peer().await;
+        client
+            .write_all(b"CAP LS 302\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+            .await
+            .unwrap();
+        let listing = read_until(&mut client, b"CAP * LS :\r\n").await;
+        assert!(String::from_utf8_lossy(&listing).contains("CAP * LS :"));
+        let since = state.borrow().downstream_detach_total;
+        client.shutdown().await.unwrap();
+        let detached = wait_detach(&mut state, since, "downstream-eof").await;
+        assert_eq!(detached.generation, Some(ConnectionGeneration(1)));
+        assert_eq!(detached.phase, Some(Phase::Online));
+        upstream.write_all(b"PING :still-alive\r\n").await.unwrap();
+        let pong = read_until(&mut upstream, b"PONG :still-alive\r\n").await;
+        assert!(String::from_utf8_lossy(&pong).contains("PONG :still-alive"));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn secret_channel_names_with_at_visibility_reach_the_projection() {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let local = Arc::new(FakeLocalAcceptor::default());
+        local
+            .queue_outcome(Ok((ClientId(73), FaultScript::default())))
+            .unwrap();
+        let supervisor = NetworkSupervisor::new(
+            SharedProvider(provider.clone()),
+            config(vec!["#secret".into()]),
+        )
+        .unwrap();
+        let mut state = supervisor.subscribe_snapshot();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let acceptor = SharedAcceptor(local.clone());
+        let task = tokio::spawn(async move { supervisor.serve(&acceptor, stop_rx).await });
+        let mut upstream = online_upstream(&provider, &task).await;
+        let _ = read_until(&mut upstream, b"JOIN #secret\r\n").await;
+        upstream
+            .write_all(b":bot!u@h JOIN #secret\r\n:srv 353 bot @ #secret :bot @Alice\r\n:srv 366 bot #secret :End of NAMES list\r\n")
+            .await
+            .unwrap();
+        while state.borrow().upstream_events_seen < 3 {
+            state.changed().await.unwrap();
+        }
+        let mut client = local.take_peer().await;
+        let projection = register_client(&mut client, SECRET_END_OF_NAMES).await;
+        assert!(
+            projection.contains("353 bot = #secret :@Alice bot"),
+            "{projection}"
+        );
+        assert!(
+            projection.contains("366 bot #secret :End of NAMES list"),
             "{projection}"
         );
         stop_tx.send(true).unwrap();

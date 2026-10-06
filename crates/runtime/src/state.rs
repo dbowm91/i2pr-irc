@@ -4,6 +4,17 @@
 //! retained across downstream detach. ISUPPORT values drive channel, membership,
 //! and mode interpretation. Where the server has not declared semantics, the state
 //! records that explicitly instead of inventing a value.
+//!
+//! Three distinct categories of channel knowledge are kept apart and must never be
+//! conflated:
+//!
+//! - [`NetworkState::desired_channels`] is durable operator intent. It survives a
+//!   rejected join and a generation replacement.
+//! - [`NetworkState::join_attempts`] is generation-local bookkeeping for a JOIN that
+//!   was written upstream. Writing a command proves nothing, so this records only that
+//!   the outcome is still outstanding, or which standard numeric rejected it.
+//! - [`NetworkState::self_channels`] is observed membership, added only by an
+//!   authoritative server event such as a self JOIN and removed by self PART/KICK.
 use i2pr_irc_core::Casemapping;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,6 +40,25 @@ const DEFAULT_PREFIX: &str = "(ov)@+";
 /// advertised: A and B always take an argument, C takes one only when set,
 /// and D never takes one.
 const DEFAULT_CHANMODES: &str = "beI,k,l,imnpst";
+
+/// Standard channel-failure numerics that a server may return for a JOIN and whose
+/// reply identifies the refused channel. Network-specific numerics stay ordinary
+/// server events because nothing specified here can classify them.
+pub const JOIN_FAILURE_NUMERICS: [&str; 7] = ["403", "405", "471", "473", "474", "475", "476"];
+
+/// Generation-local disposition of one written desired JOIN.
+///
+/// This is deliberately not membership state: it exists so a failed attempt is
+/// explicit rather than silent, and so a rejected join can never be projected as a
+/// successful one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinAttempt {
+    /// The JOIN bytes were written and the server has neither confirmed nor
+    /// rejected them yet.
+    Pending,
+    /// The server rejected this attempt with a standard channel-failure numeric.
+    Rejected(&'static str),
+}
 
 /// Reaction the upstream owner must take after applying one server line.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,10 +380,15 @@ pub struct NetworkState {
     pub chanmodes: ChanModes,
     pub isupport: BTreeSet<String>,
     pub channels: BTreeMap<String, ChannelState>,
-    /// Channels this bouncer currently holds on the network.
+    /// Channels this bouncer currently holds on the network, learned only from
+    /// authoritative server events. Command emission never adds to this set.
     pub self_channels: BTreeSet<String>,
-    /// Durable operator intent, preserved across generations by the supervisor.
+    /// Durable operator intent, preserved across generations by the supervisor and
+    /// never removed by a join failure.
     pub desired_channels: Vec<String>,
+    /// Bounded generation-local record of written desired JOINs, keyed by casemapped
+    /// channel identity. Discarded when the generation is replaced.
+    join_attempts: BTreeMap<Vec<u8>, (String, JoinAttempt)>,
 }
 impl NetworkState {
     pub fn new(nick: &str, desired_channels: &[String]) -> Self {
@@ -367,24 +402,104 @@ impl NetworkState {
             channels: BTreeMap::new(),
             self_channels: BTreeSet::new(),
             desired_channels: desired_channels.to_vec(),
+            join_attempts: BTreeMap::new(),
         }
     }
     pub fn same_nick(&self, left: &str, right: &str) -> bool {
         self.casemapping.fold(left.as_bytes()) == self.casemapping.fold(right.as_bytes())
     }
+    /// Observed membership only. Desired intent and unconfirmed attempts are
+    /// deliberately excluded so a projection can never claim an unjoined channel.
     pub fn joined_channels(&self) -> Vec<String> {
         self.self_channels.iter().cloned().collect()
     }
-    /// Records the channels requested after a fresh registration. Desired state
-    /// is replayed as joins, never as retained user traffic.
-    pub fn mark_desired_joined(&mut self) {
-        self.self_channels = self
-            .desired_channels
-            .iter()
-            .take(MAX_CHANNELS)
-            .cloned()
-            .collect();
+    /// Records that a desired JOIN for `channel` is being written upstream. This
+    /// opens an outstanding attempt, never membership: only a self JOIN closes it as
+    /// confirmed and only a recognized rejection closes it as failed.
+    pub fn begin_desired_join(&mut self, channel: &str) -> bool {
+        self.record_join_attempt(channel, JoinAttempt::Pending)
     }
+    /// Records a standard channel-failure rejection for `channel`. Observed
+    /// membership is untouched, so a refused join can never be projected as joined.
+    pub fn reject_desired_join(&mut self, channel: &str, numeric: &'static str) {
+        self.record_join_attempt(channel, JoinAttempt::Rejected(numeric));
+    }
+    /// Forgets any attempt record for `channel`, used when authoritative membership
+    /// confirms the channel or when a generation is replaced.
+    pub fn clear_join_attempt(&mut self, channel: &str) {
+        let key = self.casemapping.fold(channel.as_bytes());
+        self.join_attempts.remove(&key);
+    }
+    /// Every generation-local attempt with its channel name, ordered by casemapped
+    /// identity so diagnostics and tests are deterministic.
+    pub fn join_attempts(&self) -> Vec<(String, JoinAttempt)> {
+        self.join_attempts
+            .values()
+            .map(|(name, attempt)| (name.clone(), *attempt))
+            .collect()
+    }
+    /// Desired channels whose JOIN outcome the server has not yet reported.
+    pub fn pending_joins(&self) -> Vec<String> {
+        self.join_attempts
+            .values()
+            .filter(|(_, attempt)| *attempt == JoinAttempt::Pending)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+    /// Desired channels this generation failed to join, with the numeric that
+    /// refused them. Bounded non-secret diagnostic state, never configuration.
+    pub fn rejected_joins(&self) -> Vec<(String, &'static str)> {
+        self.join_attempts
+            .values()
+            .filter_map(|(name, attempt)| match attempt {
+                JoinAttempt::Pending => None,
+                JoinAttempt::Rejected(numeric) => Some((name.clone(), *numeric)),
+            })
+            .collect()
+    }
+    fn record_join_attempt(&mut self, channel: &str, attempt: JoinAttempt) -> bool {
+        if !self.is_channel(channel) || !valid_channel_token(channel) {
+            return false;
+        }
+        let key = self.casemapping.fold(channel.as_bytes());
+        if !self.join_attempts.contains_key(&key) && self.join_attempts.len() >= MAX_CHANNELS {
+            return false;
+        }
+        self.join_attempts
+            .insert(key, (channel.to_owned(), attempt));
+        true
+    }
+    /// Classifies a standard join-rejection reply and records it against the target
+    /// channel, but only after the parameter shape has been validated.
+    fn apply_join_failure(&mut self, numeric: &'static str, params: &[Vec<u8>]) {
+        let text = |value: &[u8]| String::from_utf8_lossy(value).into_owned();
+        // RFC-shaped replies name the channel in the last non-trailing parameter;
+        // a bare numeric carries it as the only parameter.
+        let candidate = match params.len() {
+            0 => return,
+            1 => text(&params[0]),
+            _ => text(&params[params.len() - 2]),
+        };
+        if !self.is_channel(&candidate) || !valid_channel_token(&candidate) {
+            return;
+        }
+        self.reject_desired_join(&candidate, numeric);
+    }
+    /// Authoritative self membership: only a server-confirmed self JOIN may add a
+    /// channel, and the outstanding attempt for it becomes meaningless.
+    fn confirm_self_join(&mut self, channel: &str) {
+        if self.ensure_channel(channel) && self.self_channels.len() < MAX_CHANNELS {
+            self.self_channels.insert(channel.to_owned());
+        }
+        self.clear_join_attempt(channel);
+    }
+
+    /// Removes observed membership after an authoritative self PART/KICK.
+    fn forget_self_membership(&mut self, channel: &str) {
+        self.self_channels.remove(channel);
+        self.clear_join_attempt(channel);
+    }
+
     pub fn total_members(&self) -> usize {
         self.channels
             .values()
@@ -501,8 +616,8 @@ impl NetworkState {
                 {
                     let (mode, bare) = self.prefix.split_prefix(nick);
                     let symbol = mode.and_then(|mode| self.prefix.symbol_for(mode));
-                    if self.same_nick(bare, &self.nick) && self.self_channels.len() < MAX_CHANNELS {
-                        self.self_channels.insert(channel.clone());
+                    if self.same_nick(bare, &self.nick) {
+                        self.confirm_self_join(&channel);
                     }
                     self.insert_member(&channel, bare, symbol);
                 }
@@ -512,7 +627,7 @@ impl NetworkState {
                 if let Some(nick) = source.as_deref() {
                     self.remove_member(&channel, nick);
                     if self.same_nick(nick, &self.nick) {
-                        self.self_channels.remove(&channel);
+                        self.forget_self_membership(&channel);
                     }
                 }
             }
@@ -521,7 +636,7 @@ impl NetworkState {
                 let target = text(&params[1]);
                 self.remove_member(&channel, &target);
                 if self.same_nick(&target, &self.nick) {
-                    self.self_channels.remove(&channel);
+                    self.forget_self_membership(&channel);
                 }
             }
             "QUIT" => {
@@ -538,9 +653,11 @@ impl NetworkState {
                 }
             }
             "353" if params.len() >= 3 => {
+                // The channel-visibility field is `=`, `*`, or `@`; it is a
+                // server-reply grammar value and never a member PREFIX symbol.
                 let channel = text(&params[params.len() - 2]);
                 let names = text(params.last().expect("checked length"));
-                if matches!(text(&params[params.len() - 3]).as_str(), "=" | "*") {
+                if matches!(text(&params[params.len() - 3]).as_str(), "=" | "*" | "@") {
                     self.apply_names(&channel, &names);
                 }
             }
@@ -585,7 +702,19 @@ impl NetworkState {
                 }
                 return LineOutcome::ReplyPong(text(params.last().expect("non-empty")));
             }
-            _ => {}
+            other => {
+                // Standard channel-failure numerics are the only reply that can
+                // disambiguate a refused desired attempt from a confirmed one.
+                // Every other command, including network-specific numerics, stays an
+                // ordinary server event.
+                if let Some(failure) = JOIN_FAILURE_NUMERICS
+                    .iter()
+                    .find(|value| **value == other)
+                    .copied()
+                {
+                    self.apply_join_failure(failure, params);
+                }
+            }
         }
         LineOutcome::Quiet
     }
@@ -795,6 +924,16 @@ struct ModeDelta {
     authoritative: bool,
 }
 
+/// A channel name that may safely key attempt bookkeeping: bounded and free of the
+/// characters that separate parameters in a server reply.
+fn valid_channel_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CHANNEL_NAME_BYTES
+        && !value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b',' | b':' | 0 | b'\r' | b'\n'))
+}
+
 /// The nick portion of a message prefix.
 pub fn source_nick(prefix: Option<&[u8]>) -> Option<String> {
     prefix
@@ -973,7 +1112,7 @@ mod tests {
     #[test]
     fn nick_part_quit_topic_and_desired_state_are_tracked() {
         let mut state = NetworkState::new("bot", &["#room".into()]);
-        state.mark_desired_joined();
+        assert!(state.begin_desired_join("#room"));
         state.apply_line(&line(b":bot!u@h JOIN #room\r\n"));
         state.apply_line(&line(b":alice!u@h JOIN #room\r\n"));
         state.apply_line(&line(b":alice!u@h NICK alice2\r\n"));
@@ -987,6 +1126,156 @@ mod tests {
         assert_eq!(rendered(&state, "#room"), ["bot"]);
         state.apply_line(&line(b":bot!u@h PART #room\r\n"));
         assert!(state.self_channels.is_empty());
+    }
+
+    #[test]
+    fn a_written_desired_join_is_not_observed_membership() {
+        let mut state = NetworkState::new("bot", &["#room".into()]);
+        assert!(state.begin_desired_join("#room"));
+        // Writing the command is not evidence: nothing is joined yet.
+        assert!(state.self_channels.is_empty());
+        assert!(state.joined_channels().is_empty());
+        assert_eq!(state.pending_joins(), ["#room"]);
+        // Only the server's own JOIN confirms membership.
+        state.apply_line(&line(b":bot!u@h JOIN #room\r\n"));
+        assert_eq!(state.joined_channels(), ["#room"]);
+        assert!(state.pending_joins().is_empty());
+        assert!(state.rejected_joins().is_empty());
+        assert!(state.join_attempts().is_empty());
+        // Desired intent is unchanged by a confirmation.
+        assert_eq!(state.desired_channels, ["#room"]);
+    }
+
+    #[test]
+    fn self_kick_removes_observed_membership() {
+        let mut state = NetworkState::new("bot", &["#room".into()]);
+        state.begin_desired_join("#room");
+        state.apply_line(&line(b":bot!u@h JOIN #room\r\n"));
+        assert_eq!(state.joined_channels(), ["#room"]);
+        state.apply_line(&line(b":op!u@h KICK #room bot :bye\r\n"));
+        assert!(state.joined_channels().is_empty());
+    }
+
+    #[test]
+    fn every_standard_join_failure_leaves_membership_absent() {
+        for numeric in JOIN_FAILURE_NUMERICS {
+            let mut state = NetworkState::new("bot", &["#room".into()]);
+            assert!(state.begin_desired_join("#room"));
+            let reply = format!(":srv {numeric} bot #room :No such channel\r\n");
+            state.apply_line(&line(reply.as_bytes()));
+            assert!(
+                state.joined_channels().is_empty(),
+                "{numeric} must not create membership"
+            );
+            assert!(state.pending_joins().is_empty(), "{numeric} clears pending");
+            assert_eq!(
+                state.rejected_joins(),
+                [("#room".to_owned(), numeric)],
+                "{numeric} is recorded as a bounded diagnostic"
+            );
+            // A rejection is an observation about this generation, not a
+            // configuration change.
+            assert_eq!(state.desired_channels, ["#room"]);
+            assert!(
+                state
+                    .channels
+                    .get("#room")
+                    .is_none_or(|room| room.members.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn join_failure_accepts_the_bare_and_nick_prefixed_reply_shapes() {
+        let mut state = NetworkState::new("bot", &[]);
+        state.apply_line(&line(b":srv 471 #full :Cannot join channel (+l)\r\n"));
+        assert_eq!(state.rejected_joins(), [("#full".to_owned(), "471")]);
+        state.apply_line(&line(b":srv 473 bot #locked :Cannot join channel (+i)\r\n"));
+        assert_eq!(
+            state.rejected_joins(),
+            [("#full".to_owned(), "471"), ("#locked".to_owned(), "473")]
+        );
+    }
+
+    #[test]
+    fn malformed_and_unrelated_rejections_are_not_recorded() {
+        let mut state = NetworkState::new("bot", &[]);
+        // A non-channel target, a target that is not a channel name, and a
+        // network-specific numeric must all stay ordinary server events.
+        state.apply_line(&line(b":srv 403 bot :No such channel\r\n"));
+        state.apply_line(&line(b":srv 403 bot #room,other :No such channel\r\n"));
+        state.apply_line(&line(
+            b":srv 437 bot #room :Nick/channel is temporarily unavailable\r\n",
+        ));
+        assert!(state.rejected_joins().is_empty());
+        assert!(state.joined_channels().is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_join_clears_a_previous_rejection_and_casemaps_the_key() {
+        let mut state = NetworkState::new("bot", &["#Room".into()]);
+        // rfc1459 casemapping folds `[]\^` to lowercase, so a differently cased
+        // confirmation addresses the same attempt.
+        assert!(state.begin_desired_join("#Room"));
+        state.apply_line(&line(b":srv 471 bot #room :Cannot join channel (+l)\r\n"));
+        assert_eq!(state.rejected_joins(), [("#room".to_owned(), "471")]);
+        state.apply_line(&line(b":bot!u@h JOIN #room\r\n"));
+        assert_eq!(state.joined_channels(), ["#room"]);
+        assert!(state.rejected_joins().is_empty());
+        assert!(state.join_attempts().is_empty());
+    }
+
+    #[test]
+    fn join_attempts_are_bounded_and_reject_unrepresentable_targets() {
+        let mut state = NetworkState::new("bot", &[]);
+        assert!(!state.begin_desired_join("notachannel"));
+        assert!(!state.begin_desired_join(""));
+        assert!(state.join_attempts().is_empty());
+        for index in 0..MAX_CHANNELS {
+            assert!(state.begin_desired_join(&format!("#room{index}")));
+        }
+        assert!(!state.begin_desired_join("#overflow"));
+        assert_eq!(state.pending_joins().len(), MAX_CHANNELS);
+    }
+
+    #[test]
+    fn names_visibility_accepts_equals_star_and_at() {
+        for visibility in ["=", "*", "@"] {
+            let mut state = NetworkState::new("bot", &[]);
+            state.apply_line(&line(
+                format!(":srv 353 bot {visibility} #secret :bot @Alice\r\n").as_bytes(),
+            ));
+            assert_eq!(
+                rendered(&state, "#secret"),
+                ["@Alice", "bot"],
+                "{visibility}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_visibility_is_never_a_membership_prefix() {
+        let mut state = NetworkState::new("bot", &[]);
+        // `@` is a visibility field, and a `~` prefix is not in the advertised
+        // mapping, so neither may become a member symbol.
+        state.apply_line(&line(b":srv 005 bot PREFIX=(ov)@+\r\n"));
+        state.apply_line(&line(b":srv 353 bot @ #secret :@Alice ~Someone bot\r\n"));
+        let symbols: Vec<Option<char>> = state.channels["#secret"]
+            .members
+            .iter()
+            .map(|member| member.symbol)
+            .collect();
+        assert_eq!(symbols, [Some('@'), None, None]);
+        assert_eq!(rendered(&state, "#secret"), ["@Alice", "bot", "~Someone"]);
+    }
+
+    #[test]
+    fn unknown_names_visibility_is_ignored_without_corrupting_membership() {
+        let mut state = NetworkState::new("bot", &[]);
+        state.apply_line(&line(b":srv 353 bot = #room :bot @Alice\r\n"));
+        state.apply_line(&line(b":srv 353 bot ! #room :Intruder\r\n"));
+        assert_eq!(rendered(&state, "#room"), ["@Alice", "bot"]);
+        assert!(state.channels["#room"].members_complete);
     }
 
     #[test]

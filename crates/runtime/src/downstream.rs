@@ -146,6 +146,9 @@ pub struct DownstreamSession<D: ByteStream> {
     normal_tx: mpsc::Sender<Vec<u8>>,
     registered_nick: Option<String>,
     user_received: bool,
+    /// A client that issued `CAP LS`/`CAP REQ` before registration is still
+    /// negotiating: it must send `CAP END` before any welcome or state projection.
+    cap_negotiating: bool,
     ready: bool,
 }
 impl<D: ByteStream> DownstreamSession<D> {
@@ -163,6 +166,7 @@ impl<D: ByteStream> DownstreamSession<D> {
             normal_tx,
             registered_nick: None,
             user_received: false,
+            cap_negotiating: false,
             ready: false,
         }
     }
@@ -171,6 +175,10 @@ impl<D: ByteStream> DownstreamSession<D> {
     }
     pub fn is_ready(&self) -> bool {
         self.ready
+    }
+    /// True while a pre-registration client still owes the bouncer a `CAP END`.
+    pub fn is_cap_negotiating(&self) -> bool {
+        self.cap_negotiating
     }
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.read.read(buf).await
@@ -216,7 +224,11 @@ impl<D: ByteStream> DownstreamSession<D> {
         }
     }
 
-    fn mediate_cap(&self, message: &Message) -> Result<(), RuntimeError> {
+    /// Mediates CAP locally. This never forwards a client CAP command upstream and
+    /// never alters the upstream generation's negotiated capability set. The bouncer
+    /// advertises no downstream capability of its own, so `REQ` is always refused
+    /// while `LIST` reports the empty advertised set.
+    fn mediate_cap(&mut self, message: &Message) -> Result<(), RuntimeError> {
         let subcommand = message
             .params
             .first()
@@ -224,12 +236,32 @@ impl<D: ByteStream> DownstreamSession<D> {
             .unwrap_or_default();
         let target = self.registered_nick.as_deref().unwrap_or("*");
         match subcommand.as_str() {
-            "LS" => queue_line(&self.normal_tx, &format!(":bouncer CAP {target} LS :\r\n")),
-            "REQ" => queue_line(
+            // A new negotiation round only suspends registration before it happens;
+            // a late CAP after registration cannot un-complete a live session.
+            "LS" | "REQ" => {
+                if !self.ready {
+                    self.cap_negotiating = true;
+                }
+                match subcommand.as_str() {
+                    "REQ" => queue_line(
+                        &self.normal_tx,
+                        &format!(":bouncer CAP {target} NAK :Unsupported capabilities\r\n"),
+                    ),
+                    _ => queue_line(&self.normal_tx, &format!(":bouncer CAP {target} LS :\r\n")),
+                }
+            }
+            "END" => {
+                if !self.ready {
+                    self.cap_negotiating = false;
+                }
+                Ok(())
+            }
+            "LIST" => queue_line(
                 &self.normal_tx,
-                &format!(":bouncer CAP {target} NAK :Unsupported capabilities\r\n"),
+                &format!(":bouncer CAP {target} LIST :\r\n"),
             ),
-            "END" => Ok(()),
+            // `ACK`/`NAK` are server-to-client; receiving one is a client protocol
+            // error, not a negotiation step.
             _ => queue_line(
                 &self.normal_tx,
                 ":bouncer 410 * CAP :Invalid CAP subcommand\r\n",
@@ -274,7 +306,14 @@ impl<D: ByteStream> DownstreamSession<D> {
             }
             _ => queue_line(&self.normal_tx, ":bouncer 451 * :Register first\r\n")?,
         }
-        if !self.ready && self.user_received && self.registered_nick.is_some() {
+        // Registration completes only when a valid NICK and USER are both present
+        // and no CAP negotiation is outstanding. A client that never used CAP is
+        // unaffected, and `CAP END` alone never registers a client.
+        if !self.ready
+            && !self.cap_negotiating
+            && self.user_received
+            && self.registered_nick.is_some()
+        {
             self.ready = true;
             self.project_current_state(ctx)?;
         }
@@ -480,7 +519,9 @@ mod tests {
     #[tokio::test]
     async fn registration_projects_retained_state_truthfully() {
         let mut state = NetworkState::new("bot", &["#room".into()]);
-        state.mark_desired_joined();
+        // Membership is only ever established by the server's own JOIN.
+        state.begin_desired_join("#room");
+        state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
         state.apply_line(
             &Message::parse(b":srv 005 bot PREFIX=(ov)@+ CHANMODES=beI,k,l,imnpst\r\n").unwrap(),
         );
@@ -514,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_mode_state_omits_the_mode_projection() {
         let mut state = NetworkState::new("bot", &["#room".into()]);
-        state.mark_desired_joined();
+        state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv 005 bot CHANMODES=beI,k,l,imnpst\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv MODE #room +nq\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv 353 bot = #room :bot\r\n").unwrap());
@@ -529,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_membership_omits_the_names_projection() {
         let mut state = NetworkState::new("bot", &["#room".into()]);
-        state.mark_desired_joined();
+        state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv 353 bot = #room :bot\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv MODE #room +v Stranger\r\n").unwrap());
         let mut harness = Harness::new(state);
@@ -624,6 +665,163 @@ mod tests {
             Err(RuntimeError::QueueOverloaded)
         ));
         assert_eq!(harness.session.queue_depths(), (NORMAL_QUEUE_CAPACITY, 0));
+    }
+
+    #[tokio::test]
+    async fn a_desired_channel_without_confirmation_is_never_projected() {
+        let mut state = NetworkState::new("bot", &["#room".into()]);
+        state.begin_desired_join("#room");
+        state.apply_line(&Message::parse(b":srv 332 bot #room :subject\r\n").unwrap());
+        state.apply_line(&Message::parse(b":srv 353 bot = #room :bot\r\n").unwrap());
+        let mut harness = Harness::new(state);
+        harness.register();
+        let projection = harness.drain_normal();
+        assert!(projection.contains("001 bot"), "{projection}");
+        assert!(!projection.contains("JOIN #room"), "{projection}");
+        assert!(!projection.contains("366"), "{projection}");
+    }
+
+    #[tokio::test]
+    async fn registration_without_cap_negotiation_is_unaffected() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.send(b"NICK bot\r\n").expect("nick accepted");
+        harness
+            .send(b"USER bot 0 * :phone\r\n")
+            .expect("user accepted");
+        assert!(harness.session.is_ready());
+        assert!(!harness.session.is_cap_negotiating());
+        assert!(harness.drain_normal().contains("001 bot"));
+    }
+
+    #[tokio::test]
+    async fn cap_ls_suspends_registration_until_cap_end() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.send(b"CAP LS 302\r\n").expect("cap ls accepted");
+        assert!(harness.session.is_cap_negotiating());
+        harness.send(b"NICK bot\r\n").expect("nick accepted");
+        harness
+            .send(b"USER bot 0 * :phone\r\n")
+            .expect("user accepted");
+        assert!(!harness.session.is_ready());
+        let held = harness.drain_normal();
+        assert!(held.contains("CAP * LS :"), "{held}");
+        assert!(!held.contains("001"), "{held}");
+        harness.send(b"CAP END\r\n").expect("cap end accepted");
+        assert!(!harness.session.is_cap_negotiating());
+        assert!(harness.session.is_ready());
+        let projection = harness.drain_normal();
+        assert!(projection.contains("001 bot"), "{projection}");
+        // The projection is emitted exactly once.
+        harness.send(b"CAP LIST\r\n").expect("cap list accepted");
+        let after = harness.drain_normal();
+        assert!(!after.contains("001"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn cap_end_before_registration_waits_for_both_nick_and_user() {
+        let mut state = NetworkState::new("bot", &[]);
+        state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
+        let mut harness = Harness::new(state);
+        harness.send(b"CAP LS 302\r\n").expect("cap ls accepted");
+        harness.send(b"NICK bot\r\n").expect("nick accepted");
+        harness.send(b"CAP END\r\n").expect("cap end accepted");
+        assert!(!harness.session.is_ready());
+        harness
+            .send(b"USER bot 0 * :phone\r\n")
+            .expect("user accepted");
+        assert!(harness.session.is_ready());
+        assert!(harness.drain_normal().contains("JOIN #room"));
+    }
+
+    #[tokio::test]
+    async fn user_before_nick_registers_once_after_cap_end() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.send(b"CAP LS 302\r\n").expect("cap ls accepted");
+        harness
+            .send(b"USER bot 0 * :phone\r\n")
+            .expect("user accepted");
+        assert!(!harness.session.is_ready());
+        harness.send(b"NICK bot\r\n").expect("nick accepted");
+        assert!(!harness.session.is_ready());
+        harness.send(b"CAP END\r\n").expect("cap end accepted");
+        assert!(harness.session.is_ready());
+        let projection = harness.drain_normal();
+        assert_eq!(projection.matches("001 bot").count(), 1, "{projection}");
+    }
+
+    #[tokio::test]
+    async fn cap_req_is_refused_locally_and_still_awaits_cap_end() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.send(b"CAP LS 302\r\n").expect("cap ls accepted");
+        harness
+            .send(b"CAP REQ :message-tags\r\n")
+            .expect("cap req accepted");
+        harness.send(b"NICK bot\r\n").expect("nick accepted");
+        harness
+            .send(b"USER bot 0 * :phone\r\n")
+            .expect("user accepted");
+        let local = harness.drain_normal();
+        assert!(
+            local.contains("CAP * NAK :Unsupported capabilities"),
+            "{local}"
+        );
+        assert!(!local.contains("001"), "{local}");
+        assert!(!harness.session.is_ready());
+        // No client CAP traffic is forwarded upstream.
+        assert!(harness.upstream_normal_rx.try_recv().is_err());
+        harness.send(b"CAP END\r\n").expect("cap end accepted");
+        assert!(harness.session.is_ready());
+    }
+
+    #[tokio::test]
+    async fn repeated_and_invalid_cap_commands_are_deterministic() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.send(b"CAP LS 302\r\n").expect("first ls accepted");
+        harness.send(b"CAP LS 302\r\n").expect("second ls accepted");
+        harness.send(b"CAP LS\r\n").expect("third ls accepted");
+        let listing = harness.drain_normal();
+        assert_eq!(listing.matches("CAP * LS :").count(), 3, "{listing}");
+        assert!(harness.session.is_cap_negotiating());
+        harness.send(b"CAP END\r\n").expect("cap end accepted");
+        harness
+            .send(b"CAP END\r\n")
+            .expect("repeat cap end accepted");
+        assert!(!harness.session.is_cap_negotiating());
+        // A client-sent ACK is not a negotiation step.
+        harness
+            .send(b"CAP ACK :message-tags\r\n")
+            .expect("ack refused");
+        let refused = harness.drain_normal();
+        assert!(
+            refused.contains("410 * CAP :Invalid CAP subcommand"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_cap_after_registration_cannot_unregister_the_client() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.register();
+        harness.drain_normal();
+        harness.send(b"CAP LS 302\r\n").expect("late ls accepted");
+        assert!(harness.session.is_ready());
+        assert!(!harness.session.is_cap_negotiating());
+        let local = harness.drain_normal();
+        assert!(local.contains("CAP bot LS :"), "{local}");
+        assert!(!local.contains("001"), "{local}");
+    }
+
+    #[tokio::test]
+    async fn client_ping_is_answered_while_cap_negotiation_is_pending() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.send(b"CAP LS 302\r\n").expect("cap ls accepted");
+        harness.drain_normal();
+        harness.send(b"PING :local\r\n").expect("ping answered");
+        assert_eq!(
+            harness.control_rx.try_recv().expect("pong queued"),
+            b":bouncer PONG bouncer :local\r\n"
+        );
+        assert!(!harness.session.is_ready());
     }
 
     #[test]

@@ -19,6 +19,23 @@ Only the last two rows may coincide with upstream shutdown. Client detach, proto
 
 Registration requires NICK and USER before sending 001; the NICK must match the configured current upstream network nick under negotiated casemapping. The runtime answers client PING locally, handles CAP LS/REQ/END with an empty advertised capability set, and routes a bounded command allowlist upstream. Unsupported commands receive 421. Client-supplied prefixes are rejected, and client tag budgets are checked before re-encoding.
 
+## Registration and CAP negotiation
+
+Registration state is four explicit facts, not an implicit `ready` flag: a valid NICK received, USER received, no outstanding CAP negotiation, and already projected.
+
+| client sends | negotiating | registered | effect |
+| --- | --- | --- | --- |
+| `CAP LS 302` before NICK/USER | yes | no | local `CAP * LS :` reply |
+| `CAP REQ :…` before NICK/USER | yes | no | local `CAP * NAK :…`; nothing goes upstream |
+| `CAP END` before NICK/USER | no | no | waits for both remaining facts |
+| NICK/USER with no CAP sent | no | on the second fact | single `001` projection |
+| NICK/USER while negotiating | yes | no | no `001`, no `005`, no JOIN/topic/mode/NAMES |
+| `CAP END` after NICK/USER | no | yes | one `001` projection using current state |
+| `CAP LS`/`LIST` after registration | no | unchanged | locally answered; registration is never undone |
+| `CAP ACK`/`NAK` from a client | unchanged | unchanged | `410 … Invalid CAP subcommand` |
+
+A client that entered CAP negotiation therefore cannot observe any part of the registration burst before it sends `CAP END`, and a client that never uses CAP is unaffected. Repeated or late CAP commands are deterministic: negotiation only ever starts before registration, and it ends at most once. Downstream CAP is mediated locally, so it cannot alter the upstream generation's negotiated capability set, and the advertised downstream capability set remains empty.
+
 ## Projection truthfulness
 
 The projection is bounded and derived from state the runtime actually observed:
@@ -28,7 +45,7 @@ The projection is bounded and derived from state the runtime actually observed:
 - `324` is synthesized from retained channel mode state and only when that state is complete. Parameterized modes keep their arguments, so a retained `+kl key 42` is projected as `+kl key 42`.
 - `353`/`366` are emitted only when a member list was observed and is complete.
 
-Incomplete knowledge is expressed by omission, never by a false value. A mode letter the server has not declared in `CHANMODES`, a required argument that the server did not send, a membership change for an unknown member, or a ceiling breach marks the affected channel incomplete; an authoritative `324` restores completeness. A client that attaches mid-registration receives `001` once its own registration completes.
+Incomplete knowledge is expressed by omission, never by a false value. A mode letter the server has not declared in `CHANMODES`, a required argument that the server did not send, a membership change for an unknown member, or a ceiling breach marks the affected channel incomplete; an authoritative `324` restores completeness. A client that attaches mid-registration receives `001` once its own registration completes. Channel projection iterates observed membership only: a configured or written-but-unconfirmed join is never projected, and a join the server rejected never appears at all.
 
 ## Bounds
 
