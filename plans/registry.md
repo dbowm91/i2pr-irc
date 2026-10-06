@@ -26,20 +26,21 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M004-C ready | Corrective 014, M004-A, and M004-B closed. M004-C is unblocked; M004-D waits on it. UF-015-1 (a legacy duplicate network implementation) is recorded and non-blocking. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M004-D ready | Corrective 014, M004-A, M004-B and M004-C closed. M004-D is unblocked and closes the milestone. UF-015-1 (a legacy duplicate network implementation) and UF-017-1 (an uninjectable reconnect backoff) are recorded and non-blocking. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M004-C / Plan 017 — Adverse-Network and Resource Qualification | ready | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/017-status.md |
+| Bouncer Core M004-D / Plan 018 — Integrated Anonymity Qualification and M004 Closure | ready | invariant qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/018-status.md |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M004-C / Plan 017 — Adverse-Network and Resource Qualification | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/017-status.md |
 | Bouncer Core M004-B / Plan 016 — Global Reconnect Budget | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/016-status.md |
 | Bouncer Core M004-A / Plan 015 — Anonymity Protocol Mediation | closed | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/015-status.md |
 | Bouncer Core Corrective 014 — Live Multi-Client Response Routing | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/014-status.md |
@@ -59,9 +60,9 @@ Canonical direction:
 
 ## Blocked implementation plans
 
-| Plan | Status | Blocker | Handoff |
-|---|---|---|---|
-| Bouncer Core M004-D — Integrated Anonymity Qualification and M004 Closure | blocked | Plan 017 closure | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md |
+None. Every registered implementation plan is either closed or dependency-ready. Router
+integration remains blocked, but on bouncer-core M005 rather than on any plan in this
+table; see the subsystem table above and `plans/subsystems/i2p-router-integration-roadmap.md`.
 
 ## Unplanned later milestones
 
@@ -103,13 +104,11 @@ Important retained conclusions:
 
 Implement only:
 
-- `plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md`
+- `plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md`
 
-Plan 017 owns adverse-network and resource qualification: bounded behaviour under hostile
-inputs, stalled and flapping upstreams, resource ceilings, and the qualification evidence
-that M004-D integrates. Corrective 014, M004-A, and M004-B are closed, so 017's stated
-precondition is satisfied.
-
-Plan 018 is the integrated M004 qualification and closure pass, and remains blocked on 017.
+Plan 018 is the integrated M004 qualification and closure pass. It runs the privacy,
+routing, reconnect-budget and durable-state properties together against the integrated
+subsystems, and closes the milestone. Corrective 014, M004-A, M004-B and M004-C are
+closed, so 018's stated precondition is satisfied.
 
 M005 remains sequenced behind full M004 closure, and router integration remains blocked behind M005.
