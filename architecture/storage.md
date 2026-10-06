@@ -5,7 +5,7 @@ The bouncer's durable substrate is the `i2pr-irc-store` crate. One owned worker 
 ## Topology
 
 ```text
-NetworkSupervisor / BouncerRuntime        (Tokio tasks)
+NetworkOwner (catalog-supervised)     (Tokio tasks)
         |
         | typed StoreHandle calls only
         v

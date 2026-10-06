@@ -1,19 +1,30 @@
 # Network supervisor
 
-`NetworkSupervisor::serve` owns one upstream Network across connection generations. It owns provider attempts, the connection-generation counter, backoff, and the upstream generation actor. It does not own any local client: a `LocalAcceptor` supplies at most one disposable downstream view at a time, and the generation actor handles attachment as data.
+## Which implementation is live
+
+The Network owner that ships is `owner::NetworkOwner`, driven by `catalog::NetworkSupervisor` as one supervised task per durable `NetworkId`. It accepts typed `SupervisorCommand::Attach` intents and may hold several `DownstreamSession`s at once, each with its own bounded queues and writer task.
+
+`lib.rs::NetworkSupervisor` is the superseded first-generation owner. Corrective 019 gated it behind `#[cfg(test)]`, so it is absent from the production build and its ungated upstream connect can no longer be reached from the shipped public API. It is retained only so its qualification suite keeps compiling. Nothing below about `LocalAcceptor` describes the shipping path.
+
+## Generations, ownership, and teardown
+
+`NetworkOwner::serve` owns one upstream Network across connection generations. It owns provider attempts, the connection-generation counter, backoff, and the upstream generation actor. Attachment is data the generation handles, never a precondition for it.
 
 ```
-NetworkSupervisor::serve                         (owns generations + backoff)
-└── run_generation(upstream, generation, acceptor, stop)
+NetworkOwner::serve                               (owns generations + backoff)
+└── run_generation(upstream, generation, commands, stop)
     ├── upstream read half        owner loop      registration, liveness, observed state
     ├── upstream write half       owner loop      CAP/SASL + welcome (registration only)
     └── upstream writer task      JoinSet         control(8) + normal(64) bounded queues
 
-    LocalAcceptor (zero-or-one at any instant)
-    ├── accepted  -> DownstreamSession { read half, decoder, bounded queues }
-    │                                  SessionWriter { exit signal, JoinHandle }
+    downstream sessions (zero or more, per network)
+    ├── attached  -> DownstreamSession { read half, decoder, bounded queues }
+    │                                   SessionWriter { exit signal, JoinHandle }
     └── detached  -> session + writer aborted and joined; generation continues
 ```
+
+The `LocalAcceptor` shape in the legacy supervisor is deliberately not drawn: it accepted
+at most one disposable downstream view, which is why that owner was superseded.
 
 Registration happens with no client attached. The generation reaches `Online` on its own, so local-client absence can never prevent or delay upstream registration. Each attempt receives a monotonically increasing `ConnectionGeneration`, which tags outbound intents and liveness tokens; a failed generation is discarded before another provider attempt.
 
