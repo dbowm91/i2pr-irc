@@ -1,6 +1,6 @@
 # Bouncer Core M005-E / Plan 024 — Indexed History Search and CHATHISTORY Completion
 
-Status: blocked
+Status: ready
 
 Blocker:
 

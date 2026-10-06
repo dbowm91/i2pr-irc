@@ -1,6 +1,8 @@
 # Bouncer Core M005-D / Plan 023 — Bouncer Networks and Local IRC Administration
 
-Status: ready
+Status: closed
+
+Closure: plans/closure/bouncer-core/023-status.md
 
 Blocker:
 
