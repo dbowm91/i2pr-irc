@@ -77,12 +77,31 @@ struct Online {
 
 impl Online {
     async fn start(network: u64, nick: &str, channels: &[&str], store: StoreHandle) -> Self {
+        Self::start_with_upstream_capacity(network, nick, channels, store, 64 * 1024).await
+    }
+
+    /// Brings one Network Online with an upstream fixture that buffers `capacity`
+    /// bytes.
+    ///
+    /// A small capacity is how a *stuck* upstream is modelled: the owner's writer
+    /// blocks once the buffer fills, which is what makes its bounded intent queues
+    /// apply backpressure the way a slow server would.
+    async fn start_with_upstream_capacity(
+        network: u64,
+        nick: &str,
+        channels: &[&str],
+        store: StoreHandle,
+        capacity: usize,
+    ) -> Self {
         let provider = Arc::new(FakeI2pStreamProvider::default());
         // Queue enough connect outcomes that a later reconnect fails loudly with an
         // empty fixture rather than blocking forever.
         for _ in 0..4 {
             provider
-                .queue_outcome(Ok(FaultScript::default()))
+                .queue_outcome(Ok(FaultScript {
+                    capacity,
+                    ..FaultScript::default()
+                }))
                 .expect("queue");
         }
         let context = SupervisorContext {
@@ -365,6 +384,35 @@ async fn client_register_with_caps(
         );
     }
     welcome
+}
+
+/// Registers a client that is already draining, negotiating the given capabilities.
+///
+/// `CAP REQ` only takes effect once registration completes, so negotiation, `CAP END`
+/// and `NICK`/`USER` go out together.
+async fn register_with_caps(client: &mut DrainingClient, nick: &str, caps: &[&str]) {
+    let list = caps.join(" ");
+    client
+        .write_line(&format!(
+            "CAP REQ :{list}\r\nCAP END\r\nNICK {nick}\r\nUSER {nick} 0 * :phone\r\n"
+        ))
+        .await;
+    client.wait_for(b"001 ").await;
+    for cap in caps {
+        assert!(
+            client.saw(format!("ACK :{list}").as_bytes()) || client.saw(cap.as_bytes()),
+            "a supported capability must be acknowledged: {}",
+            String::from_utf8_lossy(&client.bytes())
+        );
+    }
+}
+
+/// Registers a client that is already draining and negotiates nothing.
+async fn register_plain(client: &mut DrainingClient, nick: &str) {
+    client
+        .write_line(&format!("NICK {nick}\r\nUSER {nick} 0 * :phone\r\n"))
+        .await;
+    client.wait_for(b"001 ").await;
 }
 
 /// An attached client whose read half is consumed continuously.
@@ -1691,4 +1739,400 @@ fn no_durable_row_records_a_session_id_or_generation() {
             "an ephemeral identity must not be durable: found {forbidden}"
         );
     }
+}
+
+// ============================================================ QUEUE INTEGRITY
+//
+// Corrective 013 sections I/J/K. The old behaviour on both boundaries was to drop
+// something silently: a client command on the way up, a live frame on the way down.
+// These tests pin the corrected behaviour, which is that the loss is either reported
+// or ends that one attachment -- never neither.
+
+/// Fills the owner's bounded upstream queue by flooding a client while the fixture
+/// refuses to absorb the traffic.
+async fn saturate_upstream_queue(client: &mut DrainingClient, lines: u32) {
+    let mut chunk = String::new();
+    for index in 0..lines {
+        chunk.push_str(&format!("PRIVMSG #room :saturate {index}\r\n"));
+        if chunk.len() >= 128 {
+            client.write_line(&chunk).await;
+            chunk.clear();
+            // Paced deliberately. A client that outruns the owner's bounded
+            // session-event queue is refused at *that* boundary, which would test a
+            // different ceiling than the one under examination here.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    if !chunk.is_empty() {
+        client.write_line(&chunk).await;
+    }
+}
+
+#[tokio::test]
+async fn a_command_refused_by_the_upstream_queue_is_reported_and_never_replayed() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    // A 512-byte upstream fixture blocks the owner's writer after a handful of frames,
+    // which is the backpressure a slow server produces.
+    let mut owner = Online::start_with_upstream_capacity(1, "bot", &[], handle, 512).await;
+    owner.wait_phase(Phase::Online).await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+    client_register(&mut client, "bot").await;
+    // The client keeps reading while it floods, otherwise it would be detached for
+    // missing the live frames its own refusals generate, and two different pressures
+    // would be indistinguishable.
+    let mut client = DrainingClient::start(client);
+
+    // Deliberately do not drain upstream. The queue fills, and past its ceiling the
+    // client's own commands are refused.
+    saturate_upstream_queue(&mut client, 600).await;
+    client.wait_for(b"could not accept that command").await;
+    let notice = String::from_utf8_lossy(&client.bytes()).into_owned();
+    assert!(
+        notice.contains("NOTICE"),
+        "a refused command must be reported to its own session: {notice}"
+    );
+    assert!(
+        notice.contains("upstream delivery"),
+        "the report must say the command was not accepted: {notice}"
+    );
+
+    let snapshot = owner.snapshot.borrow();
+    assert!(
+        snapshot.upstream_rejected > 0,
+        "a refusal is counted, never silent: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error,
+        Some("upstream-queue-refused"),
+        "the refusal records an explicit diagnostic"
+    );
+    assert_eq!(
+        snapshot.phase,
+        Some(Phase::Online),
+        "one client's commands overflowing never ends the Network"
+    );
+    assert_eq!(
+        snapshot.response_routes, 0,
+        "a refused admission cannot leave an open response route"
+    );
+}
+
+#[tokio::test]
+async fn a_committed_join_converges_after_its_first_enqueue_is_refused() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start_with_upstream_capacity(1, "bot", &[], handle.clone(), 512).await;
+    owner.wait_phase(Phase::Online).await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+    client_register(&mut client, "bot").await;
+    let mut client = DrainingClient::start(client);
+
+    // Saturate the upstream queue with ordinary chat, then ask to join a channel. The
+    // database commit succeeds even though the wire write cannot.
+    saturate_upstream_queue(&mut client, 600).await;
+    client.write_line("JOIN #late\r\n").await;
+
+    // The durable intent is recorded even though nothing was written upstream.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !handle
+            .load_networks()
+            .await
+            .expect("reads")
+            .iter()
+            .any(|record| {
+                record
+                    .desired_channels
+                    .iter()
+                    .any(|channel| channel == "#late")
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the committed intent is durable regardless of the wire");
+    assert!(
+        owner.snapshot.borrow().desired_reconcile_pending > 0,
+        "the deferred intent is recorded as needing reconciliation: {:?}",
+        owner.snapshot.borrow()
+    );
+
+    // Relieve the pressure. The deferred JOIN is written on a later turn rather than
+    // being forgotten. The capture matters: a drain that discards would swallow the
+    // very frame under test whenever the reconciliation timer happened to fire inside
+    // it.
+    let mut upstream = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !upstream.contains("JOIN #late") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a committed JOIN must converge once capacity returns; upstream saw {upstream:?}"
+        );
+        upstream.push_str(&drain_upstream_capture(&mut owner).await);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        upstream.matches("JOIN #late").count(),
+        1,
+        "reconciliation writes the deferred intent once, not once per turn: {upstream:?}"
+    );
+    assert!(
+        owner.snapshot.borrow().desired_reconcile_drained > 0,
+        "convergence is counted, not silent"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while owner.snapshot.borrow().desired_reconcile_pending > 0 {
+            drain_upstream(&mut owner).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reconciliation set drains back to empty");
+}
+
+#[tokio::test]
+async fn a_committed_part_converges_after_its_first_enqueue_is_refused() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    // Stored with the channel as existing intent: a PART against a channel the store
+    // never recorded would commit nothing, and the test would be asserting on a
+    // reconciliation that could not exist.
+    handle
+        .save_network(&record(1, "bot", &["#room"]))
+        .await
+        .expect("saved");
+    let mut owner =
+        Online::start_with_upstream_capacity(1, "bot", &["#room"], handle.clone(), 512).await;
+    owner.wait_phase(Phase::Online).await;
+    join_upstream(&mut owner, "bot", "#room").await;
+    owner.settle().await;
+    let (_session, mut client) = owner.attach(ClientId(1)).await;
+    client_register(&mut client, "bot").await;
+    let mut client = DrainingClient::start(client);
+
+    saturate_upstream_queue(&mut client, 600).await;
+    client.write_line("PART #room\r\n").await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while handle
+            .load_networks()
+            .await
+            .expect("reads")
+            .iter()
+            .any(|record| {
+                record
+                    .desired_channels
+                    .iter()
+                    .any(|channel| channel == "#room")
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the committed part is durable regardless of the wire");
+
+    assert!(
+        owner.snapshot.borrow().desired_reconcile_pending > 0,
+        "the deferred part is recorded as needing reconciliation: {:?}",
+        owner.snapshot.borrow()
+    );
+
+    let mut upstream = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !upstream.contains("PART #room") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a committed PART must converge once capacity returns; upstream saw {upstream:?}"
+        );
+        upstream.push_str(&drain_upstream_capture(&mut owner).await);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        upstream.matches("PART #room").count(),
+        1,
+        "reconciliation writes the deferred intent once: {upstream:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stateful_frame_overflow_ends_that_client_rather_than_stale_state() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+
+    let (_slow, mut slow) = owner.attach_with(ClientId(1), 2048).await;
+    client_register(&mut slow, "bot").await;
+    let (_healthy, mut healthy) = owner.attach(ClientId(2)).await;
+    client_register(&mut healthy, "bot").await;
+    // The healthy client is drained throughout, so it can never be the overloaded one.
+    let healthy = DrainingClient::start(healthy);
+
+    // MODE, NICK, KICK, JOIN and PART are the frames carrying a client's idea of who is
+    // in a channel and with what modes. Dropping one and keeping the attachment would
+    // leave it holding state no later frame can repair. This floods a mix of exactly
+    // those stateful frames, with no PRIVMSG in sight, so the detach cannot be excused
+    // as "only chat was lost".
+    let mut payload = String::new();
+    for step in 0..800 {
+        payload.push_str(&format!(":srv MODE #room +o alice{step}\r\n"));
+        payload.push_str(&format!(":alice{step}!u@h NICK alice{step}x\r\n"));
+        payload.push_str(&format!(":op!u@h KICK #room alice{step} :out\r\n"));
+        payload.push_str(&format!(":bob{step}!u@h JOIN #room\r\n"));
+        payload.push_str(&format!(":bob{step}!u@h PART #room :bye\r\n"));
+    }
+    owner
+        .upstream()
+        .write_all(payload.as_bytes())
+        .await
+        .expect("upstream writable");
+    owner.wait_for_upstream_events(4_000).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while owner.snapshot.borrow().fanout_detached == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the slow client is detached once it misses a live frame");
+
+    let snapshot = owner.snapshot.borrow();
+    assert_eq!(
+        snapshot.attached_sessions, 1,
+        "the healthy attachment is untouched: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.response_routes, 0,
+        "routes for the detached session are cleared: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.phase,
+        Some(Phase::Online),
+        "one client missing a MODE never ends the Network"
+    );
+    healthy.wait_for(b"MODE #room").await;
+    assert!(
+        healthy.saw(b"KICK #room"),
+        "the healthy client received every frame it was owed: {:?}",
+        owner.snapshot.borrow()
+    );
+}
+
+#[tokio::test]
+async fn a_marker_set_by_one_session_reaches_the_operators_other_session() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    join_upstream(&mut owner, "bot", "#room").await;
+    owner.settle().await;
+
+    // Both attachments belong to the same Operator, so a marker set by one is the
+    // Operator's read state and the other has to learn about it.
+    let (_first, first) = owner.attach(ClientId(1)).await;
+    let mut first = DrainingClient::start(first);
+    register_with_caps(&mut first, "bot", &["draft/read-marker"]).await;
+    let (_second, second) = owner.attach(ClientId(2)).await;
+    let mut second = DrainingClient::start(second);
+    register_with_caps(&mut second, "bot", &["draft/read-marker"]).await;
+
+    // Retained history, carrying the upstream server-time the setter will name. The
+    // marker resolves against the protocol timestamp, not the local receive time, which
+    // is the whole point of preserving server-time exactly.
+    owner
+        .upstream()
+        .write_all(b"@time=2024-01-01T00:00:00.000Z :alice!u@h PRIVMSG #room :first message\r\n")
+        .await
+        .expect("upstream writable");
+    owner.wait_for_upstream_events(1).await;
+    owner.settle().await;
+
+    // Both clients were just told their current marker, which is `*`: nothing has been
+    // read yet. That initial value must not be mistaken for the update below.
+    first.wait_for(b"MARKREAD #room *").await;
+    second.wait_for(b"MARKREAD #room *").await;
+
+    first
+        .write_line("MARKREAD #room timestamp=2024-01-01T00:00:00.000Z\r\n")
+        .await;
+    first
+        .wait_for(b"MARKREAD #room timestamp=2024-01-01T00:00:00.000Z")
+        .await;
+    // The setter is answered with the value the bouncer actually stored, which is the
+    // retained event's own timestamp and not merely whatever was requested.
+    let asked = String::from_utf8_lossy(&first.bytes()).into_owned();
+    assert!(
+        asked.contains("MARKREAD #room timestamp=2024-01-01T00:00:00.000Z"),
+        "the setter is answered with the value the bouncer stored: {asked}"
+    );
+
+    // The other session never asked again, so it only learns about this through
+    // propagation of the Operator's read state.
+    second
+        .wait_for(b"MARKREAD #room timestamp=2024-01-01T00:00:00.000Z")
+        .await;
+
+    // A set that moves nothing must not look like an update. An older marker is
+    // refused by monotonicity and the existing newer one is returned instead.
+    first
+        .write_line("MARKREAD #room timestamp=2023-01-01T00:00:00.000Z\r\n")
+        .await;
+    owner.settle().await;
+    let before = second.bytes().len();
+    first
+        .write_line("MARKREAD #room timestamp=2023-01-01T00:00:00.000Z\r\n")
+        .await;
+    first
+        .wait_for(b"MARKREAD #room timestamp=2024-01-01T00:00:00.000Z")
+        .await;
+    owner.settle().await;
+    assert!(
+        second.bytes().len() == before,
+        "a set that does not advance the marker must not be broadcast as an update"
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_did_not_negotiate_read_marker_is_never_sent_one() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, "bot", &[]))
+        .await
+        .expect("saved");
+    let mut owner = Online::start(1, "bot", &[], handle).await;
+    owner.wait_phase(Phase::Online).await;
+    join_upstream(&mut owner, "bot", "#room").await;
+    owner.settle().await;
+
+    let (_plain, plain) = owner.attach(ClientId(1)).await;
+    let mut plain = DrainingClient::start(plain);
+    register_plain(&mut plain, "bot").await;
+    let welcome = String::from_utf8_lossy(&plain.bytes()).into_owned();
+    assert!(
+        welcome.contains("JOIN #room"),
+        "the plain client is projected as usual: {welcome}"
+    );
+    assert!(
+        !welcome.contains("MARKREAD"),
+        "an unnegotiated command is a protocol violation for a strict client: {welcome}"
+    );
 }

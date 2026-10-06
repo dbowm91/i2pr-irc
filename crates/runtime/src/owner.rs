@@ -70,6 +70,14 @@ pub const INGEST_BATCH_PER_TURN: usize = 16;
 /// This is a cooperative handoff, not a spin: the turn returns control and waits for
 /// the executor, so an idle owner still sleeps rather than burning a core.
 pub const UPSTREAM_LINES_PER_TURN: usize = 32;
+/// Deferred desired membership is relieved on its own short timer.
+///
+/// Reconciliation cannot wait for traffic. A committed JOIN or PART may be the last
+/// thing that ever happens on this Network, in which case no upstream read, session
+/// event or keepalive tick ever arrives and intent the bouncer already promised to
+/// store would sit unwritten indefinitely. The interval is a bounded timer, not a
+/// spin, and it only does work when the reconciliation set is non-empty.
+pub const DESIRED_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
 /// Ceiling on buffers whose backlog one session may receive in one pass, so a client
 /// attached to many channels still receives a bounded total amount of history.
 pub const MAX_BACKLOG_BUFFERS: usize = 32;
@@ -1061,8 +1069,25 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
 
         let mut probe = tokio::time::interval(crate::LIVENESS_INTERVAL);
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reconcile_tick = tokio::time::interval(DESIRED_RECONCILE_INTERVAL);
+        reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut awaiting_pong: Option<(Instant, String)> = None;
         let outcome = loop {
+            // Deferred desired membership is relieved at the top of every turn, not only
+            // on the keepalive tick. A committed JOIN or PART is operator intent the
+            // bouncer has already promised to store, so it converges as soon as the
+            // queue has room -- bounded by MAX_DESIRED_RECONCILE entries and by one
+            // non-blocking attempt per turn, and never by waiting on anything.
+            let reconciled = reconcile.drain(&normal_tx, generation);
+            if reconciled > 0 {
+                let pending = reconcile.pending.len();
+                self.snapshot.send_modify(|snapshot| {
+                    snapshot.desired_reconcile_drained = snapshot
+                        .desired_reconcile_drained
+                        .saturating_add(reconciled);
+                    snapshot.desired_reconcile_pending = pending;
+                });
+            }
             let attach = next_attach(commands);
             let upstream_read = ur.read(&mut ubuf);
             let session_event = session_rx.recv();
@@ -1153,11 +1178,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         }
                     }
                 }
-                _ = probe.tick() => {
-                    // Deferred desired membership converges here, on a tick that is
-                    // already bounded and already guaranteed not to spin. It is not
-                    // drained inline in the intent path, so reconciliation never
-                    // competes with the client commands it exists to relieve.
+                _ = reconcile_tick.tick() => {
+                    // An idle Network still converges committed operator intent.
                     let drained = reconcile.drain(&normal_tx, generation);
                     if drained > 0 {
                         let pending = reconcile.pending.len();
@@ -1167,6 +1189,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             snapshot.desired_reconcile_pending = pending;
                         });
                     }
+                }
+                _ = probe.tick() => {
                     // Expired routes release their slots deterministically, so a slow
                     // server cannot wedge the router.
                     let expired = router.expire(std::time::Instant::now());
@@ -1656,12 +1680,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                     &format!("PART {channel}\r\n"),
                                 )
                                 .is_err()
-                                    && !reconcile.defer(channel.clone(), DesiredIntent::Part)
+                                    && !self.defer_desired(
+                                        reconcile,
+                                        channel.clone(),
+                                        DesiredIntent::Part,
+                                    )
                                 {
-                                    self.snapshot.send_modify(|snapshot| {
-                                        snapshot.desired_reconcile_overflowed =
-                                            snapshot.desired_reconcile_overflowed.saturating_add(1)
-                                    });
                                     return Err(RuntimeError::QueueOverloaded);
                                 }
                             }
@@ -1692,6 +1716,30 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         }
         self.snapshot
             .send_modify(|snapshot| snapshot.last_error = Some("store-refused"));
+    }
+
+    /// Records one deferred desired-membership intent and publishes the pending depth.
+    ///
+    /// Returns false when the bounded set could not hold another entry. The durable
+    /// intent is still correct in storage, so that is reported rather than dropped: the
+    /// caller ends the generation, and the next one rebuilds membership from DesiredState.
+    fn defer_desired(
+        &self,
+        reconcile: &mut DesiredReconcile,
+        channel: String,
+        intent: DesiredIntent,
+    ) -> bool {
+        if !reconcile.defer(channel, intent) {
+            self.snapshot.send_modify(|snapshot| {
+                snapshot.desired_reconcile_overflowed =
+                    snapshot.desired_reconcile_overflowed.saturating_add(1);
+            });
+            return false;
+        }
+        let pending = reconcile.pending.len();
+        self.snapshot
+            .send_modify(|snapshot| snapshot.desired_reconcile_pending = pending);
+        true
     }
 
     /// Tells one client its command was refused by the bounded upstream queue.
@@ -1867,4 +1915,149 @@ pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     bytes: &[u8],
 ) -> Result<(), std::io::Error> {
     crate::write_frame(w, bytes).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generation() -> ConnectionGeneration {
+        ConnectionGeneration(1)
+    }
+
+    #[tokio::test]
+    async fn a_deferred_intent_converges_once_the_queue_has_room_again() {
+        let (tx, mut rx) = mpsc::channel::<OutboundIntent>(1);
+        // Fill the queue so the first attempt is refused the way a real overload is.
+        tx.try_send(OutboundIntent {
+            generation: generation(),
+            class: IntentClass::Control,
+            wire: b"PING :busy\r\n".to_vec(),
+        })
+        .expect("fills the bounded queue");
+
+        let mut reconcile = DesiredReconcile::default();
+        assert!(
+            reconcile.defer("#room".to_owned(), DesiredIntent::Join),
+            "the first deferred intent is always recorded"
+        );
+        assert_eq!(
+            reconcile.drain(&tx, generation()),
+            0,
+            "a full queue drains nothing"
+        );
+        assert_eq!(
+            reconcile.pending.len(),
+            1,
+            "a refused intent is retained, never dropped"
+        );
+
+        rx.recv().await.expect("the blocking frame is consumed");
+        assert_eq!(reconcile.drain(&tx, generation()), 1);
+        assert!(reconcile.pending.is_empty());
+        let intent = rx.recv().await.expect("the reconciled intent arrives");
+        assert_eq!(intent.wire, b"JOIN #room\r\n");
+        assert_eq!(intent.class, IntentClass::DesiredState);
+    }
+
+    #[tokio::test]
+    async fn the_latest_committed_intent_for_a_channel_wins() {
+        let (tx, mut rx) = mpsc::channel::<OutboundIntent>(8);
+        let mut reconcile = DesiredReconcile::default();
+        // The Operator joined, then parted, both committed. Replaying the JOIN would
+        // contradict the commit that replaced it.
+        assert!(reconcile.defer("#room".to_owned(), DesiredIntent::Join));
+        assert!(reconcile.defer("#room".to_owned(), DesiredIntent::Part));
+        assert_eq!(reconcile.pending.len(), 1);
+        assert_eq!(reconcile.drain(&tx, generation()), 1);
+        let intent = rx.recv().await.expect("intent arrives");
+        assert_eq!(intent.wire, b"PART #room\r\n");
+
+        // And the same in the other direction.
+        let mut reconcile = DesiredReconcile::default();
+        assert!(reconcile.defer("#other".to_owned(), DesiredIntent::Part));
+        assert!(reconcile.defer("#other".to_owned(), DesiredIntent::Join));
+        assert_eq!(reconcile.drain(&tx, generation()), 1);
+        let intent = rx.recv().await.expect("intent arrives");
+        assert_eq!(intent.wire, b"JOIN #other\r\n");
+    }
+
+    #[tokio::test]
+    async fn the_reconciliation_set_is_bounded_at_its_ceiling() {
+        let (_tx, _rx) = mpsc::channel::<OutboundIntent>(1);
+        let mut reconcile = DesiredReconcile::default();
+        for index in 0..MAX_DESIRED_RECONCILE {
+            assert!(
+                reconcile.defer(format!("#room{index}"), DesiredIntent::Join),
+                "intent {index} is within the ceiling"
+            );
+        }
+        assert!(
+            !reconcile.defer("#overflow".to_owned(), DesiredIntent::Join),
+            "a set past its ceiling refuses another intent rather than growing"
+        );
+        assert_eq!(reconcile.pending.len(), MAX_DESIRED_RECONCILE);
+        // Re-deferring a channel already tracked is always allowed: it replaces its own
+        // entry rather than consuming another slot.
+        assert!(reconcile.defer("#room0".to_owned(), DesiredIntent::Part));
+        assert_eq!(reconcile.pending.len(), MAX_DESIRED_RECONCILE);
+    }
+
+    #[tokio::test]
+    async fn a_partly_refused_drain_keeps_remaining_entries_in_order() {
+        let (tx, mut rx) = mpsc::channel::<OutboundIntent>(2);
+        let mut reconcile = DesiredReconcile::default();
+        for channel in ["#a", "#b", "#c"] {
+            assert!(reconcile.defer(channel.to_owned(), DesiredIntent::Join));
+        }
+        // Room for two of three, so the drain stops partway rather than losing the tail.
+        assert_eq!(reconcile.drain(&tx, generation()), 2);
+        assert_eq!(rx.recv().await.expect("a").wire, b"JOIN #a\r\n");
+        assert_eq!(rx.recv().await.expect("b").wire, b"JOIN #b\r\n");
+        assert_eq!(
+            reconcile.pending.keys().collect::<Vec<_>>(),
+            ["#c"],
+            "the refused entry is retained alone, in order"
+        );
+        assert_eq!(reconcile.drain(&tx, generation()), 1);
+        assert_eq!(rx.recv().await.expect("c").wire, b"JOIN #c\r\n");
+        assert!(reconcile.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_replays_channel_names_and_nothing_else() {
+        let (tx, mut rx) = mpsc::channel::<OutboundIntent>(8);
+        let mut reconcile = DesiredReconcile::default();
+        assert!(reconcile.defer("#room".to_owned(), DesiredIntent::Join));
+        assert!(reconcile.defer("#other".to_owned(), DesiredIntent::Part));
+        assert!(reconcile.defer("#room".to_owned(), DesiredIntent::Part));
+        assert_eq!(reconcile.drain(&tx, generation()), 2);
+        assert!(reconcile.pending.is_empty());
+
+        // Every frame reconciliation produced is a membership command. Nothing else can
+        // reach this queue: a refused client command is reported to its own session and
+        // never retained, precisely because it may not be idempotent.
+        for index in 0..2 {
+            let intent = rx.recv().await.expect("a reconciled intent arrives");
+            let line = String::from_utf8_lossy(&intent.wire).into_owned();
+            assert!(
+                matches!(line.as_str(), "PART #room\r\n" | "PART #other\r\n"),
+                "reconciliation may only carry membership commands, wrote {line:?}"
+            );
+            assert!(
+                !line.contains("PRIVMSG") && !line.contains("NOTICE"),
+                "user traffic must never be replayed through reconciliation: {line}"
+            );
+            assert_eq!(
+                intent.class,
+                IntentClass::DesiredState,
+                "a reconciled intent is still classified as durable desired state"
+            );
+            let _ = index;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "reconciliation emits nothing beyond the deferred membership intents"
+        );
+    }
 }
