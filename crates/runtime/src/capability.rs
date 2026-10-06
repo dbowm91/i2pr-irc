@@ -36,8 +36,21 @@ pub const UPSTREAM_FOUNDATIONAL: [&str; 5] = [
 pub const DOWNSTREAM_FOUNDATIONAL: [&str; 4] =
     ["message-tags", "server-time", "batch", "labeled-response"];
 
-/// Draft history capabilities. Present as a constant so their absence is an explicit,
-/// reviewable decision rather than an omission.
+/// Draft history capabilities, delegated to the versioned adapter so no `draft/...`
+/// literal appears outside it.
+///
+/// Their names and the spec revision this build implements live in
+/// `crate::chathistory`; the registry refers to those constants rather than repeating
+/// the literals, which is what keeps a future adapter update out of this file.
+pub const DOWNSTREAM_HISTORY: [&str; 2] = [
+    crate::chathistory::CHATHISTORY_CAPABILITY,
+    crate::chathistory::READ_MARKER_CAPABILITY,
+];
+
+/// Capabilities this build implemented but whose semantics are still withheld.
+///
+/// Kept as a constant so that "not advertised yet" is a reviewable decision rather
+/// than an omission. M003-E promotes [`DOWNSTREAM_HISTORY`] into the advertisement.
 pub const DOWNSTREAM_DEFERRED_HISTORY: [&str; 2] = ["chathistory", "read-marker"];
 
 /// A validated IRCv3 capability name.

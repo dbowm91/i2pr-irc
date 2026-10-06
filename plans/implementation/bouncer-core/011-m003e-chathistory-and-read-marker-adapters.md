@@ -1,6 +1,6 @@
 # Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters
 
-Status: ready for handoff
+Status: closed — see `plans/closure/bouncer-core/011-status.md`
 
 Blocker cleared:
 

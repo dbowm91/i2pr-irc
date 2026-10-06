@@ -88,8 +88,20 @@ impl Default for SessionCapabilities {
 }
 impl SessionCapabilities {
     /// True when this session should receive an automatic backlog.
+    ///
+    /// A client that negotiated `chathistory` manages its own history, so giving it
+    /// the automatic backlog too would deliver the same messages twice.
     pub fn wants_backlog(&self) -> bool {
         self.legacy_backlog && !self.explicit_history
+    }
+
+    /// Applies a client's successful `CAP REQ`, recording that it manages history.
+    pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
+        Self {
+            legacy_backlog: self.legacy_backlog,
+            explicit_history: self.explicit_history
+                || crate::chathistory::session_manages_history(enabled),
+        }
     }
 }
 

@@ -26,20 +26,21 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003-E / Plan 011 ready | M003 is decomposed into Plans 007-012. ADR-0002 and Research 004 freeze the storage/identity/history architecture. | Plans 007-010 are closed; Plan 011 is the executable successor and Plan 012 is blocked on predecessor closure. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003-F / Plan 012 ready | M003 is decomposed into Plans 007-012. ADR-0002 and Research 004 freeze the storage/identity/history architecture. | Plans 007-011 are closed; Plan 012 is the executable final M003 milestone. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | ready | capability | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/011-status.md |
+| Bouncer Core M003-F — Integrated Qualification and M003 Closure | ready | capability | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/012-status.md |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/011-status.md |
 | Bouncer Core M003-D — Response Routing and Foundational IRCv3 Mediation | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/010-status.md |
 | Bouncer Core M003-C — History Journal, Cursors, and Legacy Playback | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/009-status.md |
 | Bouncer Core M003-B — Multi-Network and Multi-Client Ownership | closed | capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/008-status.md |
@@ -55,7 +56,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M003-F — Integrated Qualification and M003 Closure | blocked | Plan 011 closure | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md |
 
 ## Unplanned later milestones
 
@@ -97,10 +97,10 @@ Important retained conclusions:
 
 Implement only:
 
-- `plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md`
+- `plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md`
 
-Plans 007-010 froze the durable substrate and identity split, multi-network/multi-client ownership, durable history with acknowledged legacy playback, and response routing with truthful capability negotiation. All four are closed.
+Plans 007-011 froze the durable substrate and identity split, multi-network/multi-client ownership, durable history with acknowledged legacy playback, response routing with truthful capability negotiation, and bounded history/read-marker adapters. All five are closed.
 
-Plan 012 is already written for continuity and review but is dependency-blocked. Promote only the direct successor after the predecessor closure is accepted.
+Plan 012 is the final M003 milestone: it qualifies the integrated system and closes the milestone.
 
 M004 and M005 remain sequenced behind full M003 closure, and router integration remains blocked behind M005.

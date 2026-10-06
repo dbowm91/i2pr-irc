@@ -32,6 +32,12 @@ use i2pr_irc_store::{
 use i2pr_irc_wire::Message;
 use std::collections::BTreeMap;
 
+/// Ceiling on how many retained events a reference lookup will consider.
+///
+/// Reference resolution must stay bounded: scanning an entire retained history to
+/// find one message would make a client command an unbounded amount of work.
+pub const MAX_REFERENCE_CANDIDATES: usize = 512;
+
 /// Bounded automatic backlog delivered to one legacy client, in events and bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BacklogCap {
@@ -335,6 +341,52 @@ impl HistoryJournal {
             }
         }
         Ok(out)
+    }
+
+    /// Reads one explicit bounded range for one buffer, ignoring any cursor.
+    ///
+    /// An explicit `CHATHISTORY` request names its own range, so it must not be
+    /// silently narrowed to "everything this client has not seen".
+    pub async fn backlog_range(
+        &self,
+        buffer: BufferId,
+        after: Option<HistoryEventId>,
+        before: Option<HistoryEventId>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEvent>, RuntimeError> {
+        if limit == 0 || limit > MAX_HISTORY_QUERY_EVENTS {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        if let (Some(after), Some(before)) = (after, before)
+            && after.0 >= before.0
+        {
+            // An inverted range would return a misleading "complete" answer.
+            return Err(RuntimeError::InvalidConfig);
+        }
+        self.store
+            .query_history(&HistoryQuery {
+                buffer,
+                bound: HistoryQueryBound {
+                    after,
+                    before,
+                    limit,
+                },
+            })
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// Bounded reference candidates for one buffer, used to resolve a msgid or a
+    /// timestamp to a durable position.
+    ///
+    /// The window is explicitly bounded: resolving a reference must not be able to
+    /// scan an entire retained history.
+    pub async fn reference_candidates(
+        &self,
+        buffer: BufferId,
+    ) -> Result<Vec<HistoryEvent>, RuntimeError> {
+        self.backlog_range(buffer, None, None, MAX_REFERENCE_CANDIDATES)
+            .await
     }
 
     /// Monotonically advances one client's playback cursor.

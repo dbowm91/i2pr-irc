@@ -6,6 +6,7 @@
 //! upstream session and client detach never ends the upstream generation.
 pub mod capability;
 pub mod catalog;
+pub mod chathistory;
 pub mod downstream;
 pub mod ircv3;
 pub mod journal;

@@ -1,8 +1,8 @@
 # Bouncer Core M003-F — Integrated Qualification and M003 Closure
 
-Status: blocked
+Status: ready for handoff
 
-Blocker:
+Blocker cleared:
 
 - `plans/closure/bouncer-core/011-status.md` accepted
 
