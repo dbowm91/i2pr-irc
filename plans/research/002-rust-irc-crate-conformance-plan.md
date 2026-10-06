@@ -1,6 +1,8 @@
 # Research 002 — Rust IRC Crate Conformance and Reuse Decision Plan
 
-Status: ready for research
+Status: closed
+
+Result record: `plans/research/003-rust-irc-crate-conformance-results.md`
 
 Research baseline: `3de5e66e49826735346a23030374ad96bfdb5a3b`
 

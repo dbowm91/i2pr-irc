@@ -112,7 +112,7 @@ M001 protocol/domain/fault foundations are evidence-closed. M002 has a historica
 
 A subsequent source review found two narrower defects that had to be corrected before M003 persists or extends the state/protocol model: configured JOIN commands were promoted to observed membership before server confirmation, and downstream CAP negotiation did not suspend registration until CAP END. Corrective 005 owned those issues plus the related RPL_NAMREPLY visibility gap and is closed in `plans/closure/bouncer-core/005-status.md`.
 
-In parallel, Research 002 compares the owned IRC wire/state/CAP behavior against current Rust IRC crates and primary specifications, and its disposition is recorded in `plans/research/003-rust-irc-crate-conformance-results.md`. M003 remains gated on both closures; see the readiness decision in that results record.
+Research 002 compared the owned IRC wire/state/CAP behavior against current Rust IRC crates and primary specifications, and its disposition is recorded in `plans/research/003-rust-irc-crate-conformance-results.md`. That research found two further conformance defects — framing recovery after an over-long line, and the unrecognized Modern IRC `CASEMAPPING=rfc1459-strict` spelling — which Corrective 006 corrected and closed in `plans/closure/bouncer-core/006-status.md`. Both pre-M003 gates are now closed; see the readiness decisions in those records.
 
 Canonical product/security direction and terminology are frozen. ADR-0001 establishes I2P-only upstream authority through I2pStreamProvider.
 
@@ -120,7 +120,7 @@ Research has identified ZNC as a mature feature-envelope reference and soju as t
 
 The runtime contains the corrected single-network owner: registration, CAP/SASL, liveness, observed state, and the upstream writer task are owned by the upstream generation, while a zero-or-one local client attachment is handled as data, so local-client absence no longer gates or ends an upstream session. Observed channel, member, and mode state is bounded and driven by advertised `CHANTYPES`, `PREFIX`, and `CHANMODES`; state that cannot be represented truthfully is marked incomplete and omitted from synthesized projections rather than projected falsely.
 
-Corrective 005 finished the DesiredState/ObservedState boundary: self-channel membership is server-confirmed rather than command-implied, written joins are tracked as bounded generation-local attempts, standard join-failure numerics are classified without creating membership, and downstream CAP registration waits for CAP END when negotiation is active. Research 002 then confirmed the resulting wire/state behavior against primary specifications and current maintained Rust IRC implementations.
+Corrective 005 finished the DesiredState/ObservedState boundary: self-channel membership is server-confirmed rather than command-implied, written joins are tracked as bounded generation-local attempts, standard join-failure numerics are classified without creating membership, and downstream CAP registration waits for CAP END when negotiation is active. Research 002 then confirmed the resulting wire/state behavior against primary specifications and current maintained Rust IRC implementations, retained the owned layers, and produced the durable conformance corpus in `research/irc-conformance/` that is now the regression gate for those layers.
 
 ## 5. Target architecture
 
@@ -168,12 +168,14 @@ C001 / Corrective 004 persistent-upstream lifecycle + state fidelity
   |
   v
 C002 / Corrective 005 observed-membership + downstream-CAP correctness
-  |\
-  | +--> Research 002 Rust IRC crate/spec conformance
-  |          |
-  +----------+
-       |
-       v
+  |
+  v
+Research 002 Rust IRC crate/spec conformance
+  |            (found two defects, below)
+  v
+C003 / Corrective 006 framing recovery + casemapping conformance
+  |
+  v
 M003 multi-network/multi-client + durable history
   |
   v
@@ -188,7 +190,7 @@ M005 mature operator feature set
 Dependency classes:
 
 - M002 has a hard dependency on M001.
-- M003 depends on historical M002 completion and Corrective 004, both closed, plus two new pre-M003 gates: a hard dependency on Corrective 005 closure and a research/decision dependency on Research 002 completion with no unresolved M003-affecting correctness defect.
+- M003 depends on historical M002 completion and Corrective 004, plus three pre-M003 gates that are all closed: Corrective 005, Corrective 006 (raised by the Research 002 corpus), and the Research 002 conformance/decision dependency with no unresolved M003-affecting correctness defect.
 - M004 has a hard dependency on M003.
 - M005 has a hard dependency on M004.
 - Router integration has a hard dependency on M005 under the canonical phase ordering.
@@ -288,8 +290,7 @@ Scale the correct M002 owner model to many Networks and local clients with trans
 
 Dependencies:
 
-- M002 and Corrective 004 closed.
-- Corrective 005 closed.
+- M002, Corrective 004, Corrective 005, and Corrective 006 closed.
 - Research 002 completed with a recorded production/dev-only/reference/excluded disposition for the candidate IRC crates and no unresolved correctness defect affecting M003.
 - storage dependency/ownership decision reviewed before code.
 
@@ -512,7 +513,8 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M002 | closed | plans/implementation/bouncer-core/002-single-network-operational-bouncer.md | plans/closure/bouncer-core/002-status.md | none |
 | C001 / Corrective 004 | closed | plans/implementation/bouncer-core/004-m002-persistent-upstream-lifecycle-and-state-fidelity-corrective.md | plans/closure/bouncer-core/004-status.md | none |
 | C002 / Corrective 005 | closed | plans/implementation/bouncer-core/005-pre-m003-observed-membership-and-downstream-cap-corrective.md | plans/closure/bouncer-core/005-status.md | none |
-| Research 002 | ready | plans/research/002-rust-irc-crate-conformance-plan.md | future plans/research/003-rust-irc-crate-conformance-results.md | may run in parallel with Corrective 005 |
-| M003 | blocked | future | future | Research 002 disposition |
+| Research 002 | closed | plans/research/002-rust-irc-crate-conformance-plan.md | plans/research/003-rust-irc-crate-conformance-results.md | none |
+| C003 / Corrective 006 | closed | plans/implementation/bouncer-core/006-framing-recovery-corrective.md | plans/closure/bouncer-core/006-status.md | none |
+| M003 | unblocked for planning | future | future | none; no implementation handoff exists yet |
 | M004 | not started | future | future | M003 |
 | M005 | not started | future | future | M004 |
