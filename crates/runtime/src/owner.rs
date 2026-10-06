@@ -21,6 +21,7 @@ use crate::{
     journal::IngestOutcome,
     playback::PlaybackOutcome,
     projection,
+    reconnect::{ReconnectScheduler, jitter_entropy},
     routing::{
         BatchRole, Incoming, LABEL_TAG, RequestClass, ResponseRouter, RouteOutcome, RouteRefusal,
         Routed, RoutingRequest,
@@ -632,6 +633,11 @@ pub struct NetworkOwner<P> {
     context: crate::catalog::SupervisorContext,
     store: StoreHandle,
     snapshot: watch::Sender<NetworkSnapshot>,
+    /// Process-wide connect admission.
+    ///
+    /// Held by handle, never owned: one Network's retry timing must not be able to
+    /// affect another's, and every attempt in this process shares one budget.
+    reconnect: ReconnectScheduler,
 }
 
 impl<P: I2pStreamProvider> NetworkOwner<P> {
@@ -639,6 +645,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         provider: P,
         context: crate::catalog::SupervisorContext,
         store: StoreHandle,
+        reconnect: ReconnectScheduler,
     ) -> Result<Self, RuntimeError> {
         let (snapshot, _) = watch::channel(NetworkSnapshot::default());
         snapshot.send_modify(|state| {
@@ -652,7 +659,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             context,
             store,
             snapshot,
+            reconnect,
         })
+    }
+
+    /// The process-wide connect budget this Network is gated by.
+    pub fn reconnect_scheduler(&self) -> &ReconnectScheduler {
+        &self.reconnect
     }
 
     pub fn network(&self) -> NetworkId {
@@ -747,6 +760,24 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             generation = generation
                 .checked_add(1)
                 .ok_or(RuntimeError::GenerationExhausted)?;
+            // Process-wide admission happens before any connect call. Every attempt in
+            // this process -- first connect and every retry alike -- passes this gate, so
+            // a cold start of many stored Networks cannot stampede the router.
+            let permit = tokio::select! {
+                _ = stopped(&mut stop) => {
+                    self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation)));
+                    return Ok(());
+                }
+                admitted = self.reconnect.acquire(self.network) => match admitted {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        // Terminal, or the bounded waiter set is full. Either way there
+                        // is nothing to retry into.
+                        self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation)));
+                        return Err(RuntimeError::QueueOverloaded);
+                    }
+                },
+            };
             self.set_phase(Phase::Connecting, Some(ConnectionGeneration(generation)));
             let connection = tokio::select! {
                 _ = stopped(&mut stop) => {
@@ -761,6 +792,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                 }
             };
+            // The permit is held for exactly the connect attempt. Dropping it releases
+            // in-flight capacity whether the attempt succeeded, failed, or was cancelled.
+            drop(permit);
             let outcome = match connection {
                 Ok(upstream) => {
                     self.set_phase(Phase::Registering, Some(ConnectionGeneration(generation)));
@@ -795,7 +829,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 }
                 Err(error) => Err(error),
             };
-            let delay = backoff.next_delay(generation.wrapping_mul(0x9e3779b97f4a7c15));
+            // A registration rejection means the credentials or configuration were
+            // refused. Retrying the identical request cannot succeed, and each attempt
+            // would spend a permit the whole process shares, so the Network is marked
+            // terminal and stops competing until it is reconciled.
+            if matches!(&outcome, Err(RuntimeError::Registration)) {
+                self.reconnect.mark_terminal(self.network);
+            }
+            let entropy = jitter_entropy(self.network, generation, self.reconnect.entropy_seed());
+            let delay = backoff.next_delay(entropy);
             self.snapshot.send_modify(|state| {
                 state.phase = Some(Phase::Backoff);
                 state.attached_sessions = 0;

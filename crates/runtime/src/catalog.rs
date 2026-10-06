@@ -8,7 +8,8 @@
 //! its own owner and its own observed state; the catalog only routes typed intents to
 //! the right one. That is what keeps "one live owner per Network" true at scale.
 use crate::{
-    RuntimeError, downstream::DownstreamDisposition, session::SessionEvent, session::SessionIntent,
+    RuntimeError, downstream::DownstreamDisposition, reconnect::ReconnectScheduler,
+    session::SessionEvent, session::SessionIntent,
 };
 use i2pr_irc_core::{
     ByteStream, ClientId, ConnectionGeneration, NetworkId, SessionId, SessionIdAllocator,
@@ -144,18 +145,38 @@ pub struct NetworkCatalog {
     handles: BTreeMap<NetworkId, SupervisorHandle>,
     statuses: watch::Sender<CatalogStatus>,
     sessions: SessionIdAllocator,
+    /// The process-wide connect budget.
+    ///
+    /// The catalog holds it because it is what stands between many independently
+    /// supervised Networks and the router: each one's backoff is deliberately
+    /// independent, so without a shared gate a shared outage becomes a connect stampede.
+    reconnect: ReconnectScheduler,
 }
 
 impl NetworkCatalog {
     /// Builds a catalog over an already-open store.
     pub fn new(store: StoreHandle) -> Self {
+        Self::with_reconnect(store, ReconnectScheduler::default())
+    }
+
+    /// Builds a catalog over an explicit connect budget.
+    ///
+    /// Injected so tests can use a smaller, virtual-time-friendly policy instead of
+    /// depending on the wall-clock production values.
+    pub fn with_reconnect(store: StoreHandle, reconnect: ReconnectScheduler) -> Self {
         let (statuses, _) = watch::channel(CatalogStatus::default());
         Self {
             store,
             handles: BTreeMap::new(),
             statuses,
             sessions: SessionIdAllocator::new(),
+            reconnect,
         }
+    }
+
+    /// The process-wide connect budget every supervised Network is gated by.
+    pub fn reconnect(&self) -> &ReconnectScheduler {
+        &self.reconnect
     }
 
     pub fn store(&self) -> &StoreHandle {

@@ -14,6 +14,7 @@ pub mod journal;
 pub mod owner;
 pub mod playback;
 pub mod projection;
+pub mod reconnect;
 pub mod routing;
 pub mod session;
 pub mod state;

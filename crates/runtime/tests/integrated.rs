@@ -15,6 +15,7 @@ use i2pr_irc_runtime::{
     chathistory::{HistoryQueryRequest, MessageReference},
     journal::{BacklogCap, HistoryJournal, IngestOutcome},
     owner::{MAX_SESSIONS_PER_NETWORK, NetworkOwner, NetworkSnapshot, Phase},
+    reconnect::ReconnectScheduler,
 };
 use i2pr_irc_store::{
     BufferKind, NetworkRecord, STORE_BUSY_TIMEOUT_MS, Store, StoreErrorKind, StoreHandle, StorePath,
@@ -110,8 +111,13 @@ impl Online {
             store: store.clone(),
             status: watch::channel(Default::default()).0,
         };
-        let owner =
-            NetworkOwner::new(Shared(provider.clone()), context, store).expect("owner constructs");
+        let owner = NetworkOwner::new(
+            Shared(provider.clone()),
+            context,
+            store,
+            ReconnectScheduler::default(),
+        )
+        .expect("owner constructs");
         let snapshot = owner.subscribe_snapshot();
         let (command_tx, command_rx) = mpsc::channel(64);
         let handle = SupervisorHandle::new(NetworkId(network), command_tx.clone());
