@@ -1,9 +1,17 @@
 //! Persistent single-network upstream owner with zero-or-one attached local client.
 //!
-//! `NetworkSupervisor` owns upstream registration, liveness, and observed IRC state
-//! across connection generations. `LocalAcceptor` supplies at most one disposable
-//! downstream view at a time; client attachment is never a precondition for the
-//! upstream session and client detach never ends the upstream generation.
+//! [`owner::NetworkOwner`] owns upstream registration, liveness, and observed IRC state
+//! across connection generations, and it is the only Network owner in the production
+//! build. A client attachment is never a precondition for the upstream session, and
+//! client detach never ends the upstream generation.
+//!
+//! The superseded first-generation owner, `NetworkSupervisor`, is retained here under
+//! `#[cfg(test)]` only. Corrective 019 gates it out of the shipped API rather than
+//! deleting it, because at the time it was gated its qualification suite still covered
+//! behaviour the production path did not: the SASL PLAIN handshake and the upstream
+//! `QUIT` fence. Both are now covered against `owner::NetworkOwner` in
+//! `crates/runtime/tests/corrective_019.rs`, so the legacy suite is redundant rather
+//! than load-bearing and the legacy owner and its helpers can be deleted outright.
 pub mod capability;
 pub mod catalog;
 pub mod chathistory;
@@ -20,36 +28,43 @@ pub mod routing;
 pub mod session;
 pub mod state;
 
-use crate::downstream::{
-    DownstreamContext, DownstreamDisposition, DownstreamSession, SessionWriter,
+use i2pr_irc_core::{ConnectionGeneration, ProviderError};
+use std::{fmt, io, time::Duration};
+use thiserror::Error;
+use tokio::{io::AsyncWriteExt, sync::mpsc, time::timeout};
+use zeroize::Zeroize;
+
+// Corrective 019: every import below is reachable only from the gated legacy
+// supervisor, so they are gated too. Leaving them ungated would make the production
+// build claim a dependency on modules it no longer contains.
+#[cfg(test)]
+use crate::{
+    downstream::{DownstreamContext, DownstreamDisposition, DownstreamSession, SessionWriter},
+    state::{LineOutcome, NetworkState},
 };
-use crate::state::{LineOutcome, NetworkState};
-use i2pr_irc_core::{
-    ByteStream, ClientId, ConnectionGeneration, I2pEndpoint, I2pStreamProvider, LocalAcceptor,
-    ProviderError,
-};
+#[cfg(test)]
+use i2pr_irc_core::{ByteStream, ClientId, I2pEndpoint, I2pStreamProvider, LocalAcceptor};
+#[cfg(test)]
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
+#[cfg(test)]
 use std::{
     collections::BTreeSet,
-    fmt,
     future::Future,
-    io,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
-use thiserror::Error;
+#[cfg(test)]
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
+    io::AsyncReadExt,
     sync::watch,
     task::JoinSet,
-    time::{Instant, MissedTickBehavior, timeout},
+    time::{Instant, MissedTickBehavior},
 };
-use zeroize::{Zeroize, Zeroizing};
+#[cfg(test)]
+use zeroize::Zeroizing;
 
 pub use crate::state::{
     JOIN_FAILURE_NUMERICS, JoinAttempt, MAX_CHANNEL_NAME_BYTES, MAX_CHANNELS, MAX_ISUPPORT_TOKENS,
@@ -126,6 +141,11 @@ impl Drop for Secret {
         self.0.zeroize()
     }
 }
+/// Upstream configuration for the gated legacy supervisor.
+///
+/// [`owner::NetworkOwner`] takes its configuration from the durable
+/// [`i2pr_irc_store::NetworkRecord`] instead, so this type has no production reader.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct UpstreamConfig {
     pub endpoint: I2pEndpoint,
@@ -135,6 +155,7 @@ pub struct UpstreamConfig {
     pub sasl: Option<(String, Secret)>,
     pub desired_channels: Vec<String>,
 }
+#[cfg(test)]
 impl UpstreamConfig {
     /// Conservative pre-connection validation. Live channel-type interpretation
     /// uses the server-advertised `CHANTYPES` set instead.
@@ -180,8 +201,14 @@ impl UpstreamConfig {
     }
 }
 
-/// Diagnostic projection of the network owner. It never carries message payloads,
-/// endpoints, or credentials.
+/// Diagnostic projection of the legacy network owner. It never carries message
+/// payloads, endpoints, or credentials.
+///
+/// This is not the projection the running bouncer publishes;
+/// [`owner::NetworkSnapshot`] is. Two same-named projections were a hazard for exactly
+/// the reason Corrective 019 gates this one: a reader could not tell which owner a
+/// diagnostic belonged to.
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct NetworkSnapshot {
     pub phase: Option<Phase>,
@@ -211,6 +238,7 @@ pub struct NetworkSnapshot {
     pub rejected_joins: Vec<(String, &'static str)>,
 }
 
+#[cfg(test)]
 type AcceptFuture<'a, A> = Pin<
     Box<
         dyn Future<Output = Result<(ClientId, <A as LocalAcceptor>::Stream), ProviderError>>
@@ -219,11 +247,21 @@ type AcceptFuture<'a, A> = Pin<
     >,
 >;
 
+/// The superseded first-generation Network owner, retained for its qualification suite.
+///
+/// Corrective 019 gates it out of the production build rather than deleting it. Its
+/// `serve` calls [`I2pStreamProvider::connect`] directly, outside both
+/// [`reconnect::ReconnectScheduler`] admission and [`resource::ResourceLedger`]
+/// accounting, so shipping a second such owner in the public API is precisely what
+/// `ADR-0001` forbids. Gating makes "no production code calls the legacy supervisor" the
+/// stronger and simpler claim: in the production build, it does not exist at all.
+#[cfg(test)]
 pub struct NetworkSupervisor<P> {
     provider: P,
     config: UpstreamConfig,
     snapshot: watch::Sender<NetworkSnapshot>,
 }
+#[cfg(test)]
 impl<P: I2pStreamProvider> NetworkSupervisor<P> {
     pub fn new(provider: P, config: UpstreamConfig) -> Result<Self, RuntimeError> {
         config.validate()?;
@@ -779,8 +817,14 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
     }
 }
 
+// Corrective 019: the helpers below are reachable only from the gated legacy
+// supervisor, so they are gated too. They are gated rather than deleted because the
+// legacy supervisor is gated rather than deleted and its qualification suite still
+// calls them: deleting them would break a live suite in order to remove code the
+// production build no longer contains anyway.
 /// Applies one upstream line to observed state and, when a client is registered,
 /// forwards it. Returns a disposition when only the client must detach.
+#[cfg(test)]
 fn apply_upstream_line<D: ByteStream>(
     state: &mut NetworkState,
     session: Option<&DownstreamSession<D>>,
@@ -797,9 +841,10 @@ fn apply_upstream_line<D: ByteStream>(
     }
     // CTCP privacy policy is applied before any client sees the frame, so a metadata
     // probe never reaches a client that would answer it with its own hostname and
-    // software. The legacy supervisor shares this policy with the production owner
-    // rather than having its own: two network implementations must not disagree about
-    // what a client may observe.
+    // software. This block is a *duplicate* of the enforcement the production owner
+    // performs at `owner.rs:1563`; it shares the `ctcp` module with it, not the
+    // enforcement site. Corrective 019 corrected this comment, which claimed a shared
+    // guard where two separate copies exist.
     let direction = match &message.command[..] {
         [b'N', b'O', b'T', b'I', b'C', b'E'] => crate::ctcp::CtcpDirection::Reply,
         _ => crate::ctcp::CtcpDirection::Query,
@@ -852,6 +897,7 @@ fn apply_upstream_line<D: ByteStream>(
     }
 }
 
+#[cfg(test)]
 async fn next_accept<'a, A: LocalAcceptor>(
     slot: &mut Option<AcceptFuture<'a, A>>,
 ) -> Option<Result<(ClientId, A::Stream), ProviderError>> {
@@ -861,6 +907,7 @@ async fn next_accept<'a, A: LocalAcceptor>(
     }
 }
 
+#[cfg(test)]
 async fn read_client<D: ByteStream>(
     session: &mut Option<DownstreamSession<D>>,
     buf: &mut [u8],
@@ -871,6 +918,7 @@ async fn read_client<D: ByteStream>(
     }
 }
 
+#[cfg(test)]
 async fn client_writer_exit(session_writer: &mut Option<SessionWriter>) -> Option<io::Result<()>> {
     match session_writer {
         Some(writer) => Some(writer.wait().await),
@@ -880,9 +928,18 @@ async fn client_writer_exit(session_writer: &mut Option<SessionWriter>) -> Optio
 
 /// Applies a bounded deadline to a future that would otherwise park indefinitely.
 ///
-/// A wall-clock timeout is used deliberately here: these are real network and I/O
-/// deadlines, and a virtual monotonic clock must not be able to expire them without
-/// the test actually advancing it.
+/// This is `tokio::time::timeout` over the runtime clock, and the runtime clock is
+/// pausable. Under `#[tokio::test(start_paused = true)]` the runtime auto-advances
+/// whenever every task is parked, so this deadline *does* expire without the test ever
+/// calling `advance()`. Corrective 019 measured a parked 120s deadline firing in eight
+/// microseconds of real time.
+///
+/// That is the intended behaviour for a real deadline — auto-advance standing in for
+/// elapsed time is exactly what a pausable runtime is for — but it is not what a test
+/// that intends to exercise *backoff* wants. `owner.rs` therefore reaches backoff through
+/// `Backoff::next_delay` and the scheduler's own timer rather than through a timeout. A
+/// test that asserts a retry schedule must advance time in a loop: a single
+/// `advance(600s)` fires one re-armed timer, not sixty thousand of them.
 pub(crate) async fn timeout_bounded<T>(
     duration: Duration,
     future: impl std::future::Future<Output = T>,
@@ -890,6 +947,11 @@ pub(crate) async fn timeout_bounded<T>(
     tokio::time::timeout(duration, future).await
 }
 
+/// Parks until the stop flag is set or the sender is dropped.
+///
+/// Gated with the legacy supervisor for the same reason as `queue_control`: `owner.rs`
+/// has its own private copy, so this one no longer has a production reader.
+#[cfg(test)]
 pub(crate) async fn stopped(stop: &mut watch::Receiver<bool>) {
     loop {
         if *stop.borrow() {
@@ -930,6 +992,15 @@ pub(crate) fn valid_client_nick(bytes: &[u8]) -> bool {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || special(*b) || *b == b'-')
 }
+/// Queues one bounded control frame, refusing anything that is not a complete line.
+///
+/// Corrective 019 gates this behind `#[cfg(test)]`: after the legacy supervisor was
+/// gated, `owner.rs` and `downstream.rs` turned out to each hold their own private copy,
+/// so this one had no production reader left. It is kept rather than deleted because the
+/// control-vs-normal overflow test still exercises it directly. Consolidating the three
+/// copies is deliberately not part of 019; it is a de-duplication, not a closure of a
+/// finding, and it would touch shipping code on no evidence that the copies disagree.
+#[cfg(test)]
 pub(crate) fn queue_control(
     sender: &mpsc::Sender<Vec<u8>>,
     line: &str,
@@ -958,12 +1029,14 @@ pub(crate) async fn next_upstream_frame(
 ) -> Option<Vec<u8>> {
     tokio::select! { biased; command = control.recv() => command, command = normal.recv() => command }
 }
+#[cfg(test)]
 async fn next_intent_frame(
     control: &mut mpsc::Receiver<Vec<u8>>,
     normal: &mut mpsc::Receiver<OutboundIntent>,
 ) -> Option<Result<OutboundIntent, Vec<u8>>> {
     tokio::select! { biased; command = control.recv() => command.map(Err), command = normal.recv() => command.map(Ok) }
 }
+#[cfg(test)]
 async fn send<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<(), io::Error> {
     write_frame(w, s.as_bytes()).await
 }
