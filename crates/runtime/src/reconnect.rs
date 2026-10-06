@@ -38,9 +38,18 @@ use i2pr_irc_core::NetworkId;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::{
+    sync::Notify,
+    // The rate limiter must run on the same clock as the backoff sleep it gates.
+    // `owner.rs` waits out its per-Network backoff with `tokio::time::sleep`, so if the
+    // token bucket ran on a different clock the two would disagree under virtual time:
+    // the sleep would advance while the bucket believed time had not moved, and a
+    // qualification of "the scheduler sleeps between admissions" would be measuring the
+    // wrong thing.
+    time::Instant,
+};
 
 /// Ceiling on concurrent connect attempts across the whole process.
 ///

@@ -262,7 +262,13 @@ impl ResourceLedger {
             state.refused = state.refused.saturating_add(1);
             return Err(LedgerRefused);
         }
-        state.current.entry(network).or_default();
+        state.current.insert(
+            network,
+            NetworkGauges {
+                owner_tasks: 1,
+                ..NetworkGauges::ZERO
+            },
+        );
         state.peak.entry(network).or_default();
         Ok(())
     }
@@ -393,6 +399,20 @@ mod tests {
     }
 
     #[test]
+    fn a_registered_network_counts_as_an_owner_before_any_turn_runs() {
+        let (ledger, _store) = ledger();
+        assert!(ledger.snapshot().current.owner_tasks == 0);
+        ledger.register(NetworkId(1)).expect("registers");
+        assert_eq!(
+            ledger.snapshot().current.owner_tasks,
+            1,
+            "an owner exists from construction, so the count must not wait for a generation turn"
+        );
+        ledger.forget(NetworkId(1));
+        assert_eq!(ledger.snapshot().current.owner_tasks, 0);
+    }
+
+    #[test]
     fn peaks_are_retained_but_current_returns_to_baseline() {
         let (ledger, _store) = ledger();
         ledger.register(NetworkId(1)).expect("registers");
@@ -402,6 +422,7 @@ mod tests {
             .observe(
                 NetworkId(1),
                 NetworkGauges {
+                    owner_tasks: 1,
                     session_tasks: 8,
                     upstream_normal: 12,
                     ..NetworkGauges::ZERO
@@ -413,7 +434,13 @@ mod tests {
         assert_eq!(loaded.peak.upstream_normal, 12);
 
         ledger
-            .observe(NetworkId(1), NetworkGauges::ZERO)
+            .observe(
+                NetworkId(1),
+                NetworkGauges {
+                    owner_tasks: 1,
+                    ..NetworkGauges::ZERO
+                },
+            )
             .expect("observes");
         let settled = ledger.snapshot();
         assert_eq!(
@@ -434,6 +461,7 @@ mod tests {
             .observe(
                 NetworkId(1),
                 NetworkGauges {
+                    owner_tasks: 1,
                     session_tasks: 4,
                     ..NetworkGauges::ZERO
                 },
@@ -445,7 +473,13 @@ mod tests {
         // load is still present would be meaningless: the new campaign would begin at 4
         // and the old peak would be indistinguishable from a fresh reading.
         ledger
-            .observe(NetworkId(1), NetworkGauges::ZERO)
+            .observe(
+                NetworkId(1),
+                NetworkGauges {
+                    owner_tasks: 1,
+                    ..NetworkGauges::ZERO
+                },
+            )
             .expect("observes");
         ledger.reset_peaks();
         assert_eq!(
@@ -457,6 +491,7 @@ mod tests {
             .observe(
                 NetworkId(1),
                 NetworkGauges {
+                    owner_tasks: 1,
                     session_tasks: 2,
                     ..NetworkGauges::ZERO
                 },
@@ -478,6 +513,7 @@ mod tests {
             .observe(
                 NetworkId(2),
                 NetworkGauges {
+                    owner_tasks: 1,
                     session_tasks: 5,
                     ..NetworkGauges::ZERO
                 },
@@ -504,6 +540,7 @@ mod tests {
             .observe(
                 NetworkId(1),
                 NetworkGauges {
+                    owner_tasks: 1,
                     session_tasks: 3,
                     ..NetworkGauges::ZERO
                 },

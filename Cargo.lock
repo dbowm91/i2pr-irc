@@ -72,6 +72,7 @@ dependencies = [
 name = "i2pr-irc-fuzz-smoke"
 version = "0.1.0"
 dependencies = [
+ "i2pr-irc-runtime",
  "i2pr-irc-wire",
 ]
 

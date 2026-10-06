@@ -5,5 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 [dependencies]
 i2pr-irc-wire = { path = "../wire" }
+i2pr-irc-runtime = { path = "../runtime" }
 [lints]
 workspace = true

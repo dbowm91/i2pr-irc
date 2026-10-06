@@ -268,6 +268,23 @@ async fn read_until(stream: &mut ScriptedStream, needle: &[u8]) -> Vec<u8> {
     all
 }
 
+/// The upstream label the bouncer attached to one specific query.
+///
+/// The line is selected by *which query it carries*, never by its position in the
+/// buffer. A read buffer legitimately begins with whatever the server happened to send
+/// first -- a keepalive, a capability frame -- so taking the first line made this pass or
+/// fail on scheduling luck rather than on the routing behaviour under test.
+fn query_label(text: &str, needle: &str) -> String {
+    text.lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no query for {needle} in {text}"))
+        .split_whitespace()
+        .next()
+        .and_then(|tag| tag.strip_prefix("@label="))
+        .unwrap_or_else(|| panic!("query for {needle} carried no label in {text}"))
+        .to_owned()
+}
+
 async fn read_client_until(stream: &mut tokio::io::DuplexStream, needle: &[u8]) -> String {
     let mut all = Vec::new();
     let mut buf = [0; 256];
@@ -869,18 +886,8 @@ async fn two_clients_query_concurrently_and_each_gets_only_its_own_answer() {
 
     // The server answers each query with the label the bouncer sent. Answers arrive out
     // of order, to prove ordering is not what routes them.
-    let label_of = |needle: &str| -> String {
-        text.lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("no query for {needle} in {text}"))
-            .split_whitespace()
-            .next()
-            .and_then(|tag| tag.strip_prefix("@label="))
-            .unwrap_or_else(|| panic!("query for {needle} carried no label in {text}"))
-            .to_owned()
-    };
-    let alice = label_of("WHOIS alice");
-    let bob = label_of("WHOIS bob");
+    let alice = query_label(&text, "WHOIS alice");
+    let bob = query_label(&text, "WHOIS bob");
     assert_ne!(alice, bob, "two concurrent queries must not share a label");
     upstream
         .write_all(
@@ -931,13 +938,7 @@ async fn a_batched_multi_line_answer_stays_with_its_client_and_closes() {
     let upstream = harness.upstream();
     first.write_all(b"WHOIS alice\r\n").await.unwrap();
     let frames = read_until(upstream, b"WHOIS alice\r\n").await;
-    let label = String::from_utf8_lossy(&frames)
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .and_then(|tag| tag.strip_prefix("@label="))
-        .expect("the bouncer labeled its correlated query")
-        .to_owned();
+    let label = query_label(&String::from_utf8_lossy(&frames), "WHOIS alice");
 
     // A batched answer: the opener carries the response label, the body carries only
     // `batch=`, and the closing frame carries neither.
