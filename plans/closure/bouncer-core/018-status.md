@@ -261,6 +261,35 @@ outside its own test module constructs it, which is why it does not block closur
 recorded at medium rather than low because the type is public API, so the guarantee is "no
 production code calls this today" rather than "this cannot be called".
 
+## Post-closure amendment: remedies revised by Corrective 019
+
+A follow-up review of this record found all three findings real and found that **the
+remedies proposed above were wrong in two of three cases**. Corrective 019
+(`plans/implementation/bouncer-core/019-m004-findings-corrective.md`) owns the corrected work.
+The findings are restated here rather than amended in place, so the record as accepted stays
+readable and the correction is auditable.
+
+| Finding | Remedy stated above | Corrected remedy | Why it changed |
+|---|---|---|---|
+| UF-015-1 | "gated or deleted", treated as equal options; severity medium | **Gate, do not delete**; severity low | 25 substantive tests depend on the legacy supervisor, and two behaviours it covers — the SASL PLAIN handshake (`owner.rs:1042-1084`) and the upstream `QUIT` on stop (`owner.rs:1453`) — have **no production-path test coverage at all**. Deleting would trade a cosmetic API wart for a silent coverage regression. Gating is ~10 `#[cfg(test)]` attributes. Severity is low because no production code exists that could call it: the workspace's only binary is `fuzz-smoke`, which references neither it nor `UpstreamConfig`. |
+| UF-017-1 | "constrains testability", severity low | **Severity medium; the campaign is vacuous** | `a_stalled_provider_produces_a_bounded_number_of_attempts` advances virtual time once by 600s and measured **4 attempts — exactly one per Network**, sitting on its own lower bound. A spin loop and correct backoff are indistinguishable, which is the precise thing its doc comment claims to rule out. Cause: `tokio::time::advance` performs one poll, so a timer re-armed during it never fires. Repairing the test (looped small advances) measured 4 → 20 attempts with zero production change. |
+| UF-018-1 | delete the unenforced constant | **Unchanged; confirmed stronger** | `git log -S` shows the constant has never been read since introduction at `646937e`. The 1024 figure traces only to `plans/closure/bouncer-core/012-status.md:116`, which presented an unenforced declaration as an enforced ceiling. Delete; do not enforce. |
+
+Two further corrections recorded by that review:
+
+- **A false doc comment, previously unrecorded.** `timeout_bounded`'s comment (`lib.rs:881-885`)
+  claims a virtual clock cannot expire its deadlines without an explicit `advance()`. It is
+  `tokio::time::timeout`; auto-advance fires it — a parked 120s deadline expired in 8
+  microseconds of real time. This is load-bearing for the campaign defect above.
+- **An overstated claim in the legacy supervisor.** The comment at `lib.rs:800-802` says it
+  "shares this policy with the production owner rather than having its own". It shares the
+  `ctcp::` module; the *enforcement site* is duplicated logic (`lib.rs:798-831` vs
+  `owner.rs:1563`). There is no shared guard.
+
+None of this changes any M004 claim. M004 closed correctly: the findings were real,
+recorded honestly, non-blocking, and M004's own invariants were not weakened to reach
+closure. What was wrong was the proposed remedy, and that is what Corrective 019 fixes.
+
 Two audit observations were examined and deliberately not changed:
 
 - `crates/store/src/testing.rs:82-84` uses `std::env::temp_dir()` and `std::process::id()` in

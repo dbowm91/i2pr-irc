@@ -224,9 +224,15 @@ adverse-network/resource qualification
 integrated anonymity qualification + M004 closure
                |
                v
-M005 mature operator feature set
-  |
-  +--> router-integration M001 portable SAM
+   +---------------------------+
+   |                           |
+   v                           v
+Corrective 019                 M005 feature set
+M004 findings closeout         |
+   |                           |
+   +---------------------------+
+   |
+   +--> router-integration M001 portable SAM
 ~~~
 
 Dependency classes:
@@ -235,6 +241,9 @@ Dependency classes:
 - M003 depends on historical M002 completion and Corrective 004, plus three pre-M003 gates that are all closed: Corrective 005, Corrective 006 (raised by the Research 002 corpus), and the Research 002 conformance/decision dependency with no unresolved M003-affecting correctness defect.
 - M004 had a hard dependency on M003 plus the post-M003 correctness gates. Corrective 014 was the direct prerequisite and is closed; M004-A and M004-B then proceeded independently and are both closed; M004-C required both and is closed; M004-D closed the milestone. M004 is complete.
 - M005 has a hard dependency on M004.
+- Corrective 019 depends only on M004 closure. It is **not** a prerequisite for M005 and does
+  not gate it: the findings it owns are non-blocking by construction, and its own acceptance
+  criteria do not depend on M005 scope. It may run before, alongside, or after M005.
 - Router integration has a hard dependency on M005 under the canonical phase ordering.
 - External router interoperability fixtures are operational dependencies for router claims, not core M001-M005.
 
@@ -400,8 +409,18 @@ Implementation decomposition:
 3. M004-B / Plan 016 — global reconnect budget and fair scheduling. **Closed**; see `plans/closure/bouncer-core/016-status.md`.
 4. M004-C / Plan 017 — adverse-network/resource qualification. **Closed**; see `plans/closure/bouncer-core/017-status.md`.
 5. M004-D / Plan 018 — integrated anonymity qualification and M004 closure. **Closed**; see `plans/closure/bouncer-core/018-status.md`.
+6. Corrective 019 — close the three findings M004 left open. **Ready**; see `plans/implementation/bouncer-core/019-m004-findings-corrective.md`.
 
-All five M004 handoffs are closed, so M004 is complete. M004-D ran the cross-subsystem
+All five M004 handoffs are closed, so M004 is complete.
+
+Corrective 019 owns UF-015-1, UF-017-1 and UF-018-1. Independent review of the M004 closure
+record found all three are real and that the remedies the record proposed were wrong in two
+of the three cases: the duplicate network owner must be gated rather than deleted, because
+deleting it would strip the only test coverage of the production SASL handshake and upstream
+`QUIT`; and the stalled-provider campaign is not merely testability-constrained but vacuous,
+sitting on its own lower bound. Corrective 019 does not gate M005.
+
+M004-D ran the cross-subsystem
 claims that no single mechanism suite can catch — the CLIENTTAGDENY advertisement against the
 mediator that enforces it, the upstream-fingerprint sweep across the projection, the CTCP
 auto-answer and the diagnostics, and the structural proof that no raw-protocol logging sink
@@ -604,4 +623,5 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M004-B / Plan 016 | closed | plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md | plans/closure/bouncer-core/016-status.md | Corrective 014 closed |
 | M004-C / Plan 017 | closed | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closed |
 | M004-D / Plan 018 | closed | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | plans/closure/bouncer-core/018-status.md | Plan 017 closure |
+| C019 / Corrective 019 | ready | plans/implementation/bouncer-core/019-m004-findings-corrective.md | future plans/closure/bouncer-core/019-status.md | Owns UF-015-1, UF-017-1, UF-018-1; does not gate M005 |
 | M005 | not started — planning/research eligible | future | future | M004 closure satisfied |

@@ -26,14 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M005 planning eligible | Corrective 014 and M004-A/B/C/D are closed, so M004 is complete. UF-015-1 (a legacy duplicate network implementation) and UF-017-1 (an uninjectable reconnect backoff) are recorded and non-blocking. No implementation plan is registered yet; M005 requires planning/research before a handoff may be written. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | Corrective 019 ready; M005 planning eligible | Corrective 014 and M004-A/B/C/D are closed, so M004 is complete. UF-015-1, UF-017-1 and UF-018-1 are owned by Corrective 019; independent review revised two of the three remedies the M004 closure record proposed. M005 remains planning/research eligible and is not blocked by this corrective. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| _None_ | — | — | — | Every registered implementation plan is closed or awaiting planning. |
+| Bouncer Core Corrective 019 — Close M004 Findings and Restore Sole-Owner Evidence | ready | invariant + testability corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/019-status.md |
 
 
 ## Recently closed implementation plans
@@ -67,8 +67,8 @@ table; see the subsystem table above and `plans/subsystems/i2p-router-integratio
 
 ## Unplanned later milestones
 
-M004 is fully decomposed, registered and closed. Only later roadmap milestones remain
-intentionally unplanned.
+M004 is fully decomposed, registered and closed; its open findings are owned by Corrective
+019. Only later roadmap milestones remain intentionally unplanned.
 
 - Bouncer Core M005 — mature operator feature set;
 - Router R001 — portable SAM adapter/cross-router qualification;
@@ -104,12 +104,17 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-No implementation plan is currently authorized. M004 is closed at
-`plans/closure/bouncer-core/018-status.md`.
+Implement only:
 
-The next eligible work is M005 planning and research. A plan cannot be written until the
-milestone is decomposed against the repository state that M004 closure produced; when one
-exists it must be registered here before implementation begins.
+- `plans/implementation/bouncer-core/019-m004-findings-corrective.md`
+
+Corrective 019 closes the three findings M004 left open. It adds no protocol feature and no
+dependency: it gates a duplicate network owner out of the shipped API, deletes an unenforced
+stale constant, repairs one vacuous qualification campaign, and ports two production
+behaviours that are currently tested only by the code being gated.
+
+M005 planning and research remain eligible alongside it. This corrective does not block or
+change M005 scope.
 
 Router integration remains blocked behind M005, and no router-specific implementation is
 authorized by M004 closure alone.

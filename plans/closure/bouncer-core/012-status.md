@@ -113,7 +113,7 @@ Every externally controlled quantity has an explicit ceiling.
 | Store worker park | 25 ms | `store::worker::WORKER_PARK` |
 | Supervised Networks | 64 | `catalog::MAX_SUPERVISED_NETWORKS` |
 | Sessions per Network | 64 | `owner::MAX_SESSIONS_PER_NETWORK` |
-| Total sessions | 1024 | `catalog::MAX_TOTAL_SESSIONS` |
+| Total sessions | 4096 | derived: `MAX_SUPERVISED_NETWORKS` × `MAX_SESSIONS_PER_NETWORK`. **Amended by Corrective 019**: this row previously read "1024 / `catalog::MAX_TOTAL_SESSIONS`", but that constant was never read by any code — it was a declaration only, presented here as an enforced ceiling. Corrective 019 deletes it; the real bound is the product of the two enforced rows above. |
 | Session event queue | 64 | `session::SESSION_EVENT_QUEUE_CAPACITY` |
 | Client control / normal queue | 8 / 64 | `CONTROL_QUEUE_CAPACITY` / `NORMAL_QUEUE_CAPACITY` |
 | Upstream intent queues | 64 / 8 | same constants, upstream side |
