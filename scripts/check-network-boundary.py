@@ -12,6 +12,11 @@ prohibited production primitive family: generic TCP, DNS, HTTP client, SOCKS/pro
 DCC dial/listen. Each family is named below across the source, manifest, and dependency
 tree predicates, so dropping or narrowing a token fails the script instead of quietly
 narrowing the boundary. The production source and dependency tree scan is unchanged.
+
+Plan 018 section 3 (M004-D final audit) found that `fuzz-smoke` was absent from the crate
+list. That crate is a binary rather than a library, but M004 gave it a dependency on the
+runtime, so anything it can reach the network through is reachable from it. A boundary that
+depends on which crate a file happens to live in is not a boundary.
 """
 from pathlib import Path
 import re
@@ -20,7 +25,7 @@ import sys
 import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
-CRATES=("core","wire","store","runtime","testkit")
+CRATES=("core","wire","store","runtime","testkit","fuzz-smoke")
 SOURCE_TOKENS=("std::net::Tcp","std::net::Udp","ToSocketAddrs","tokio::net::Tcp","tokio::net::Udp","reqwest","hyper::Client","trust_dns","hickory_resolver","ureq::","socks::")
 # Corrected to the canonical crate name so the DNS family control exercises the real
 # spelling rather than a typo no manifest can ever carry.

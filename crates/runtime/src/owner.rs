@@ -1826,7 +1826,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         // Privacy mediation runs before anything is queued upstream and
                         // before any durable or diagnostic side effect, so a blocked
                         // frame is never transmitted, fanned out, or recorded as sent.
-                        let wire = match self.mediate_client_frame(sessions, session, wire) {
+                        let wire = match self.mediate_client_frame(wire) {
                             Some(wire) => wire,
                             None => return Ok(()),
                         };
@@ -2133,12 +2133,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     ///   response label, which is this bouncer's own correlation mechanism: it is
     ///   consumed by the router, translated to an opaque upstream token, and restored
     ///   only to the client that sent it. It never reaches the server.
-    fn mediate_client_frame(
-        &self,
-        sessions: &BTreeMap<SessionId, SessionTask>,
-        session: SessionId,
-        wire: Vec<u8>,
-    ) -> Option<Vec<u8>> {
+    fn mediate_client_frame(&self, wire: Vec<u8>) -> Option<Vec<u8>> {
         let message = Message::parse(&wire).ok()?;
         let direction = match &message.command[..] {
             [b'N', b'O', b'T', b'I', b'C', b'E'] => crate::ctcp::CtcpDirection::Reply,
@@ -2152,12 +2147,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             return None;
         }
         // Tag mediation applies to every forwarded frame, not only chat, so a client
-        // cannot smuggle a forged `msgid` onto a MODE or a NICK.
-        let negotiated = sessions
-            .get(&session)
-            .map(|task| task.handle().capabilities().negotiated_tags())
-            .unwrap_or(false);
-        let (mediated, _) = crate::ircv3::mediate_client_tags(&message, negotiated);
+        // cannot smuggle a forged `msgid` onto a MODE or a NICK. It does not depend on
+        // whether this client negotiated the tag surface: what a client asked for says
+        // nothing about whether the tags it sent may be trusted.
+        let (mediated, _) = crate::ircv3::mediate_client_tags(&message);
         mediated.encode().ok()
     }
 

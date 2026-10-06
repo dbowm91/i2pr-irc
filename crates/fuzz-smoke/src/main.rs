@@ -200,26 +200,28 @@ fn check_privacy(line: &[u8], rng: &mut Rng) {
         _ => {}
     }
 
-    // The mediated frame is the only thing that could carry the body onwards. Whatever
-    // the disposition, the sentinel must not survive into the client's own tag space
-    // from the server's frame.
-    for negotiated in [false, true] {
-        let (mediated, disposition) = mediate_client_tags(&message, negotiated);
-        let rendered = format!("{mediated:?}");
-        if matches!(disposition, TagDisposition::Rejected) {
-            continue;
-        }
-        assert!(
-            !rendered.contains(SENTINEL) || !rendered.contains("@"),
-            "a mediated frame grew an unexpected tag carrying {SENTINEL}: {rendered}"
-        );
-    }
+    // The mediated frame is the only thing that could carry the body onwards. A
+    // disposition of `Stripped` means the mediator removed client tags; either way the
+    // sentinel must not reappear inside a tag the mediator introduced.
+    let (mediated, disposition) = mediate_client_tags(&message);
+    let rendered = format!("{mediated:?}");
+    assert!(
+        !(rendered.contains(SENTINEL) && rendered.contains('@')),
+        "a mediated frame grew an unexpected tag carrying {SENTINEL}: {rendered}"
+    );
+    assert!(
+        matches!(
+            disposition,
+            TagDisposition::Stripped | TagDisposition::Forwarded
+        ),
+        "mediation strips or forwards; it never refuses, so no third disposition exists"
+    );
 
     // Tag churn: the same message tagged repeatedly must keep producing a parseable,
     // re-encodable frame rather than accumulating state.
     let mut churn = message.clone();
     for _ in 0..rng.below(8) {
-        churn = mediated(churn);
+        churn = mediate_client_tags(&churn).0;
         if let Ok(re_encoded) = churn.encode() {
             let reparsed = Message::parse(&re_encoded).expect("mediated frame stays parseable");
             assert_eq!(
@@ -228,11 +230,6 @@ fn check_privacy(line: &[u8], rng: &mut Rng) {
             );
         }
     }
-}
-
-fn mediated(message: Message) -> Message {
-    let (mediated, _) = mediate_client_tags(&message, true);
-    mediated
 }
 
 fn main() {

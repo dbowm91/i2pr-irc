@@ -166,11 +166,15 @@ impl BatchTracker {
 }
 
 /// How a client-originated tag was treated.
+///
+/// There is deliberately no `Rejected` variant. A rejected frame would be one the
+/// bouncer refused to send at all, but the policy here is to *mediate* rather than
+/// refuse: stripping the untrusted tags leaves a frame whose meaning is unchanged. A
+/// `Rejected` variant that nothing constructs would imply a policy that does not exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TagDisposition {
     Forwarded,
     Stripped,
-    Rejected,
 }
 
 /// The conservative client-tag policy: deny by default.
@@ -191,8 +195,12 @@ pub enum TagDisposition {
 /// The client-only allowlist is intentionally empty. Adding to it requires a separate
 /// privacy and timing review, because a client-only tag is relayed verbatim to everyone
 /// else on the network.
-pub fn mediate_client_tags(message: &Message, negotiated: bool) -> (Message, TagDisposition) {
-    let _ = negotiated;
+///
+/// The policy takes no `negotiated` argument on purpose. An earlier signature accepted
+/// whether the client had negotiated the message-tag surface and then ignored it, which
+/// read as though negotiation gated the policy. It does not: whether a client asked for
+/// tags is not evidence that the tags it sent may be trusted.
+pub fn mediate_client_tags(message: &Message) -> (Message, TagDisposition) {
     let mut mediated = message.clone();
     let mut stripped_any = false;
     for name in message.tags.keys().collect::<Vec<_>>() {
@@ -273,7 +281,7 @@ mod tests {
         // how one client could impersonate another client's metadata. M004-A tightened
         // this from "forward a well-formed msgid" to deny by default.
         let forged = parse("@msgid=spoofed;+custom=1 :a!b@c PRIVMSG #room :hi\r\n");
-        let (mediated, disposition) = mediate_client_tags(&forged, true);
+        let (mediated, disposition) = mediate_client_tags(&forged);
         assert_eq!(disposition, TagDisposition::Stripped);
         assert!(
             !mediated.tags.contains_key(MSGID_TAG),
@@ -291,7 +299,7 @@ mod tests {
         // the router translates it to an opaque upstream token and restores it only to
         // the client that sent it.
         let labeled = parse("@label=mine WHOIS alice\r\n");
-        let (mediated, disposition) = mediate_client_tags(&labeled, true);
+        let (mediated, disposition) = mediate_client_tags(&labeled);
         assert_eq!(disposition, TagDisposition::Forwarded);
         assert_eq!(
             mediated.tags.get(LABEL_TAG.as_bytes()),
@@ -304,7 +312,7 @@ mod tests {
         // Every `+` tag is denied, including ones a client might consider its own.
         for name in ["+typing", "+draft/reply", "+example/vendor"] {
             let raw = format!("@{name}=1 :a!b@c PRIVMSG #room :hi\r\n");
-            let (mediated, _) = mediate_client_tags(&parse(&raw), true);
+            let (mediated, _) = mediate_client_tags(&parse(&raw));
             assert!(mediated.tags.is_empty(), "{name} must be denied by default");
         }
     }
@@ -318,7 +326,7 @@ mod tests {
             "@msgid= :a!b@c PRIVMSG #room :hi\r\n",
         ] {
             let message = parse(raw);
-            let (mediated, _) = mediate_client_tags(&message, true);
+            let (mediated, _) = mediate_client_tags(&message);
             assert!(
                 mediated.tags.is_empty(),
                 "a malformed tag must not be forwarded: {raw}"
@@ -331,7 +339,7 @@ mod tests {
         // Parsing is not authorisation. A client that could set its own timestamp could
         // make its message look older or newer than it is to every other participant.
         let message = parse("@time=2023-11-14T22:13:20.000Z :a!b@c PRIVMSG #room :hi\r\n");
-        let (mediated, disposition) = mediate_client_tags(&message, true);
+        let (mediated, disposition) = mediate_client_tags(&message);
         assert_eq!(disposition, TagDisposition::Stripped);
         assert!(
             mediated.tags.is_empty(),
@@ -342,7 +350,7 @@ mod tests {
     #[test]
     fn tags_are_dropped_entirely_when_the_client_did_not_negotiate_them() {
         let message = parse("@time=2023-11-14T22:13:20.000Z :a!b@c PRIVMSG #room :hi\r\n");
-        let (mediated, _) = mediate_client_tags(&message, false);
+        let (mediated, _) = mediate_client_tags(&message);
         assert!(mediated.tags.is_empty());
         let bare = strip_all_tags(&message);
         assert!(bare.tags.is_empty());

@@ -741,7 +741,7 @@ fn client_only_tags_are_default_deny() {
     // A client forging msgid or inventing tags must not reach the server: that is how
     // one client could impersonate another's metadata.
     let forged = parse("@msgid=forged;+client=1;draft/x=1 :a!b@c PRIVMSG #room :hi\r\n");
-    let (mediated, disposition) = mediate_client_tags(&forged, true);
+    let (mediated, disposition) = mediate_client_tags(&forged);
     assert_ne!(disposition, TagDisposition::Forwarded);
     assert!(mediated.tags.len() < forged.tags.len());
     for draft in DOWNSTREAM_DEFERRED_HISTORY {

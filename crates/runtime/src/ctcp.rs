@@ -491,8 +491,7 @@ mod tests {
                     parsed,
                     Ctcp::Malformed | Ctcp::OrdinaryText | Ctcp::Unknown { .. }
                 ),
-                "{:?} must not be actionable",
-                parsed
+                "{parsed:?} must not be actionable"
             );
         }
     }
