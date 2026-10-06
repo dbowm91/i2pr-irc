@@ -26,15 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003 closed; M004 ready to decompose | M003 is decomposed into Plans 007-012 and all six are closed. ADR-0002 and Research 004 froze the storage/identity/history architecture. | M003 is evidence-closed in `plans/closure/bouncer-core/012-status.md`; M004 is unblocked and not yet decomposed. |
+| Bouncer core | active corrective | plans/subsystems/bouncer-core-roadmap.md | Corrective 013 ready | M003 retains its historical closure, but post-closure IRCv3 time/history and queue-integrity findings block M004 until Corrective 013 closes. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-
-No implementation plan is currently dependency-ready. Bouncer Core M003 is closed and M004 is unblocked, but it has no implementation decomposition yet; writing M004's plan set is the next planning action.
+| Bouncer Core Corrective 013 — Post-M003 IRCv3 Time/History and Queue-Integrity Conformance | ready | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/013-status.md |
 
 
 ## Recently closed implementation plans
@@ -58,12 +57,13 @@ No implementation plan is currently dependency-ready. Bouncer Core M003 is close
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
+| Bouncer Core M004 — Anonymity and Adverse-Network Qualification | planning/implementation blocked | Corrective 013 closure | Do not decompose/activate M004 until Corrective 013 closes without an M004-blocking finding |
 
 ## Unplanned later milestones
 
-M003 is closed. Later roadmap milestones remain intentionally unplanned; M004 in particular is unblocked but not yet decomposed into implementation handoffs.
+M003 retains its historical closure, but Corrective 013 is the strict current readiness gate. Later roadmap milestones remain intentionally unplanned; M004 must not be decomposed or activated until Corrective 013 closes.
 
-- Bouncer Core M004 — anonymity and adverse-network qualification;
+- Bouncer Core M004 — anonymity and adverse-network qualification (blocked on Corrective 013);
 - Bouncer Core M005 — mature operator feature set;
 - Router R001 — portable SAM adapter/cross-router qualification;
 - Router R002 — i2pr managed-app adapter;
@@ -97,8 +97,12 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Implement nothing until a plan is written.
+Implement only:
 
-Bouncer Core M003 is fully closed: Plans 007-011 froze the durable substrate and identity split, multi-network/multi-client ownership, durable history with acknowledged legacy playback, response routing with truthful capability negotiation, and bounded history/read-marker adapters; Plan 012 qualified the integrated system and closed the milestone in `plans/closure/bouncer-core/012-status.md`.
+- `plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md`
 
-The next planning action is to decompose Bouncer Core M004 (anonymity and adverse-network qualification) into implementation handoffs against the then-current repository state. M005 remains sequenced behind M004, and router integration remains blocked behind M005.
+Corrective 013 owns the post-M003 findings around spec-correct `server-time`, CHATHISTORY and MARKREAD behavior, explicit upstream queue-overload disposition, bounded DesiredState reconciliation after committed JOIN/PART, and live downstream fanout integrity.
+
+The historical M003 closure remains preserved at `plans/closure/bouncer-core/012-status.md`, but it is not sufficient authority for M004 readiness. M004 remains blocked until `plans/closure/bouncer-core/013-status.md` closes this corrective.
+
+M005 remains sequenced behind M004, and router integration remains blocked behind M005.
