@@ -13,8 +13,10 @@ use rusqlite::Connection;
 /// [`HISTORY_EVENTS_V2`] for why. Version 3 adds the operator-chosen `display_name`
 /// a Network is listed under; see [`NETWORKS_V2`] and [`migrate_2_to_3`]. Version 4
 /// adds the bouncer-owned `detached` presentation flag on a desired channel; see
-/// [`DESIRED_CHANNELS_V3`] and [`migrate_3_to_4`].
-pub const SCHEMA_VERSION: i64 = 4;
+/// [`DESIRED_CHANNELS_V3`] and [`migrate_3_to_4`]. Version 5 adds the two Operator
+/// presence policies, `auto_away` and `keep_nick`; see [`NETWORKS_V5`] and
+/// [`migrate_4_to_5`].
+pub const SCHEMA_VERSION: i64 = 5;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -59,6 +61,33 @@ CREATE TABLE networks (
 ) STRICT;
 "#;
 
+const NETWORKS_V5: &str = r#"
+CREATE TABLE networks (
+    network_id      INTEGER PRIMARY KEY,
+    endpoint        TEXT NOT NULL,
+    endpoint_kind   INTEGER NOT NULL,
+    nick            TEXT NOT NULL,
+    username        TEXT NOT NULL,
+    realname        TEXT NOT NULL,
+    display_name    TEXT NOT NULL,
+    auto_away       INTEGER NOT NULL DEFAULT 0
+                    CHECK (auto_away IN (0, 1)),
+    keep_nick       INTEGER NOT NULL DEFAULT 0
+                    CHECK (keep_nick IN (0, 1))
+) STRICT;
+"#;
+
+/// The `networks` table as schema 5 creates it.
+///
+/// `auto_away` and `keep_nick` are Operator presence policy, constrained to 0 or 1 for
+/// the same reason `detached` is: an unrecognized value would be read back as an unknown
+/// policy, and neither guess is the Operator's decision.
+///
+/// Both default to 0. An existing Network that gains these columns therefore keeps
+/// emitting exactly the upstream traffic it emitted before, which is the point: a
+/// presence policy that switched itself on because the binary was upgraded would look,
+/// from upstream, indistinguishable from the bouncer misbehaving.
+///
 /// The `networks` table as schema 1 and 2 created it.
 ///
 /// Retained verbatim so the v2 -> v3 migration rebuilds exactly the representation it
@@ -272,11 +301,21 @@ pub(crate) fn schema_v3() -> String {
     )
 }
 
-/// The current schema, created directly when no database exists yet.
+/// Schema 4, used to build the fixture the schema 5 migration must handle.
 pub(crate) fn schema_v4() -> String {
     compose(
         DESIRED_CHANNELS_V4,
         NETWORKS_V3,
+        HISTORY_EVENTS_V2,
+        SCHEMA_TAIL,
+    )
+}
+
+/// The current schema, created directly when no database exists yet.
+pub(crate) fn schema_v5() -> String {
+    compose(
+        DESIRED_CHANNELS_V4,
+        NETWORKS_V5,
         HISTORY_EVENTS_V2,
         SCHEMA_TAIL,
     )
@@ -426,7 +465,7 @@ pub(crate) fn open_and_migrate(
                 .unchecked_transaction()
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
-                .execute_batch(&schema_v4())
+                .execute_batch(&schema_v5())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -488,7 +527,11 @@ const REQUIRED_TABLES: &[&str] = &[
 /// served as though the policy it carries were absent. That is the failure mode schema
 /// version 4 exists to prevent, so the column is checked rather than assumed from the
 /// table being there.
-const REQUIRED_COLUMNS: &[(&str, &str)] = &[("desired_channels", "detached")];
+const REQUIRED_COLUMNS: &[(&str, &str)] = &[
+    ("desired_channels", "detached"),
+    ("networks", "auto_away"),
+    ("networks", "keep_nick"),
+];
 
 /// Confirms every promised column is present on its table.
 fn verify_promised_columns(connection: &Connection) -> Result<(), StoreError> {
@@ -523,6 +566,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             1 => migrate_1_to_2(transaction)?,
             2 => migrate_2_to_3(transaction)?,
             3 => migrate_3_to_4(transaction)?,
+            4 => migrate_4_to_5(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -667,6 +711,30 @@ fn migrate_3_to_4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreEr
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// Adds the two Operator presence policies to `networks`.
+///
+/// Both columns default to disabled, which is the only safe migration: a Network that
+/// begins emitting `AWAY` or reclaim `NICK` traffic after a binary upgrade has changed
+/// its upstream behaviour without the Operator asking, and the change would be
+/// indistinguishable from the bouncer misbehaving. Enabling either policy is an explicit
+/// configuration change, recorded like any other.
+///
+/// The step is two `ADD COLUMN` statements in the one migration transaction, for the same
+/// reason the v3 -> v4 step is a single statement: SQLite re-checks the whole row, and a
+/// half-applied schema is worse than no migration at all.
+fn migrate_4_to_5(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        "ALTER TABLE networks ADD COLUMN auto_away INTEGER NOT NULL DEFAULT 0
+             CHECK (auto_away IN (0, 1));
+         ALTER TABLE networks ADD COLUMN keep_nick INTEGER NOT NULL DEFAULT 0
+             CHECK (keep_nick IN (0, 1));",
+    )
+    .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     Ok(())
 }

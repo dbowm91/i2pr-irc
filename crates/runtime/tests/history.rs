@@ -52,6 +52,8 @@ async fn journal_for(
             nick: "bot".into(),
             username: "user".into(),
             realname: "bouncer".into(),
+            auto_away: false,
+            keep_nick: false,
             sasl: None,
             desired_channels: i2pr_irc_store::attached_channels(
                 &channels
@@ -458,12 +460,14 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         explicit_history: false,
         read_markers: false,
         message_tags: false,
+        pre_away: false,
     }));
     assert!(!playback::wants_backlog(SessionCapabilities {
         legacy_backlog: true,
         explicit_history: true,
         read_markers: false,
         message_tags: false,
+        pre_away: false,
     }));
     // The drafts are independently negotiable, so a read-marker client that does not
     // manage its own history still receives the automatic backlog.
@@ -472,6 +476,7 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         explicit_history: false,
         read_markers: true,
         message_tags: false,
+        pre_away: false,
     }));
 }
 

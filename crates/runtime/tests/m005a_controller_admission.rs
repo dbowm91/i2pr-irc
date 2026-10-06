@@ -51,6 +51,8 @@ fn record(network: u64, nick: &str) -> NetworkRecord {
         nick: nick.into(),
         username: "user".into(),
         realname: "bouncer".into(),
+        auto_away: false,
+        keep_nick: false,
         sasl: None,
         desired_channels: Vec::new(),
     }

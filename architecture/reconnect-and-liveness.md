@@ -13,3 +13,11 @@ The implementation uses Tokio's monotonic timer for these runtime deadlines. Pau
 Backoff bounds how often *one* Network retries. It does nothing about the case that
 actually hurts on a router restart, where every Network fails together and retries together.
 A process-wide `ReconnectScheduler` gates that separately — see `reconnect-budget.md`.
+
+## Reclaim is a generation clock, and registration can end the generation
+
+Registration handles `433`/`436` inside the registration loop, so a nickname collision is answered in the same window as the refusal rather than by waiting out the 180-second registration ceiling. Exhausting the bounded fallback sequence is a typed terminal failure that marks the Network terminal instead of retrying; the backoff path above is for faults a retry could plausibly fix, and a sequence already refused once per candidate is not one of them. See [presence and preferred-nick policy](presence-and-nick.md).
+
+Keep-nick reclaim adds a second generation-owned clock, a 300-second interval that nothing but that generation moves. Client activity is deliberately not wired to it: if attaching a client could make the bouncer poll upstream faster, its upstream behaviour would depend on which local sessions happen to exist. Accepted upstream evidence shortens the *wait* for an already-permitted write through a generation-local `Notify`; it never grants permission the schedule would not have.
+
+Because reclaim state is a plain local in `run_generation`, it is dropped when the generation is replaced. A probe scheduled by a connection that has since died cannot act on the connection that replaced it — the same generation-fencing rule that governs upstream reader and writer state, applied to a task that would otherwise outlive its own socket.

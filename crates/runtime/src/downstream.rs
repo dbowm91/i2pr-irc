@@ -31,6 +31,7 @@ pub const DOWNSTREAM_ADVERTISED: &[&str] = &[
     crate::capability::MESSAGE_TAGS,
     crate::capability::BATCH,
     crate::capability::LABELED_RESPONSE,
+    crate::presence::PRE_AWAY_CAPABILITY,
 ];
 
 /// The exact `CAP LS` and `CAP REQ` support set for this generation.

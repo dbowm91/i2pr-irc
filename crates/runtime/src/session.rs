@@ -31,6 +31,33 @@ const MAX_LINES_PER_READ: usize = 64;
 /// also bounds how much a single client can make the owner do.
 pub const SESSION_EVENT_QUEUE_CAPACITY: usize = 64;
 
+/// Whether one session counts as the Operator being at the keyboard.
+///
+/// This is a fact about the session, not a count of sockets. A history sync running in
+/// the background and a foreground window are both "attached", and treating them the
+/// same is why bouncers end up permanently online: the socket is there, the Operator is
+/// not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionPresence {
+    /// A session that represents the Operator being present.
+    Active,
+    /// A background or passive session: it receives state, it does not make the bouncer
+    /// look present.
+    Passive,
+}
+impl SessionPresence {
+    /// The state a session starts in.
+    ///
+    /// Active, deliberately. A client that never says `PASSIVE` is assumed to be a
+    /// foreground client, because assuming otherwise would make auto-away fire for every
+    /// client that does not know the draft — a bouncer that is away while somebody is
+    /// using it is worse than one that is present when nobody is.
+    pub const DEFAULT: Self = Self::Active;
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
 /// Trailing parameter that turns `PART` into a detach request.
 ///
 /// Exact match only. A shorter or longer token, or any third parameter, is an ordinary
@@ -40,6 +67,14 @@ pub const DETACH_SHORTHAND: &str = "detach";
 /// Trailing parameter that turns `PART` into a reattach request. See
 /// [`DETACH_SHORTHAND`] for why the match is exact.
 pub const ATTACH_SHORTHAND: &str = "attach";
+
+/// Explicit ceiling on an Operator-supplied away message.
+///
+/// An away message is a line that reaches every member of every channel the bouncer
+/// holds. The ceiling sits well below the line ceiling because the content is a single
+/// phrase; anything longer is not an away message, and forwarding it would put an
+/// unbounded Operator string into a field that has no framing guard left.
+pub const MAX_AWAY_TEXT_BYTES: usize = 200;
 
 /// What one session asks the network owner to do.
 ///
@@ -63,6 +98,17 @@ pub enum SessionIntent {
     Detach { channel: String },
     /// The client asked to resume presenting a detached channel.
     Reattach { channel: String },
+    /// The client declared itself passive: it still receives state, but it no longer
+    /// makes the bouncer look present upstream.
+    Passive,
+    /// The client declared itself an active foreground session again.
+    Active,
+    /// The client set or cleared its own away state explicitly.
+    ///
+    /// `text` is `None` for a bare `AWAY`, which clears. A manual away is Operator intent
+    /// and outlives the session that set it, so an unrelated client attaching later cannot
+    /// silently drop it.
+    Away { text: Option<String> },
     /// The client completed registration and wants the current projection.
     RequestProjection,
     /// The client asked the bouncer itself for retained history.
@@ -123,6 +169,13 @@ pub struct SessionCapabilities {
     /// read. This is tracked per session because the fanout path delivers one upstream
     /// line to many sessions with different surfaces.
     pub message_tags: bool,
+    /// The client negotiated `draft/pre-away`, so `PASSIVE` and `ACTIVE` are part of the
+    /// contract it expects the bouncer to honour.
+    ///
+    /// Tracked per session rather than globally: the pre-away declaration is about this
+    /// connection, and one client knowing the capability must not let another client's
+    /// `PASSIVE` be accepted on its behalf.
+    pub pre_away: bool,
 }
 impl Default for SessionCapabilities {
     fn default() -> Self {
@@ -131,6 +184,7 @@ impl Default for SessionCapabilities {
             explicit_history: false,
             read_markers: false,
             message_tags: false,
+            pre_away: false,
         }
     }
 }
@@ -161,6 +215,12 @@ impl SessionCapabilities {
         self.message_tags
     }
 
+    /// True when this client negotiated the pre-away draft and may therefore declare
+    /// itself passive or active.
+    pub fn negotiated_pre_away(&self) -> bool {
+        self.pre_away
+    }
+
     /// Applies a client's successful `CAP REQ`, recording that it manages history.
     pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
         Self {
@@ -172,6 +232,10 @@ impl SessionCapabilities {
                 || enabled
                     .iter()
                     .any(|name| name == crate::capability::MESSAGE_TAGS),
+            pre_away: self.pre_away
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::presence::PRE_AWAY_CAPABILITY),
         }
     }
 }
@@ -591,6 +655,18 @@ struct SessionReader<D: ByteStream> {
     /// with the local queue that produced it. It is drained before any further read, so
     /// the client's own ordering is preserved across the transfer.
     pending: VecDeque<Vec<u8>>,
+    /// A presence declaration sent before registration completed.
+    ///
+    /// The pre-away draft's whole point is that a background client can say it is
+    /// passive *during* registration. Holding the declaration until the session is
+    /// registered is what stops the bouncer counting a background client as an Operator
+    /// for one turn and then taking it back: the network would see an away-and-back
+    /// flap for every such client that connects.
+    pre_away_declaration: Option<SessionPresence>,
+    /// Whether the pre-registration declaration has already been reported.
+    pre_away_reported: bool,
+    /// Whether the registration projection has been requested.
+    projection_reported: bool,
 }
 
 impl<D: ByteStream> SessionReader<D> {
@@ -612,6 +688,9 @@ impl<D: ByteStream> SessionReader<D> {
             negotiated: std::collections::BTreeSet::new(),
             ready: false,
             pending: VecDeque::new(),
+            pre_away_declaration: None,
+            pre_away_reported: false,
+            projection_reported: false,
         }
     }
 
@@ -639,11 +718,23 @@ impl<D: ByteStream> SessionReader<D> {
                 // The one pre-registration intent that ends this phase. Everything the
                 // reader owns is returned exactly as it stands.
                 Ok(Some(SessionIntent::RequestProjection)) => return Ok(self),
+                Ok(Some(SessionIntent::Passive)) | Ok(Some(SessionIntent::Active)) => {
+                    // A pre-away declaration is allowed before registration completes,
+                    // because declaring itself passive *is* the pre-away draft's point.
+                    // It is held by the reader and reported once the session exists.
+                    continue;
+                }
                 // No other intent can be produced before registration completes; a line
                 // that somehow yields one is refused rather than forwarded from a phase
                 // that is not allowed to touch the owner.
                 Ok(Some(_)) => return Err(DownstreamDisposition::ProtocolViolation),
-                Ok(None) => {}
+                Ok(None) => {
+                    // Admission needs a registered session and nothing else, so a
+                    // pre-away declaration is held by the reader rather than forwarded.
+                    if self.registration_intent() == Some(SessionIntent::RequestProjection) {
+                        return Ok(self);
+                    }
+                }
                 Err(error) => return Err(DownstreamDisposition::from_error(&error)),
             }
         }
@@ -666,21 +757,32 @@ impl<D: ByteStream> SessionReader<D> {
             if raw.len() > MAX_CLIENT_LINE {
                 return DownstreamDisposition::QueueOverload;
             }
-            match self.translate(&raw) {
-                Ok(Some(intent)) => {
-                    let event = SessionEvent::Intent {
-                        session: self.session,
-                        intent,
-                    };
-                    // A bounded queue is awaited here, so a client that outruns the
-                    // owner applies backpressure instead of growing memory. If the
-                    // owner is gone the session ends rather than blocking forever.
-                    if events.send(event).await.is_err() {
-                        return DownstreamDisposition::SupervisorStop;
-                    }
-                }
-                Ok(None) => {}
+            // Registration completion is checked after every line, not only after one
+            // that translated to nothing: a client that declared itself passive during
+            // registration gets that declaration reported first, and the projection that
+            // follows it is a separate turn.
+            let translated = match self.translate(&raw) {
+                Ok(Some(intent)) => Some(intent),
+                Ok(None) => None,
                 Err(error) => return DownstreamDisposition::from_error(&error),
+            };
+            // Completing a registration can owe the owner more than one intent: a
+            // pre-away declaration first, then the projection. Both are emitted in the
+            // same turn, because waiting for another line to arrive would leave a
+            // registered session waiting for a projection it can never trigger.
+            let mut next = translated.or_else(|| self.registration_intent());
+            while let Some(intent) = next {
+                let event = SessionEvent::Intent {
+                    session: self.session,
+                    intent,
+                };
+                // A bounded queue is awaited here, so a client that outruns the owner
+                // applies backpressure instead of growing memory. If the owner is gone
+                // the session ends rather than blocking forever.
+                if events.send(event).await.is_err() {
+                    return DownstreamDisposition::SupervisorStop;
+                }
+                next = self.registration_intent();
             }
         }
     }
@@ -732,7 +834,6 @@ impl<D: ByteStream> SessionReader<D> {
         &self.negotiated
     }
 
-    /// Converts one complete client line into an intent or a local reply.
     fn translate(&mut self, raw: &[u8]) -> Result<Option<SessionIntent>, RuntimeError> {
         let message = Message::parse(raw).map_err(|_| RuntimeError::Protocol)?;
         // A client may not send a prefix, and its tag budget is enforced before any
@@ -747,6 +848,20 @@ impl<D: ByteStream> SessionReader<D> {
         let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
         if self.ready {
             self.translate_registered(&message, &command)
+        } else if matches!(command.as_str(), "PASSIVE" | "ACTIVE") {
+            // Accepted before registration completes, which is what the draft means by
+            // pre-away: a background client declares itself while it is still arriving.
+            // It is recorded rather than forwarded, because there is nothing to forward
+            // it *to* until the session exists.
+            if !self.handle.capabilities().negotiated_pre_away() {
+                return Err(RuntimeError::Protocol);
+            }
+            self.pre_away_declaration = Some(if command == "PASSIVE" {
+                SessionPresence::Passive
+            } else {
+                SessionPresence::Active
+            });
+            Ok(None)
         } else {
             self.translate_registration(&message, &command)
         }
@@ -796,17 +911,42 @@ impl<D: ByteStream> SessionReader<D> {
                 .handle
                 .queue_normal(":bouncer 451 * :Register first\r\n")?,
         }
-        // Registration completes only when a valid NICK and USER are both present and
-        // no CAP negotiation is outstanding. `CAP END` alone never registers a client.
-        if !self.ready
-            && !self.cap_negotiating
-            && self.user_received
-            && self.registered_nick.is_some()
-        {
-            self.ready = true;
-            return Ok(Some(SessionIntent::RequestProjection));
-        }
         Ok(None)
+    }
+
+    /// The intent registration completing produces, once every line has been consumed.
+    ///
+    /// Completion is evaluated here rather than at the end of `translate` so it waits
+    /// for the reader's decoded buffer to drain. A client that sends `NICK`, `USER`,
+    /// `CAP REQ`, `CAP END`, and `PASSIVE` in one write has all of those decoded by the
+    /// time `USER` is translated; completing on `USER` would make its own `CAP REQ` a
+    /// registered command and its `PASSIVE` a declaration the bouncer has already
+    /// announced it did not make. Draining first is what makes a pre-registration
+    /// command mean what the draft says it means.
+    fn registration_intent(&mut self) -> Option<SessionIntent> {
+        if self.cap_negotiating || !self.user_received || self.registered_nick.is_none() {
+            return None;
+        }
+        // The declaration is reported before the projection so the owner classifies the
+        // session before it projects anything on its behalf.
+        if let Some(declaration) = self.pre_away_declaration
+            && !self.pre_away_reported
+        {
+            self.pre_away_reported = true;
+            // `ready` is deliberately *not* set here. Registration is not complete until
+            // CAP negotiation has finished, and claiming otherwise makes the session's
+            // own `CAP END` arrive as a registered command that the reader ignores.
+            return Some(match declaration {
+                SessionPresence::Active => SessionIntent::Active,
+                SessionPresence::Passive => SessionIntent::Passive,
+            });
+        }
+        if self.ready || self.projection_reported || !self.pending.is_empty() {
+            return None;
+        }
+        self.ready = true;
+        self.projection_reported = true;
+        Some(SessionIntent::RequestProjection)
     }
 
     fn translate_registered(
@@ -825,6 +965,42 @@ impl<D: ByteStream> SessionReader<D> {
                 self.handle.queue_control(&line)?;
             }
             "QUIT" => return Ok(Some(SessionIntent::Quit)),
+            // The pre-away declarations are only honoured from a client that negotiated
+            // the capability. Accepting them unconditionally would let a client that never
+            // asked for the semantics silence the Operator's presence with a command the
+            // client itself does not understand the consequences of.
+            "PASSIVE" | "ACTIVE" => {
+                if !self.handle.capabilities().negotiated_pre_away() {
+                    return Err(RuntimeError::Protocol);
+                }
+                return Ok(Some(if command == "PASSIVE" {
+                    SessionIntent::Passive
+                } else {
+                    SessionIntent::Active
+                }));
+            }
+            // An away message is the Operator's own words, so it is bounded and checked
+            // here rather than at the owner: an unbounded frame must never reach a field
+            // that goes to every member of every channel the bouncer holds.
+            "AWAY" => {
+                let text = match message.params.first() {
+                    None => None,
+                    Some(raw) => {
+                        let text = String::from_utf8_lossy(raw).into_owned();
+                        if text.is_empty() || text.len() > MAX_AWAY_TEXT_BYTES {
+                            return Err(RuntimeError::Protocol);
+                        }
+                        if text
+                            .bytes()
+                            .any(|byte| byte == 0 || byte == b'\r' || byte == b'\n')
+                        {
+                            return Err(RuntimeError::Protocol);
+                        }
+                        Some(text)
+                    }
+                };
+                return Ok(Some(SessionIntent::Away { text }));
+            }
             "JOIN" | "PART" => {
                 // Desired membership is durable operator intent, so it is expressed as
                 // an intent and persisted by the owner *before* anything goes upstream.

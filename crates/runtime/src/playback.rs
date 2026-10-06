@@ -239,6 +239,7 @@ mod tests {
             legacy_backlog: true,
             explicit_history: true,
             read_markers: false,
+            pre_away: false,
         };
         assert!(
             !wants_backlog(explicit),
@@ -252,6 +253,7 @@ mod tests {
             legacy_backlog: true,
             explicit_history: false,
             read_markers: true,
+            pre_away: false,
         };
         assert!(
             wants_backlog(markers_only),

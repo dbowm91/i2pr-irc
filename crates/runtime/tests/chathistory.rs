@@ -39,6 +39,8 @@ async fn journal_for(handle: &StoreHandle) -> HistoryJournal {
             nick: "bot".into(),
             username: "user".into(),
             realname: "bouncer".into(),
+            auto_away: false,
+            keep_nick: false,
             sasl: None,
             desired_channels: i2pr_irc_store::attached_channels(&["#room"]),
         })

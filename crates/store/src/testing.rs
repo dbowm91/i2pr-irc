@@ -91,6 +91,23 @@ pub fn create_v3_database(path: &Path) -> Connection {
     connection
 }
 
+/// Creates a database at schema version 4 and returns a raw connection to it.
+///
+/// Used to build the fixture the v4 -> v5 migration must handle.
+pub fn create_v4_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v4())
+        .expect("schema 4 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 4)
+        .expect("user_version is writable");
+    connection
+}
+
 /// A temporary directory owned by one test, removed when the guard is dropped.
 #[derive(Debug)]
 pub struct TempDir(PathBuf);

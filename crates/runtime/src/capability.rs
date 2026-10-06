@@ -42,6 +42,15 @@ pub const UPSTREAM_FOUNDATIONAL: [&str; 5] = [
 /// forwards.
 pub const DOWNSTREAM_FOUNDATIONAL: [&str; 3] = [MESSAGE_TAGS, BATCH, LABELED_RESPONSE];
 
+/// The pre-away draft this build serves.
+///
+/// M005-C promotes it because the semantics are implemented end to end: a session that
+/// declares itself passive really is excluded from active presence, and one that declares
+/// itself active really is included. Advertising it and then treating `PASSIVE` as a no-op
+/// would make a background history sync silently keep the Operator looking online, which
+/// is the failure this capability exists to fix.
+pub const DOWNSTREAM_PRE_AWAY: [&str; 1] = [crate::presence::PRE_AWAY_CAPABILITY];
+
 /// The message-tag capability.
 pub const MESSAGE_TAGS: &str = "message-tags";
 /// The batch capability.

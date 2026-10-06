@@ -52,6 +52,8 @@ fn record(network: u64, channels: &[DesiredChannelRecord]) -> NetworkRecord {
         nick: "bot".into(),
         username: "user".into(),
         realname: "bouncer".into(),
+        auto_away: false,
+        keep_nick: false,
         sasl: None,
         desired_channels: channels.to_vec(),
     }

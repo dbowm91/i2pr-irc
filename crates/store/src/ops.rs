@@ -29,11 +29,20 @@ fn sql(_error: rusqlite::Error, commit: CommitState) -> StoreError {
     StoreError::mutating(StoreErrorKind::Sqlite, commit)
 }
 
+/// Reads one constrained 0/1 policy column.
+fn policy_flag(value: i64, reason: &'static str) -> Result<bool, StoreError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(StoreError::new(StoreErrorKind::Corrupt(reason))),
+    }
+}
+
 pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord>, StoreError> {
     let mut statement = connection
         .prepare(
             "SELECT n.network_id, n.endpoint, n.nick, n.username, n.realname, n.display_name,
-                    s.sasl_username, s.sasl_password
+                    n.auto_away, n.keep_nick, s.sasl_username, s.sasl_password
              FROM networks n
              LEFT JOIN network_secrets s ON s.network_id = n.network_id
              ORDER BY n.network_id",
@@ -47,8 +56,15 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             let username: String = row.get(3)?;
             let realname: String = row.get(4)?;
             let display_name: String = row.get(5)?;
-            let sasl_username: Option<String> = row.get(6)?;
-            let sasl_password: Option<Vec<u8>> = row.get(7)?;
+            // A constrained 0/1 column read back as anything else means the row was
+            // written by something that does not honour this build's schema. It is
+            // reported as corrupt rather than coerced: guessing which presence policy an
+            // unrecognized value meant would start or stop upstream AWAY traffic on the
+            // Operator's behalf.
+            let auto_away: i64 = row.get(6)?;
+            let keep_nick: i64 = row.get(7)?;
+            let sasl_username: Option<String> = row.get(8)?;
+            let sasl_password: Option<Vec<u8>> = row.get(9)?;
             Ok((
                 network,
                 endpoint,
@@ -56,6 +72,8 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
                 username,
                 realname,
                 display_name,
+                auto_away,
+                keep_nick,
                 sasl_username,
                 sasl_password,
             ))
@@ -70,9 +88,13 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             username,
             realname,
             display_name,
+            auto_away,
+            keep_nick,
             sasl_username,
             sasl_password,
         ) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        let auto_away = policy_flag(auto_away, "auto away flag")?;
+        let keep_nick = policy_flag(keep_nick, "keep nick flag")?;
         if records.len() >= MAX_NETWORKS {
             return Err(StoreError::new(StoreErrorKind::Corrupt(
                 "network count exceeds ceiling",
@@ -105,6 +127,8 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             username,
             realname,
             display_name,
+            auto_away,
+            keep_nick,
             sasl,
             desired_channels,
         };
@@ -206,15 +230,18 @@ pub(crate) fn save_network(
     }
     transaction
         .execute(
-            "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username,
+                     realname, display_name, auto_away, keep_nick)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(network_id) DO UPDATE SET
                 endpoint=excluded.endpoint,
                 endpoint_kind=excluded.endpoint_kind,
                 nick=excluded.nick,
                 username=excluded.username,
                 realname=excluded.realname,
-                display_name=excluded.display_name",
+                display_name=excluded.display_name,
+                auto_away=excluded.auto_away,
+                keep_nick=excluded.keep_nick",
             params![
                 network,
                 record.endpoint.as_str(),
@@ -223,6 +250,8 @@ pub(crate) fn save_network(
                 record.username,
                 record.realname,
                 record.display_name,
+                i64::from(record.auto_away),
+                i64::from(record.keep_nick),
             ],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;

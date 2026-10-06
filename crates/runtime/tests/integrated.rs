@@ -52,6 +52,8 @@ fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
         nick: nick.into(),
         username: "user".into(),
         realname: "bouncer".into(),
+        auto_away: false,
+        keep_nick: false,
         sasl: None,
         desired_channels: i2pr_irc_store::attached_channels(
             &channels
@@ -1723,14 +1725,21 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
             i2pr_irc_runtime::chathistory::READ_MARKER_CAPABILITY.to_owned()
         ]
     );
-    // The advertisement is the union of the history adapter's capabilities and the
-    // foundational tag surface, and nothing else.
+    // M005-C promotes the pre-away draft: `SessionPresence` is implemented end to end,
+    // so advertising it is a claim the bouncer can keep.
+    assert!(
+        advertised.contains(&i2pr_irc_runtime::presence::PRE_AWAY_CAPABILITY.to_owned()),
+        "draft/pre-away is served because SessionPresence is implemented end to end"
+    );
+    // The advertisement is the union of the history adapter's capabilities, the
+    // foundational tag surface, and the pre-away draft, and nothing else.
     let mut expected = history.clone();
     expected.extend(
         ["message-tags", "batch", "labeled-response"]
             .iter()
             .map(|name| (*name).to_owned()),
     );
+    expected.push(i2pr_irc_runtime::presence::PRE_AWAY_CAPABILITY.to_owned());
     expected.sort();
     let mut actual = advertised.clone();
     actual.sort();

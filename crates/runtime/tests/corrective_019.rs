@@ -66,6 +66,8 @@ fn record(network: u64, nick: &str, sasl: Option<(&str, &str)>) -> NetworkRecord
         nick: nick.into(),
         username: "user".into(),
         realname: "bouncer".into(),
+        auto_away: false,
+        keep_nick: false,
         sasl: sasl
             .map(|(user, password)| (user.to_owned(), StoredSecret::new(password.to_owned()))),
         desired_channels: Vec::new(),

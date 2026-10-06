@@ -27,7 +27,7 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 4
+## Schema version 5
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
@@ -79,6 +79,16 @@ Version 4 adds `desired_channels.detached`: whether a channel the bouncer still 
 Desired membership and detached presentation are separate durable facts, and storing the second one is what makes it survive a restart. A derived rule — "hidden because something is happening right now" — would restore a different policy after a restart than the one the Operator set, and would let a reconnect disagree with what every client was just shown.
 
 The flag is constrained to `0` or `1` at the storage layer. A value outside that range is refused on read as `Corrupt` rather than coerced, because guessing which end of an unrecognised value was meant would show or hide a channel nobody chose. The store also refuses to open a database that claims the current version but has lost a promised column: a table that survived a migration without `detached` would be served as though every channel were attached.
+
+### What version 5 added, and why
+
+Version 5 adds `networks.auto_away` and `networks.keep_nick`: the two durable halves of [presence and preferred-nick policy](presence-and-nick.md).
+
+They are policy, not observation, which is exactly why they are durable while the away state and the live nick are not. `auto_away` is the Operator's standing instruction about when to be away; `keep_nick` is the standing instruction about whether to fight for a nickname. Both `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT 0`, so both migrate **disabled**.
+
+Migrating them on would be the worst possible default: every existing Network would start emitting upstream `AWAY` and `NICK` traffic the Operator never asked for, purely because the binary changed. New upstream behaviour has to be something an Operator turns on, not something an upgrade does to them.
+
+The automatic away text is deliberately *not* a column. It is a bouncer-owned constant, because an away message reaches an IRC-visible field on paths including upstream re-application after a reconnect, and a configurable string there is a control-character delivery problem waiting to happen. See [presence and preferred-nick policy](presence-and-nick.md).
 
 A detached channel is still a desired channel. `detach` is a single `UPDATE`, not a delete-and-reinsert, so the durable position never moves; detaching and reattaching cannot reorder a Network's channel list.
 

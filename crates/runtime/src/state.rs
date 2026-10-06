@@ -491,6 +491,19 @@ impl NetworkState {
         }
         true
     }
+    /// The `MONITOR` limit the server advertised, if any.
+    ///
+    /// Read from ISUPPORT rather than negotiated, so the upstream CAP fingerprint stays
+    /// independent of which clients happen to be attached. `MONITOR=0` is reported as
+    /// `Some(0)`: the server did advertise the feature and disabled it, which is a
+    /// different answer from never mentioning it.
+    pub fn monitor_limit(&self) -> Option<usize> {
+        self.isupport
+            .iter()
+            .find_map(|token| token.strip_prefix("MONITOR="))
+            .and_then(|value| value.parse::<usize>().ok())
+    }
+
     /// Casemapped identities of every detached channel, whether or not it is currently
     /// joined. A detached channel the server has parted is still detached: the policy is
     /// durable and does not lapse because membership ended.

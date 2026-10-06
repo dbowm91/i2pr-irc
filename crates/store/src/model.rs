@@ -192,6 +192,18 @@ pub struct NetworkRecord {
     pub sasl: Option<(String, StoredSecret)>,
     /// Durable channel intent, in durable order.
     pub desired_channels: Vec<DesiredChannelRecord>,
+    /// Whether the bouncer goes away upstream when no active local session remains.
+    ///
+    /// Disabled by default and disabled by migration, because enabling it would make an
+    /// existing Network emit new upstream `AWAY` traffic merely because the binary was
+    /// upgraded. Turning this on is a deliberate Operator decision, not a consequence of
+    /// running newer code.
+    pub auto_away: bool,
+    /// Whether the bouncer keeps trying to reclaim its configured nick upstream.
+    ///
+    /// Disabled by default for the same reason: reclaim writes `NICK` traffic upstream
+    /// forever, and that traffic must not begin without being asked for.
+    pub keep_nick: bool,
 }
 
 /// Longest accepted `display_name`. A name is a single protocol token, so it is
@@ -534,6 +546,8 @@ mod tests {
             realname: "bouncer".into(),
             sasl: None,
             desired_channels: attached_channels(&["#room"]),
+            auto_away: false,
+            keep_nick: false,
         }
     }
 

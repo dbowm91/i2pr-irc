@@ -20,6 +20,7 @@ use crate::{
     downstream::DownstreamDisposition,
     journal::IngestOutcome,
     playback::PlaybackOutcome,
+    presence::{PresencePolicy, PresenceState, ReclaimAttempt, SessionPresence},
     projection,
     reconnect::{ReconnectScheduler, jitter_entropy},
     resource::{NetworkGauges, ResourceLedger},
@@ -566,6 +567,19 @@ pub struct NetworkSnapshot {
     /// asked for this room to be hidden".
     pub detached_channels: Vec<String>,
     pub reconnect_attempt: u32,
+    /// The away state upstream is currently being told, if any.
+    ///
+    /// This is the Operator's presence as the rest of the network sees it, which makes it
+    /// a diagnostic worth having: a bouncer that is away while the Operator is at the
+    /// keyboard and a bouncer that is present while they are not are both failures that
+    /// are otherwise invisible from outside.
+    pub away: Option<String>,
+    /// Sessions currently counted as the Operator being present.
+    ///
+    /// Reported next to `detached_channels` for the same reason: a reader must be able to
+    /// tell "no active client" from "several active clients that all declared themselves
+    /// passive", which are very different situations behind the same socket count.
+    pub active_sessions: usize,
     /// Durable detach and reattach decisions this owner has applied.
     pub channels_detached: u64,
     pub channels_reattached: u64,
@@ -725,6 +739,13 @@ pub struct NetworkOwner<P> {
     /// Durable channel policy, held behind its own trait so the ambiguous-commit
     /// branch is reachable from a test without a corrupt database.
     policy: Arc<dyn ChannelPolicy>,
+    /// Operator presence, owned here rather than per generation.
+    ///
+    /// Manual-away belongs to the Operator, not to a connection: a reconnect must
+    /// re-apply it, not drop it, and only an owner that outlives generations can carry
+    /// that. The generation-scoped half — what upstream currently believes — is derived
+    /// from this on every registration and dies with the generation.
+    presence: std::sync::Mutex<PresenceState>,
     snapshot: watch::Sender<NetworkSnapshot>,
     /// Process-wide connect admission.
     ///
@@ -810,12 +831,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // `Drop` below is what makes the count return to baseline.
         context.resources.register(context.network)?;
         let resources = context.resources.clone();
+        // Read before `context` moves into the owner: the durable policy is the seed,
+        // and a separate borrow of the moved value would not be available here.
+        let presence = PresenceState::new(PresencePolicy::from_record(&context.record));
         Ok(Self {
             provider,
             network: context.network,
             context,
             store,
             policy,
+            presence: std::sync::Mutex::new(presence),
             snapshot,
             reconnect,
             resources,
@@ -1036,6 +1061,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             });
                             return Err(RuntimeError::Registration);
                         }
+                        // Terminal for the same reason: a refused sequence will be
+                        // refused identically on a retry, and each retry would spend a
+                        // process-wide connect permit to produce identical upstream
+                        // traffic. Configuration or a reconcile is the only thing that
+                        // can change the answer.
+                        Err(RuntimeError::NickExhausted) => {
+                            self.reconnect.mark_terminal(self.network);
+                            self.snapshot.send_modify(|state| {
+                                state.phase = Some(Phase::Stopped);
+                                state.attached_sessions = 0;
+                                state.last_error = Some("nick exhausted");
+                            });
+                            return Err(RuntimeError::NickExhausted);
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -1089,6 +1128,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // the birth record instead would silently drop it on the next reconnect.
         let desired = self.durable_desired_policy().await;
         let mut state = NetworkState::new(&self.context.record.nick, &desired);
+        // Presence policy is durable; the away state upstream currently holds is not.
+        // A fresh generation starts with no upstream away state, so the current policy is
+        // re-applied after registration rather than a stale observation being restored.
+        // The Operator's manual-away carries across the generation boundary; everything
+        // this generation observed does not.
+        let mut presence = self.owner_presence().for_generation();
+        // Per-session classification. An empty entry set with a non-empty session map is
+        // impossible: every attached session is classified at attach time.
+        let mut presence_of: BTreeMap<SessionId, SessionPresence> = BTreeMap::new();
+        // Bounded fallback sequence for a preferred nick the server already holds.
+        let mut fallback = crate::presence::NickFallback::new(&self.context.record.nick, None);
         let mut decoder = LineDecoder::default();
         let mut ubuf = [0u8; 2048];
         let mut welcomed = false;
@@ -1105,12 +1155,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 &mut uw,
                 &format!(
                     "NICK {}\r\nUSER {} 0 * :{}\r\n",
-                    self.context.record.nick,
-                    self.context.record.username,
-                    self.context.record.realname
+                    state.nick, self.context.record.username, self.context.record.realname
                 ),
             )
             .await?;
+            // The preferred nick has now been offered. The fallback sequence continues
+            // after it rather than starting from it, so a refusal is answered with a
+            // different name rather than with the same one twice.
+            fallback.prime();
             while !(welcomed && cap_finished) {
                 let n = if cap_finished {
                     ur.read(&mut ubuf).await?
@@ -1236,6 +1288,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         "904" | "905" | "906" | "907" if sasl_active => {
                             return Err(RuntimeError::Registration);
                         }
+                        // A collision is answered, not waited out. Sitting until the
+                        // registration ceiling would turn a two-second collision into a
+                        // thirty-second stall and look indistinguishable from a dead
+                        // network.
+                        "433" | "436" => {
+                            let Some(next) = fallback.next_candidate() else {
+                                return Err(RuntimeError::NickExhausted);
+                            };
+                            if !crate::presence::valid_nick(&next) {
+                                return Err(RuntimeError::NickExhausted);
+                            }
+                            state.nick = next.clone();
+                            send(&mut uw, &format!("NICK {next}\r\n")).await?;
+                        }
                         "001" => welcomed = true,
                         "ERROR" | "464" | "465" | "451" => return Err(RuntimeError::Registration),
                         _ => match state.apply_line(&message) {
@@ -1285,6 +1351,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         });
         self.publish_state(&state);
 
+        // The generation's presence policy is applied now, against the sessions that
+        // are already attached. An upstream that has just registered us knows nothing
+        // about our away state, so writing it here is what makes "re-applied, not
+        // restored" true in the only sense that matters on the wire.
         let (control_tx, mut control_rx) = mpsc::channel::<Vec<u8>>(CONTROL_QUEUE_CAPACITY);
         let (normal_tx, mut normal_rx) = mpsc::channel::<OutboundIntent>(NORMAL_QUEUE_CAPACITY);
         let (session_tx, mut session_rx) =
@@ -1351,10 +1421,41 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 &mut sessions,
                 &self.snapshot,
             );
+            presence_of.insert(session, SessionPresence::DEFAULT);
         }
 
         let mut probe = tokio::time::interval(crate::LIVENESS_INTERVAL);
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Keep-nick reclaim runs on its own generation-owned clock. It is deliberately
+        // not wired to client activity: a client attaching must never make the bouncer
+        // poll upstream faster, or the bouncer's upstream behaviour would depend on
+        // which local sessions happen to exist.
+        let mut reclaim = tokio::time::interval(crate::presence::RECLAIM_INTERVAL);
+        reclaim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The tick fires immediately, so the clock starts now and the first pass is
+        // compared against a zero elapsed time: a fresh generation asks nothing until the
+        // schedule is actually due.
+        let reclaim_started = std::time::Instant::now();
+        // Upstream evidence that the preferred nick is free wakes this rather than the
+        // schedule, so a claim the server has already blessed is not delayed by the
+        // interval. Generation-local, like the clock it accelerates.
+        let reclaim_wake = tokio::sync::Notify::new();
+        // Generation-local reclaim state. It exists only when the policy is on *and* the
+        // server did not give us the nick we asked for, so a Network that holds its
+        // configured nick allocates nothing.
+        let mut reclaim_attempt = (presence.policy().keep_nick
+            && !state.nick.eq_ignore_ascii_case(&self.context.record.nick))
+        .then(|| ReclaimAttempt::new(&self.context.record.nick, &state.nick));
+        if reclaim_attempt.is_some() {
+            self.begin_reclaim(&mut reclaim_attempt, &state, &control_tx);
+        }
+        // Presence is evaluated *after* the waiting attachments are applied, so a
+        // generation that came up with a client already waiting does not declare itself
+        // away and then immediately back. A bouncer that flaps its away state on every
+        // reconnect is a bouncer the network learns to ignore.
+        if let Some(frame) = self.apply_presence(&mut presence, &presence_of) {
+            let _ = queue_control(&control_tx, &frame);
+        }
         let mut reconcile_tick = tokio::time::interval(DESIRED_RECONCILE_INTERVAL);
         reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut awaiting_pong: Option<(Instant, String)> = None;
@@ -1390,6 +1491,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &normal_tx,
                             &session_tx,
                             &mut sessions,
+                            &mut presence_of,
                         ).await;
                     }
                 }
@@ -1410,6 +1512,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &mut batches,
                         &mut reconcile,
                         &upstream_caps,
+                        &mut presence,
+                        &mut presence_of,
                     )
                     .await
                     {
@@ -1418,6 +1522,18 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         // controlled reconnect rebuilds membership from storage, which
                         // is the honest way to honour intent the bounded set cannot hold.
                         break Err(error);
+                    }
+                    // Presence is re-evaluated after every session event, because every
+                    // session event can change the answer: an attach, a detach, a
+                    // `PASSIVE`, a manual `AWAY`. An event that changes nothing produces
+                    // no frame, because `apply_presence` returns one only on a
+                    // transition.
+                    if let Some(frame) = self.apply_presence(&mut presence, &presence_of)
+                        && queue_control(&control_tx, &frame).is_err()
+                    {
+                        self.snapshot.send_modify(|snapshot| {
+                            snapshot.last_error = Some("upstream-queue-refused");
+                        });
                     }
                 }
                 writer = writer_exit => {
@@ -1475,6 +1591,44 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 snapshot.desired_reconcile_drained.saturating_add(drained);
                             snapshot.desired_reconcile_pending = pending;
                         });
+                    }
+                }
+                _ = reclaim.tick() => {
+                    // Reclaim writes upstream only when the policy is on, the observed
+                    // nick differs from the configured one, and the schedule or
+                    // `MONITOR` evidence says a write is due. The whole `reclaim` state
+                    // is generation-local, so a probe scheduled by a connection that has
+                    // since died cannot act on the connection that replaced it.
+                    if presence.policy().keep_nick {
+                        let elapsed = reclaim_started.elapsed();
+                        let frame = reclaim_attempt
+                            .as_mut()
+                            .and_then(|attempt| self.reclaim_tick(attempt, &state, elapsed));
+                        if let Some(frame) = frame
+                            && queue_control(&control_tx, &frame).is_err()
+                        {
+                            self.snapshot.send_modify(|snapshot| {
+                                snapshot.last_error = Some("upstream-queue-refused");
+                            });
+                        }
+                    }
+                }
+                _ = reclaim_wake.notified() => {
+                    // Evidence, not the clock. Same policy, same ceiling, and the same
+                    // generated local attempt state: this only moves the *timing* of a
+                    // write the scheduled pass would have been allowed to make anyway.
+                    if presence.policy().keep_nick {
+                        let elapsed = reclaim_started.elapsed();
+                        let frame = reclaim_attempt
+                            .as_mut()
+                            .and_then(|attempt| self.reclaim_tick(attempt, &state, elapsed));
+                        if let Some(frame) = frame
+                            && queue_control(&control_tx, &frame).is_err()
+                        {
+                            self.snapshot.send_modify(|snapshot| {
+                                snapshot.last_error = Some("upstream-queue-refused");
+                            });
+                        }
                     }
                 }
                 _ = probe.tick() => {
@@ -1549,6 +1703,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             }
                             Err(error) => { failure = Some(error); break; }
                         }
+                        // Reclaim evidence.
+                        //
+                        // `730` (MONITOR OFFLINE) names the nicks that became free, and
+                        // a `303` whose list omits the preferred nick says the same thing
+                        // for the `ISON` path. Neither is authoritative: the `NICK` that
+                        // follows is a request, and only the server's own frame confirms
+                        // it. Treating either as confirmation would let the bouncer
+                        // believe it holds a nick it is still queued to claim.
+                        self.note_reclaim_evidence(
+                            &state,
+                            &message,
+                            &mut reclaim_attempt,
+                            &reclaim_wake,
+                        );
                         // Resolve a channel to its durable buffer *after* this line has
                         // been applied, because the line that creates membership is the
                         // self JOIN itself. Checking before applying would mean the very
@@ -1653,6 +1821,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         normal_tx: &mpsc::Sender<OutboundIntent>,
         session_tx: &mpsc::Sender<SessionEvent>,
         sessions: &mut BTreeMap<SessionId, SessionTask>,
+        presence_of: &mut BTreeMap<SessionId, SessionPresence>,
     ) {
         match command {
             SupervisorCommand::Attach {
@@ -1673,11 +1842,25 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         sessions,
                         &self.snapshot,
                     );
+                    // A newly attached session starts active. Classification is a fact
+                    // about the session, not a counter, so the entry is added here and
+                    // removed where the session goes away.
+                    presence_of.insert(session, SessionPresence::DEFAULT);
+                    // Presence is deliberately *not* re-evaluated on attach. A session
+                    // that negotiated the pre-away draft may declare itself passive
+                    // during registration, before the bouncer has heard from it at all;
+                    // evaluating now would count it as an Operator and then take that
+                    // back, which is a flap the rest of the network sees on every
+                    // background client that connects. The first evaluation happens when
+                    // the session's own first intent arrives.
                     Ok(())
                 };
                 let _ = reply.send(accepted);
             }
             SupervisorCommand::AttachPrepared { session, reply } => {
+                // Captured before the value is consumed: adoption takes the session by
+                // value, and presence classification is keyed by its id.
+                let session_id = session.session_id();
                 let accepted = adopt_prepared_session(
                     session,
                     &state.nick,
@@ -1685,6 +1868,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     sessions,
                     &self.snapshot,
                 );
+                if accepted.is_ok() {
+                    // An adopted session registered during admission and may already have
+                    // declared itself passive; its intent arrived through the ordinary
+                    // queue and the `Passive` arm classifies it. Until then it counts as
+                    // active, which is the safe default.
+                    presence_of.insert(session_id, SessionPresence::DEFAULT);
+                }
                 let _ = reply.send(accepted);
             }
             SupervisorCommand::Session { session, event } => {
@@ -1941,6 +2131,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         batches: &mut crate::ircv3::BatchTracker,
         reconcile: &mut DesiredReconcile,
         upstream_caps: &UpstreamCapabilities,
+        presence: &mut PresenceState,
+        presence_of: &mut BTreeMap<SessionId, SessionPresence>,
     ) -> Result<(), RuntimeError> {
         match event {
             SessionEvent::Ended {
@@ -1950,6 +2142,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 if let Some(task) = sessions.remove(&session) {
                     task.shutdown().await;
                 }
+                // A departing session stops counting towards active presence. Leaving
+                // its classification behind would let a session that no longer exists
+                // keep the Operator looking online.
+                presence_of.remove(&session);
                 // A detached client must never receive a reply that arrives later, even
                 // if the server is slow. Dropping its routes is what guarantees that.
                 router.drop_session(session);
@@ -2008,6 +2204,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     SessionIntent::Quit => {
                         if let Some(task) = sessions.remove(&session) {
                             task.shutdown().await;
+                            presence_of.remove(&session);
                         }
                         router.drop_session(session);
                         self.snapshot.send_modify(|snapshot| {
@@ -2141,6 +2338,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     SessionIntent::Detach { channel } => {
                         self.apply_detach(sessions, state, session, &channel).await;
+                    }
+                    SessionIntent::Passive => {
+                        presence_of.insert(session, SessionPresence::Passive);
+                    }
+                    SessionIntent::Active => {
+                        presence_of.insert(session, SessionPresence::Active);
+                    }
+                    SessionIntent::Away { text } => {
+                        self.apply_manual_away(presence, text.as_deref());
                     }
                     SessionIntent::Reattach { channel } => {
                         self.apply_reattach(
@@ -2319,6 +2525,183 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             .joined_channels()
             .iter()
             .any(|held| state.same_nick(held, channel))
+    }
+
+    /// Evaluates presence and returns the upstream `AWAY` frame a transition requires.
+    ///
+    /// Returns `None` when nothing changed, which is the common case: a session
+    /// attaching, a projection running, or the same away state being re-derived must
+    /// not produce upstream traffic. Only a genuine transition writes a frame.
+    fn apply_presence(
+        &self,
+        presence: &mut PresenceState,
+        presence_of: &BTreeMap<SessionId, SessionPresence>,
+    ) -> Option<String> {
+        let active = presence_of
+            .values()
+            .filter(|presence| presence.is_active())
+            .count();
+        let desired = presence.away_state(active);
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.active_sessions = active;
+            snapshot.away = desired.clone();
+        });
+        presence.note_upstream_away(desired).map(|text| match text {
+            // Returning to present is the protocol's bare `AWAY`, which carries no
+            // parameter at all. `AWAY :` would put an empty message in front of every
+            // member of every channel the bouncer holds, which is both ugly and a
+            // different statement from "I am back".
+            None => "AWAY\r\n".to_owned(),
+            Some(text) if text.is_empty() => "AWAY\r\n".to_owned(),
+            Some(text) => format!("AWAY :{text}\r\n"),
+        })
+    }
+
+    /// Opens this generation's reclaim: `MONITOR` when the server offered a usable
+    /// limit, bounded `ISON` probing when it did not.
+    ///
+    /// The strategy is chosen once per generation from what the server advertised rather
+    /// than per pass, so a server that drops `MONITOR` mid-connection cannot make the
+    /// bouncer alternate between two mechanisms on consecutive ticks.
+    fn begin_reclaim(
+        &self,
+        attempt: &mut Option<ReclaimAttempt>,
+        state: &NetworkState,
+        control_tx: &mpsc::Sender<Vec<u8>>,
+    ) {
+        let Some(attempt) = attempt.as_mut() else {
+            return;
+        };
+        let _ = state;
+        match crate::presence::reclaim_strategy(state.monitor_limit()) {
+            crate::presence::ReclaimStrategy::Monitor => {
+                let _ = queue_control(control_tx, &format!("MONITOR + {}\r\n", attempt.preferred));
+            }
+            crate::presence::ReclaimStrategy::Probe => {
+                let _ = queue_control(control_tx, &format!("ISON {}\r\n", attempt.preferred));
+            }
+        }
+    }
+
+    /// Reads one upstream line for reclaim evidence.
+    ///
+    /// The two replies mean opposite things, and reading them the same way is how a
+    /// bouncer ends up convinced a free nick is taken:
+    ///
+    /// * `303` (RPL_ISON) lists the nicks that are **online**, so the preferred one being
+    ///   *absent* from the answer is the evidence that it is free.
+    /// * `730` (RPL_MONITOROFFLINE) names the nick that just went **offline**, so the
+    ///   preferred one being *named* is the evidence that it is free.
+    ///
+    /// Only those two commands are evidence at all. Every other line -- including a
+    /// `731` reporting the preferred nick on-line -- is recorded as nothing rather than
+    /// as negative evidence that would suppress a future write.
+    ///
+    /// Accepted evidence wakes the reclaim clock rather than waiting out the interval. A
+    /// server that says the preferred nick just came free has answered the question the
+    /// bouncer is asking, and deferring the write to the next scheduled pass would lose a
+    /// nick the bouncer already knows is available.
+    fn note_reclaim_evidence(
+        &self,
+        state: &NetworkState,
+        message: &Message,
+        attempt: &mut Option<ReclaimAttempt>,
+        wake: &tokio::sync::Notify,
+    ) {
+        let Some(attempt) = attempt.as_mut() else {
+            return;
+        };
+        // Both replies are addressed to the bouncer, so the nick list starts after the
+        // recipient parameter.
+        let offline = if message.command.eq_ignore_ascii_case(b"730") {
+            Some(true)
+        } else if message.command.eq_ignore_ascii_case(b"303") {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(offline) = offline else {
+            return;
+        };
+        let listed: Vec<String> = message
+            .params
+            .iter()
+            .skip(1)
+            .map(|param| String::from_utf8_lossy(param).into_owned())
+            .collect();
+        if listed.is_empty() {
+            return;
+        }
+        let preferred_listed = listed
+            .iter()
+            .any(|nick| state.same_nick(nick, &attempt.preferred));
+        let free = if offline {
+            preferred_listed
+        } else {
+            !preferred_listed
+        };
+        if free {
+            attempt.evidence = true;
+            wake.notify_one();
+        }
+    }
+
+    /// One keep-nick reclaim pass, returning the upstream frame a write requires.
+    ///
+    /// The strategy is chosen once per generation from what the server advertised, not
+    /// per pass, so a server that drops `MONITOR` mid-connection cannot make the
+    /// bouncer alternate between two mechanisms on consecutive ticks.
+    fn reclaim_tick(
+        &self,
+        attempt: &mut ReclaimAttempt,
+        state: &NetworkState,
+        elapsed: std::time::Duration,
+    ) -> Option<String> {
+        if state.nick.eq_ignore_ascii_case(&self.context.record.nick) {
+            return None;
+        }
+        if !attempt.should_write(elapsed, crate::presence::RECLAIM_INTERVAL) {
+            return None;
+        }
+        if !crate::presence::note_reclaim_write(
+            attempt,
+            crate::presence::MAX_RECLAIM_WRITES_PER_GENERATION,
+        ) {
+            self.snapshot.send_modify(|snapshot| {
+                snapshot.last_error = Some("reclaim-write-ceiling");
+            });
+            return None;
+        }
+        Some(format!("NICK {}\r\n", attempt.preferred))
+    }
+
+    /// The owner-scoped presence state.
+    ///
+    /// A poisoned lock is recovered rather than propagated: presence is not authority,
+    /// and losing the ability to answer "is the Operator away" would stop the bouncer
+    /// doing anything at all over a panic in an unrelated generation.
+    fn owner_presence(&self) -> std::sync::MutexGuard<'_, PresenceState> {
+        self.presence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records the Operator's explicit away state on both the owner and the generation.
+    ///
+    /// Both copies exist deliberately: the owner copy survives a reconnect, the
+    /// generation copy drives this connection's transitions.
+    fn apply_manual_away(&self, presence: &mut PresenceState, text: Option<&str>) {
+        let mut owner = self.owner_presence();
+        match text {
+            Some(text) => {
+                owner.set_manual_away(text);
+                presence.set_manual_away(text);
+            }
+            None => {
+                owner.clear_manual_away();
+                presence.clear_manual_away();
+            }
+        }
     }
 
     /// Emits the bouncer-owned `PART` that tells every session a channel was detached.
