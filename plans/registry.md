@@ -26,13 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | gates closed | plans/subsystems/bouncer-core-roadmap.md | M003 unblocked for implementation planning | M001, M002, Corrective 004, Corrective 005, and Corrective 006 are closed, and Research 003 records the Rust IRC crate/spec conformance disposition. No M003 implementation handoff exists yet. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003-A / Plan 007 ready | M003 is decomposed into Plans 007-012. ADR-0002 and Research 004 freeze the storage/identity/history architecture. Plan 007 is ready; Plans 008-012 are registered and blocked on predecessor closure. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
+| Bouncer Core M003-A — Durable Storage and Identity Foundation | ready | infrastructure | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/007-status.md |
 
 
 ## Recently closed implementation plans
@@ -48,13 +49,18 @@ Canonical direction:
 
 ## Blocked implementation plans
 
-None. No implementation plan is currently dependency-blocked.
+| Plan | Status | Blocker | Handoff |
+|---|---|---|---|
+| Bouncer Core M003-B — Multi-Network and Multi-Client Ownership | blocked | Plan 007 closure | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md |
+| Bouncer Core M003-C — History Journal, Cursors, and Legacy Playback | blocked | Plan 008 closure | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md |
+| Bouncer Core M003-D — Response Routing and Foundational IRCv3 Mediation | blocked | Plan 009 closure | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md |
+| Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | blocked | Plan 010 closure | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md |
+| Bouncer Core M003-F — Integrated Qualification and M003 Closure | blocked | Plan 011 closure | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md |
 
 ## Unplanned later milestones
 
-These have roadmap authority but intentionally do not yet have implementation handoffs. M003's pre-M003 gates — Corrective 005, Corrective 006, and the Research 002 disposition — are all closed, so M003 is unblocked for implementation planning; its handoff must be written against the Corrective-005 and Corrective-006 closures and the Research-003 result baseline, and it does not exist yet.
+M003 now has complete sequenced implementation handoffs. Later roadmap milestones remain intentionally unplanned.
 
-- Bouncer Core M003 — durable multi-network/multi-client/history (unblocked for planning; no handoff yet);
 - Bouncer Core M004 — anonymity and adverse-network qualification;
 - Bouncer Core M005 — mature operator feature set;
 - Router R001 — portable SAM adapter/cross-router qualification;
@@ -68,12 +74,14 @@ Do not create implementation code for these merely from their roadmap descriptio
 | ADR | Status | Decision |
 |---|---|---|
 | plans/adrs/ADR-0001-i2p-only-upstream-and-router-adapter-boundary.md | accepted | Upstream IRC authority is structurally I2P-only through I2pStreamProvider; SAM/i2pr are adapters; Proposal 170 is separate optional control plane. |
+| plans/adrs/ADR-0002-bounded-sqlite-persistence-history-order-and-session-identity.md | accepted | M003 uses an owned bounded rusqlite worker; durable DesiredState/history/cursors remain separate from live ObservedState; HistoryEventId is canonical order; SessionId is ephemeral and distinct from durable ClientId. |
 
 ## Research authority
 
 Current foundation research:
 
 - plans/research/001-bouncer-and-i2p-foundation.md
+- plans/research/004-m003-storage-multiclient-history-research.md
 
 Important retained conclusions:
 
@@ -87,12 +95,12 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-All pre-M003 gates are closed:
+Implement only:
 
-- `plans/closure/bouncer-core/005-status.md` — server-confirmed observed channel membership, bounded join-failure disposition, downstream CAP registration gating, complete RPL_NAMREPLY visibility handling.
-- `plans/closure/bouncer-core/006-status.md` — framing recovery at an over-long line's own terminator, and both strict casemapping spellings.
-- `plans/research/003-rust-irc-crate-conformance-results.md` — owned wire and state layers retained; `ircv3_parse` is a dev-only differential oracle; `irc-proto`, `vinezombie`, `obby-proto`, and the high-level `irc` crate are reference-only or excluded.
+- `plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md`
 
-The durable conformance corpus in `research/irc-conformance/` is now the regression gate for any change to the owned wire or state layers, and its runners execute on every `cargo test`.
+Plan 007 freezes the bounded `rusqlite` worker, schema version 1, durable IDs, SessionId separation, DesiredState restart semantics, wall-clock abstraction, and store failure/backpressure contract.
 
-The next eligible work is authoring the M003 implementation handoff. No plan is dependency-blocked. M004 and M005 remain sequenced behind M003, and router integration remains blocked behind M005.
+Plans 008-012 are already written for continuity and review but are dependency-blocked. Promote only the direct successor after the predecessor closure is accepted.
+
+M004 and M005 remain sequenced behind full M003 closure, and router integration remains blocked behind M005.
