@@ -332,15 +332,17 @@ Router integration:
 2. i2pr managed-app adapter after public capability stabilization;
 3. optional scoped Proposal 170 integration only after a concrete need.
 
-## 14. Open questions intentionally deferred
+## 14. Deferred and subsequently resolved questions
 
-- exact MSRV and dependency pins;
-- owned parser versus reviewed irc-proto reuse;
-- exact SQLite async wrapper;
-- local authentication scheme and OS peer-credential integration;
-- default reconnect/timeout values after measured I2P evidence;
-- whether remote downstream IRC-over-I2P is useful enough for a later inbound-stream milestone;
-- exact subset of safe client-only tags;
-- whether a second independent consumer eventually justifies extracting the deterministic fault stream as a separate crate.
+The original foundation research intentionally deferred several decisions. Current status:
 
-These are not blockers for planning Milestone 001.
+- MSRV is now frozen at Rust 1.88 by the M001 closure.
+- M001 selected an owned byte-oriented wire codec rather than `irc-proto`; that production decision is closed. `plans/research/002-rust-irc-crate-conformance-plan.md` now asks a narrower question: whether current IRC crates should be conformance oracles, dev-only dependencies, references, or justify a separately planned migration.
+- the exact SQLite async wrapper remains an M003 decision;
+- local authentication scheme and OS peer-credential integration remain deferred;
+- default reconnect/timeout values still require measured live-I2P evidence;
+- remote downstream IRC-over-I2P remains a possible later inbound-stream milestone;
+- the exact safe client-only tag set remains M004 work;
+- extracting the deterministic fault stream remains unjustified without a second independent consumer.
+
+The parser decision is therefore not reopened merely by Research 002. A production replacement requires new evidence and a separately registered migration/corrective plan.
