@@ -26,20 +26,21 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003-A / Plan 007 ready | M003 is decomposed into Plans 007-012. ADR-0002 and Research 004 freeze the storage/identity/history architecture. Plan 007 is ready; Plans 008-012 are registered and blocked on predecessor closure. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M003-B / Plan 008 ready | M003 is decomposed into Plans 007-012. ADR-0002 and Research 004 freeze the storage/identity/history architecture. Plan 007 is closed; Plan 008 is the executable successor and Plans 009-012 are blocked on predecessor closure. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M003-A — Durable Storage and Identity Foundation | ready | infrastructure | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/007-status.md |
+| Bouncer Core M003-B — Multi-Network and Multi-Client Ownership | ready | capability | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/008-status.md |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M003-A — Durable Storage and Identity Foundation | closed | infrastructure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/007-status.md |
 | Bouncer Core Corrective 006 — Framing Recovery and Casemapping Token Conformance | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/006-status.md |
 | Research 002 — Rust IRC Crate Conformance and Reuse Decision | closed | research/decision gate | plans/research/002-rust-irc-crate-conformance-plan.md | plans/research/003-rust-irc-crate-conformance-results.md |
 | Bouncer Core Corrective 005 — Pre-M003 Observed Membership and Downstream CAP Correctness | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/005-status.md |
@@ -51,7 +52,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M003-B — Multi-Network and Multi-Client Ownership | blocked | Plan 007 closure | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md |
 | Bouncer Core M003-C — History Journal, Cursors, and Legacy Playback | blocked | Plan 008 closure | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md |
 | Bouncer Core M003-D — Response Routing and Foundational IRCv3 Mediation | blocked | Plan 009 closure | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md |
 | Bouncer Core M003-E — IRCv3 Chathistory and Read-Marker Adapters | blocked | Plan 010 closure | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md |
@@ -97,10 +97,10 @@ Important retained conclusions:
 
 Implement only:
 
-- `plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md`
+- `plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md`
 
-Plan 007 freezes the bounded `rusqlite` worker, schema version 1, durable IDs, SessionId separation, DesiredState restart semantics, wall-clock abstraction, and store failure/backpressure contract.
+Plan 007 froze the bounded `rusqlite` worker, schema version 1, durable IDs, SessionId separation, DesiredState restart semantics, wall-clock abstraction, and store failure/backpressure contract; it is closed in `plans/closure/bouncer-core/007-status.md`.
 
-Plans 008-012 are already written for continuity and review but are dependency-blocked. Promote only the direct successor after the predecessor closure is accepted.
+Plans 009-012 are already written for continuity and review but are dependency-blocked. Promote only the direct successor after the predecessor closure is accepted.
 
 M004 and M005 remain sequenced behind full M003 closure, and router integration remains blocked behind M005.

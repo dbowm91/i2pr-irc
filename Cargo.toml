@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/wire", "crates/core", "crates/testkit", "crates/runtime", "crates/fuzz-smoke"]
+members = [
+    "crates/wire",
+    "crates/core",
+    "crates/store",
+    "crates/testkit",
+    "crates/runtime",
+    "crates/fuzz-smoke",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +21,10 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 async-trait = "0.1"
 base64 = "0.22"
 zeroize = "1"
+# M003 storage boundary. `bundled` compiles a pinned SQLite so supported binary
+# behavior does not depend on a host library, and `default-features = false` keeps
+# the build-script/network feature set off. See architecture/dependency-review.md.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

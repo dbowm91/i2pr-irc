@@ -23,6 +23,43 @@ macro_rules! id {
 id!(NetworkId);
 id!(ClientId);
 id!(ConnectionGeneration);
+id!(BufferId);
+id!(HistoryEventId);
+/// Ephemeral identity for exactly one live downstream attachment.
+///
+/// A `SessionId` is allocated locally when a client attaches, is never written to
+/// durable storage, and is never restored after a process restart. It answers
+/// "which connection owns this CAP state, queue, and response route?", which is a
+/// different question from the durable [`ClientId`] lineage that owns playback and
+/// read state.
+///
+/// A durable `ClientId` that reconnects always receives a fresh `SessionId`, so a
+/// late reply from a previous attachment can never be delivered to its replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SessionId(pub u64);
+/// Explicit ceiling on distinct attachments one process may identify in a lifetime.
+///
+/// Exhaustion is reported instead of wrapping, because a reused `SessionId` would
+/// make an old response route indistinguishable from a current one.
+pub const MAX_SESSION_IDS: u64 = 1 << 32;
+/// Bounded local allocator for ephemeral attachment identity.
+#[derive(Clone, Debug, Default)]
+pub struct SessionIdAllocator(Arc<AtomicU64>);
+impl SessionIdAllocator {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(1)))
+    }
+    /// Allocates the next attachment identity, or `None` once [`MAX_SESSION_IDS`] is
+    /// reached. It never wraps and never reissues a previous value.
+    pub fn allocate(&self) -> Option<SessionId> {
+        let next = self.0.fetch_add(1, Ordering::SeqCst);
+        if next >= MAX_SESSION_IDS {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(SessionId(next))
+    }
+}
 pub const MAX_I2P_ENDPOINT_BYTES: usize = 516;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -267,6 +304,76 @@ impl Timer for VirtualClock {
     }
 }
 
+/// Bounded receive wall time, in whole seconds since the Unix epoch.
+///
+/// This is metadata on a durable history event, never its order. Canonical history
+/// order is [`HistoryEventId`], so a skewed, missing, or repeated server timestamp
+/// cannot reorder retained history. Values are bounded to a representable window so a
+/// corrupt durable row fails validation instead of wrapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct WallTime(pub i64);
+pub const MAX_WALL_TIME_SECONDS: i64 = 32_503_680_000;
+impl WallTime {
+    /// Rejects a timestamp outside the representable window.
+    ///
+    /// The bound is checked with unsigned comparison so a corrupt durable row
+    /// carrying `i64::MIN` fails validation instead of overflowing.
+    pub fn from_unix_seconds(seconds: i64) -> Option<Self> {
+        let magnitude = seconds.unsigned_abs();
+        (magnitude <= MAX_WALL_TIME_SECONDS.unsigned_abs()).then_some(Self(seconds))
+    }
+    pub fn unix_seconds(self) -> i64 {
+        self.0
+    }
+}
+/// Injectable civil-time source, deliberately separate from the monotonic [`Clock`].
+///
+/// Reconnect backoff and liveness need a monotonic source that cannot jump. Durable
+/// history needs civil time that survives a restart. Mixing them would make one of
+/// those two properties false.
+pub trait WallClock: Send + Sync {
+    fn now(&self) -> WallTime;
+}
+/// Production civil-time source.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemWallClock;
+impl WallClock for SystemWallClock {
+    fn now(&self) -> WallTime {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+            .and_then(WallTime::from_unix_seconds)
+            .unwrap_or(WallTime(0))
+    }
+}
+/// Deterministic civil-time source for tests. It starts at the Unix epoch and only
+/// moves when a test advances it, so durable receive timestamps are reproducible.
+#[derive(Clone, Debug)]
+pub struct VirtualWallClock(Arc<Mutex<VirtualWallState>>);
+#[derive(Debug)]
+struct VirtualWallState {
+    now: i64,
+}
+impl Default for VirtualWallClock {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(VirtualWallState { now: 0 })))
+    }
+}
+impl VirtualWallClock {
+    /// Moves civil time forward. It refuses to leave the representable window.
+    pub fn advance(&self, seconds: i64) -> Option<WallTime> {
+        let mut state = self.0.lock().expect("virtual wall clock lock poisoned");
+        let now = state.now.checked_add(seconds)?;
+        WallTime::from_unix_seconds(now).inspect(|value| state.now = value.0)
+    }
+}
+impl WallClock for VirtualWallClock {
+    fn now(&self) -> WallTime {
+        WallTime(self.0.lock().expect("virtual wall clock lock poisoned").now)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Casemapping {
     Ascii,
@@ -418,5 +525,59 @@ mod tests {
     #[test]
     fn casemap() {
         assert_eq!(Casemapping::Rfc1459.fold(b"Nick[\\^"), b"nick{|~");
+    }
+
+    #[test]
+    fn session_identity_is_ephemeral_bounded_and_never_reissued() {
+        let allocator = SessionIdAllocator::new();
+        assert_eq!(allocator.allocate(), Some(SessionId(1)));
+        assert_eq!(allocator.allocate(), Some(SessionId(2)));
+        // A durable client lineage is distinct from an attachment: the same client
+        // reconnecting receives a new session identity, never a recycled one.
+        let first: SessionId = allocator.allocate().unwrap();
+        let second: SessionId = allocator.allocate().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first.0, 0);
+    }
+
+    #[test]
+    fn session_identity_exhaustion_is_reported_not_wrapped() {
+        let exhaustion = Arc::new(AtomicU64::new(MAX_SESSION_IDS - 1));
+        let at_edge = SessionIdAllocator(exhaustion.clone());
+        assert_eq!(at_edge.allocate(), Some(SessionId(MAX_SESSION_IDS - 1)));
+        assert_eq!(at_edge.allocate(), None);
+        // A refused allocation must not burn the final identity, and repeated
+        // refusals must stay refused instead of wrapping to an earlier value.
+        assert_eq!(at_edge.allocate(), None);
+        assert_eq!(exhaustion.load(Ordering::SeqCst), MAX_SESSION_IDS);
+    }
+
+    #[test]
+    fn wall_time_is_bounded_and_separate_from_monotonic_time() {
+        assert_eq!(WallTime::from_unix_seconds(0), Some(WallTime(0)));
+        assert_eq!(WallTime::from_unix_seconds(-1), Some(WallTime(-1)));
+        assert_eq!(WallTime::from_unix_seconds(MAX_WALL_TIME_SECONDS + 1), None);
+        assert_eq!(
+            WallTime::from_unix_seconds(i64::MIN),
+            None,
+            "a corrupt durable timestamp must fail validation, not wrap"
+        );
+        // Monotonic time has no relationship to civil time; the bouncer must not
+        // derive one from the other.
+        let clock = VirtualClock::default();
+        assert_eq!(clock.now(), MonoTime(0));
+        assert!(SystemWallClock.now().unix_seconds() > 0);
+    }
+
+    #[test]
+    fn virtual_wall_clock_is_deterministic_and_bounded() {
+        let wall = VirtualWallClock::default();
+        assert_eq!(wall.now(), WallTime(0));
+        assert_eq!(wall.advance(1700000000), Some(WallTime(1700000000)));
+        assert_eq!(wall.now(), WallTime(1700000000));
+        assert_eq!(wall.advance(0), Some(WallTime(1700000000)));
+        // Refusing to leave the window leaves the retained value unchanged.
+        assert_eq!(wall.advance(MAX_WALL_TIME_SECONDS), None);
+        assert_eq!(wall.now(), WallTime(1700000000));
     }
 }

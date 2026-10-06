@@ -312,14 +312,14 @@ Dependencies:
 
 Implementation decomposition:
 
-1. M003-A / Plan 007 — durable storage and identity foundation.
+1. M003-A / Plan 007 — durable storage and identity foundation. **Closed**; see `plans/closure/bouncer-core/007-status.md`.
 2. M003-B / Plan 008 — multi-Network and multi-client ownership.
 3. M003-C / Plan 009 — history journal, cursors, and legacy playback.
 4. M003-D / Plan 010 — response routing and foundational IRCv3 mediation.
 5. M003-E / Plan 011 — chathistory/read-marker adapters.
 6. M003-F / Plan 012 — integrated qualification and M003 closure.
 
-Only the earliest dependency-ready plan is executable at a time. Plan 007 is ready now; Plans 008-012 are registered but blocked on their direct predecessor closure.
+Only the earliest dependency-ready plan is executable at a time. Plan 007 is closed in `plans/closure/bouncer-core/007-status.md`; Plan 008 is the current executable plan and Plans 009-012 remain blocked on their direct predecessor closure.
 
 Deliverable boundary:
 

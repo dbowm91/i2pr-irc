@@ -2,10 +2,10 @@
 """Check source, build scripts, manifests, and dependency trees for forbidden egress.
 
 Every first-party crate that could own network access is scanned, including the
-runtime that owns the upstream connection and the downstream client sockets. The
-positive controls exercise the same predicates and the same crate scoping as the
-real scan, so a future coverage regression fails loudly instead of silently
-narrowing the boundary.
+runtime that owns the upstream connection and the downstream client sockets, and the
+store that opens a third-party native database dependency. The positive controls
+exercise the same predicates and the same crate scoping as the real scan, so a future
+coverage regression fails loudly instead of silently narrowing the boundary.
 """
 from pathlib import Path
 import re
@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
-CRATES=("core","wire","runtime","testkit")
+CRATES=("core","wire","store","runtime","testkit")
 SOURCE_TOKENS=("std::net::Tcp","std::net::Udp","ToSocketAddrs","tokio::net::Tcp","tokio::net::Udp","reqwest","hyper::Client","trust_dns","hickory_resolver","ureq::","socks::")
 DEPENDENCY_NAMES={"reqwest","hyper","hyper-util","ureq","isahc","surf","trust-dns-resolver","hickory-resolver","socks","tokio-socks","async-socks5","smol-hyper"}
 
@@ -67,12 +67,20 @@ def positive_control_failures():
         for crate in CRATES:(fixture/"crates"/crate/"src").mkdir(parents=True)
         (fixture/"crates"/"runtime"/"src"/"lib.rs").write_text("use std::net::TcpStream;\n")
         (fixture/"crates"/"runtime"/"Cargo.toml").write_text("[dependencies]\nreqwest = { version = \"1\" }\n")
+        # The store crate pulls a third-party native dependency, so its scope must be
+        # proven independently rather than assumed from the runtime's coverage.
+        (fixture/"crates"/"store"/"src"/"lib.rs").write_text("use std::net::UdpSocket;\n")
+        (fixture/"crates"/"store"/"Cargo.toml").write_text("[dependencies]\ntrust-dns-resolver = \"1\"\n")
         (fixture/"crates"/"wire"/"src"/"lib.rs").write_text("pub fn clean() {}\n")
         detected=scan_sources(fixture)
         runtime_source=[finding for finding in detected if "crates/runtime/src" in str(finding[0])]
         runtime_manifest=[finding for finding in detected if "crates/runtime/Cargo.toml" in str(finding[0])]
+        store_source=[finding for finding in detected if "crates/store/src" in str(finding[0])]
+        store_manifest=[finding for finding in detected if "crates/store/Cargo.toml" in str(finding[0])]
         if not runtime_source:failures.append("runtime source scope")
         if not runtime_manifest:failures.append("runtime manifest scope")
+        if not store_source:failures.append("store source scope")
+        if not store_manifest:failures.append("store manifest scope")
         if any("crates/wire" in str(finding[0]) for finding in detected):
             failures.append("crate scope over-reports clean fixtures")
     return failures

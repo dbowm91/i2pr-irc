@@ -1,6 +1,6 @@
 # Bouncer Core M003-A — Durable Storage and Identity Foundation
 
-Status: ready for handoff
+Status: closed — see `plans/closure/bouncer-core/007-status.md`
 
 Repository planning baseline: `0cb3354d5e4139a1f3b37a8d0afc10854c6c7686`
 

@@ -1,0 +1,19 @@
+[package]
+name = "i2pr-irc-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+i2pr-irc-core = { path = "../core" }
+i2pr-irc-wire = { path = "../wire" }
+rusqlite = { workspace = true }
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt"] }
+
+[lints]
+workspace = true

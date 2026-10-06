@@ -1,8 +1,8 @@
 # Bouncer Core M003-B — Multi-Network and Multi-Client Ownership
 
-Status: blocked
+Status: ready for handoff
 
-Blocker:
+Blocker cleared:
 
 - `plans/closure/bouncer-core/007-status.md` accepted
 
