@@ -1,6 +1,8 @@
 # Bouncer Core M005-C / Plan 022 — Presence and Preferred-Nick Policy
 
-Status: blocked
+Status: closed
+
+Closure: plans/closure/bouncer-core/022-status.md
 
 Blocker:
 

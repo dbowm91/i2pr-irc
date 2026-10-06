@@ -26,19 +26,20 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M005-C / Plan 022 ready; M005-A and M005-B closed | M004, Corrective 019, Plan 020, and Plan 021 are closed. Research 006 and ADR-0003 freeze M005 control-session/runtime ownership. Plan 020 landed the bounded RuntimeController, pre-bind DownstreamAdmission, one-shot PreparedSession transfer, and schema 3. Plan 021 landed the typed DesiredChannelRecord, schema 4's durable detached flag, and the detach/reattach transitions. Plan 022 is the only dependency-ready M005 handoff; Plans 023-028 remain behind sequential closure gates. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M005-D / Plan 023 ready; M005-A, M005-B, and M005-C closed | M004, Corrective 019, Plan 020, Plan 021, and Plan 022 are closed. Research 006 and ADR-0003 freeze M005 control-session/runtime ownership. Plan 020 landed the bounded RuntimeController, pre-bind DownstreamAdmission, one-shot PreparedSession transfer, and schema 3. Plan 021 landed the typed DesiredChannelRecord, schema 4's durable detached flag, and the detach/reattach transitions. Plan 022 landed schema 5's auto_away and keep_nick policy, per-session active/passive classification with draft/pre-away mediation, owner-scoped manual away, a bounded deterministic nick fallback answered inside the registration window, and MONITOR-assisted or ISON-probed reclaim that a client attaching cannot make poll faster. Plan 023 is the only dependency-ready M005 handoff; Plans 024-028 remain behind sequential closure gates. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M005-C / Plan 022 — Presence and Preferred-Nick Policy | ready | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | |
+| Bouncer Core M005-D / Plan 023 — Bouncer Networks and Local IRC Administration | ready | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M005-C / Plan 022 — Presence and Preferred-Nick Policy | closed | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/022-status.md |
 | Bouncer Core M005-B / Plan 021 — Durable Detached-Channel Policy | closed | invariant + infrastructure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/021-status.md |
 | Bouncer Core M005-A / Plan 020 — Runtime Control and Downstream Admission Foundation | closed | infrastructure + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/020-status.md |
 | Bouncer Core Corrective 019 — Close M004 Findings and Restore Sole-Owner Evidence | closed | invariant + testability corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/019-status.md |
@@ -65,7 +66,6 @@ Canonical direction:
 
 | Plan | Status | Blocker |
 |---|---|---|
-| Bouncer Core M005-D / Plan 023 — Bouncer Networks and Local IRC Administration | blocked | Plan 022 closure |
 | Bouncer Core M005-E / Plan 024 — Indexed History Search and CHATHISTORY Completion | blocked | Plan 023 closure |
 | Bouncer Core M005-F / Plan 025 — Downstream IRCv3 Protocol Polish | blocked | Plan 024 closure |
 | Bouncer Core M005-G / Plan 026 — Richer IRCv3 Member-State Mediation | blocked | Plan 025 closure |
@@ -76,7 +76,7 @@ Router integration remains blocked on M005 closure; see the subsystem table and 
 
 ## Unplanned later milestones
 
-M004 is fully closed, Plans 020 and 021 closed M005-A and M005-B with no open findings, and M005 is fully decomposed into registered Plans 020-028. Only Plan 022 is ready.
+M004 is fully closed, Plans 020, 021, and 022 closed M005-A, M005-B, and M005-C with no open findings, and M005 is fully decomposed into registered Plans 020-028. Only Plan 023 is ready.
 
 The later router milestones remain intentionally outside this handoff:
 
@@ -120,6 +120,6 @@ Implement only:
 - plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md
 - plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md
 
-Research 006 and ADR-0003 freeze the control-session/runtime ownership needed by M005. Plan 020 adds process control and pre-bind admission without moving bound-session or upstream ownership out of NetworkOwner. Plan 021 adds a durable presentation policy for channels the bouncer still holds, without moving membership ownership out of NetworkOwner.
+Research 006 and ADR-0003 freeze the control-session/runtime ownership needed by M005. Plan 020 adds process control and pre-bind admission without moving bound-session or upstream ownership out of NetworkOwner. Plan 021 adds a durable presentation policy for channels the bouncer still holds, without moving membership ownership out of NetworkOwner. Plan 022 adds durable presence and preferred-nick policy, per-session presence classification, and generation-owned reclaim, without moving membership ownership out of NetworkOwner.
 
-Plan 020 is closed at plans/closure/bouncer-core/020-status.md and Plan 021 at plans/closure/bouncer-core/021-status.md, both with no open findings; between them they landed the bounded RuntimeController, the pre-bind DownstreamAdmission, the one-shot PreparedSession transfer, schema 3, the typed DesiredChannelRecord, schema 4's durable detached flag, and the detach/reattach transitions. Plan 022 is unblocked and dependency-ready. Plans 023-028 remain registered behind their sequential closure gates. Router integration remains blocked behind M005 closure, and no router-specific implementation is authorized by the M004 closure, the M005 planning handoff, the Plan 020 closure, or the Plan 021 closure.
+Plan 020 is closed at plans/closure/bouncer-core/020-status.md, Plan 021 at plans/closure/bouncer-core/021-status.md, and Plan 022 at plans/closure/bouncer-core/022-status.md, all with no open findings; between them they landed the bounded RuntimeController, the pre-bind DownstreamAdmission, the one-shot PreparedSession transfer, schema 3, the typed DesiredChannelRecord, schema 4's durable detached flag, the detach/reattach transitions, schema 5's auto_away and keep_nick policy, per-session active/passive classification with draft/pre-away mediation, owner-scoped manual away, a bounded deterministic nick fallback answered inside the registration window, and generation-owned MONITOR/ISON reclaim. Plan 023 is unblocked and dependency-ready. Plans 024-028 remain registered behind their sequential closure gates. Router integration remains blocked behind M005 closure, and no router-specific implementation is authorized by the M004 closure, the M005 planning handoff, or the Plan 020, 021, and 022 closures.
