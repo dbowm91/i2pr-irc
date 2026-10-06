@@ -176,7 +176,22 @@ Research 002 Rust IRC crate/spec conformance
 C003 / Corrective 006 framing recovery + casemapping conformance
   |
   v
-M003 multi-network/multi-client + durable history
+M003-A / 007 storage + durable identity
+  |
+  v
+M003-B / 008 multi-network + multi-client ownership
+  |
+  v
+M003-C / 009 history + cursors + legacy playback
+  |
+  v
+M003-D / 010 response routing + IRCv3 foundation
+  |
+  v
+M003-E / 011 chathistory + read-marker adapters
+  |
+  v
+M003-F / 012 integrated qualification + M003 closure
   |
   v
 M004 anonymity + adverse-network qualification
@@ -292,7 +307,19 @@ Dependencies:
 
 - M002, Corrective 004, Corrective 005, and Corrective 006 closed.
 - Research 002 completed with a recorded production/dev-only/reference/excluded disposition for the candidate IRC crates and no unresolved correctness defect affecting M003.
-- storage dependency/ownership decision reviewed before code.
+- storage/identity research completed in `plans/research/004-m003-storage-multiclient-history-research.md`.
+- persistence consistency and identity ownership accepted in `plans/adrs/ADR-0002-bounded-sqlite-persistence-history-order-and-session-identity.md`.
+
+Implementation decomposition:
+
+1. M003-A / Plan 007 — durable storage and identity foundation.
+2. M003-B / Plan 008 — multi-Network and multi-client ownership.
+3. M003-C / Plan 009 — history journal, cursors, and legacy playback.
+4. M003-D / Plan 010 — response routing and foundational IRCv3 mediation.
+5. M003-E / Plan 011 — chathistory/read-marker adapters.
+6. M003-F / Plan 012 — integrated qualification and M003 closure.
+
+Only the earliest dependency-ready plan is executable at a time. Plan 007 is ready now; Plans 008-012 are registered but blocked on their direct predecessor closure.
 
 Deliverable boundary:
 
@@ -515,6 +542,12 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | C002 / Corrective 005 | closed | plans/implementation/bouncer-core/005-pre-m003-observed-membership-and-downstream-cap-corrective.md | plans/closure/bouncer-core/005-status.md | none |
 | Research 002 | closed | plans/research/002-rust-irc-crate-conformance-plan.md | plans/research/003-rust-irc-crate-conformance-results.md | none |
 | C003 / Corrective 006 | closed | plans/implementation/bouncer-core/006-framing-recovery-corrective.md | plans/closure/bouncer-core/006-status.md | none |
-| M003 | unblocked for planning | future | future | none; no implementation handoff exists yet |
-| M004 | not started | future | future | M003 |
+| M003 | planned / active handoff sequence | plans 007-012 | plans/closure/bouncer-core/012-status.md | Plan 007 ready; later M003 plans sequenced |
+| M003-A / Plan 007 | ready | plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md | plans/closure/bouncer-core/007-status.md | none |
+| M003-B / Plan 008 | blocked | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md | plans/closure/bouncer-core/008-status.md | Plan 007 closure |
+| M003-C / Plan 009 | blocked | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md | plans/closure/bouncer-core/009-status.md | Plan 008 closure |
+| M003-D / Plan 010 | blocked | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md | plans/closure/bouncer-core/010-status.md | Plan 009 closure |
+| M003-E / Plan 011 | blocked | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md | plans/closure/bouncer-core/011-status.md | Plan 010 closure |
+| M003-F / Plan 012 | blocked | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | Plan 011 closure |
+| M004 | not started | future | future | M003 closure |
 | M005 | not started | future | future | M004 |
