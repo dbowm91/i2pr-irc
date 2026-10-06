@@ -1,0 +1,243 @@
+## CV-001 | NICK and USER with no CAP register immediately
+spec: RFC 2812 section 3.1 (NICK, USER), section 4.1.1 (numeric 001)
+status: stable
+utf8: relevant
+why: The baseline for ordinary clients must not regress while CAP is implemented.
+client: NICK bot\r\n
+check: after the preceding client line
+expect: ready=false
+expect: negotiating=false
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+
+## CV-002 | CAP LS before NICK and USER suspends registration
+spec: IRCv3 capability negotiation (stable); RFC 1459 registration sequencing
+status: stable
+utf8: relevant
+why: A client that offers capabilities must be able to send them before the welcome.
+client: CAP LS 302\r\n
+check: after the preceding client line
+expect: ready=false
+expect: negotiating=true
+expect: contains=CAP * LS :
+expect: welcome_count=0
+client: NICK bot\r\n
+check: after the preceding client line
+expect: ready=false
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=false
+expect: welcome_count=0
+expect: absent=001 bot
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=true
+expect: negotiating=false
+expect: welcome_count=1
+
+## CV-003 | USER may precede NICK and registration still waits for CAP END
+spec: IRCv3 capability negotiation (stable)
+status: stable
+utf8: relevant
+why: Clients send NICK and USER in either order.
+client: CAP LS 302\r\n
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=false
+client: NICK bot\r\n
+check: after the preceding client line
+expect: ready=false
+expect: welcome_count=0
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+
+## CV-004 | CAP END alone does not register a client
+spec: IRCv3 capability negotiation (stable)
+status: stable
+utf8: relevant
+why: Negotiation must not substitute for NICK and USER.
+client: CAP LS 302\r\n
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=false
+expect: negotiating=false
+expect: welcome_count=0
+client: NICK bot\r\n
+check: after the preceding client line
+expect: ready=false
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+
+## CV-005 | CAP REQ is refused locally and negotiation continues
+spec: IRCv3 capability negotiation (stable), ACK/NAK semantics
+status: stable
+utf8: relevant
+why: A capability must never be granted without implemented downstream semantics.
+client: CAP LS 302\r\n
+client: CAP REQ :message-tags\r\n
+check: after the preceding client line
+expect: negotiating=true
+expect: contains=CAP * NAK :Unsupported capabilities
+expect: welcome_count=0
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=false
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+
+## CV-006 | The bouncer advertises no downstream capabilities
+spec: IRCv3 capability negotiation (stable)
+status: stable
+utf8: relevant
+why: Advertising an unimplemented capability produces client-visible failures later.
+client: CAP LS 302\r\n
+check: after the preceding client line
+expect: contains=CAP * LS :
+expect: absent=message-tags
+expect: absent=sasl
+expect: absent=away-notify
+
+## CV-007 | CAP LIST reports the empty advertised set
+spec: IRCv3 capability negotiation (stable), LIST subcommand
+status: stable
+utf8: relevant
+why: LIST is a defined subcommand and must not be answered as an invalid command.
+client: CAP LS 302\r\n
+client: CAP LIST\r\n
+check: after the preceding client line
+expect: contains=CAP * LIST :
+expect: absent=410
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=true
+
+## CV-008 | A client-sent ACK is a protocol error, not a negotiation step
+spec: IRCv3 capability negotiation (ACK is server-to-client)
+status: stable
+utf8: relevant
+why: Accepting a client ACK would let a client claim an unrequested capability.
+client: CAP LS 302\r\n
+client: CAP ACK :message-tags\r\n
+check: after the preceding client line
+expect: contains=410
+expect: negotiating=true
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=false
+
+## CV-009 | Repeated CAP LS is deterministic
+spec: IRCv3 capability negotiation (stable)
+status: stable
+utf8: relevant
+why: A chatty client must not cause unbounded replies or state changes.
+client: CAP LS 302\r\n
+client: CAP LS 302\r\n
+client: CAP LS\r\n
+check: after the preceding client line
+expect: negotiating=true
+expect: welcome_count=0
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+
+## CV-010 | A repeated CAP END is harmless
+spec: IRCv3 capability negotiation (stable)
+status: stable
+utf8: relevant
+why: Duplicate terminators are common in client reconnect logic.
+client: CAP LS 302\r\n
+client: CAP END\r\n
+client: CAP END\r\n
+check: after the preceding client line
+expect: ready=false
+expect: negotiating=false
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+
+## CV-011 | A post-registration CAP round does not undo registration
+spec: IRCv3 capability negotiation (stable), post-registration CAP
+status: stable
+utf8: relevant
+why: Later clients renegotiate after registration; the welcome must not be replayed.
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=true
+expect: welcome_count=1
+client: CAP LS 302\r\n
+check: after the preceding client line
+expect: ready=true
+expect: negotiating=false
+expect: welcome_count=1
+expect: contains=CAP bot LS :
+
+## CV-012 | Client PING is answered locally during negotiation
+spec: RFC 2812 section 3.7.2 (PING/PONG)
+status: stable
+utf8: irrelevant
+why: A client waiting on CAP END must still be able to keep its connection alive.
+client: CAP LS 302\r\n
+client: PING :local\r\n
+check: after the preceding client line
+expect: contains=PONG bouncer :local
+expect: ready=false
+
+## CV-013 | A NICK that does not match the upstream nick is not accepted
+spec: RFC 1459 registration; the bouncer owns one upstream identity
+status: stable
+utf8: relevant
+why: A client claiming another identity would misattribute every relayed message.
+client: NICK someone\r\n
+check: after the preceding client line
+expect: ready=false
+client: USER someone 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=false
+expect: welcome_count=0
+
+## CV-014 | SASL PLAIN credentials are only sent when the server offers SASL
+spec: IRCv3 SASL (stable), capability-dependent sequencing
+status: stable
+utf8: irrelevant
+why: Sending credentials to a server that never offered SASL leaks them.
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: ready=true
+expect: absent=AUTHENTICATE PLAIN
+
+## CV-015 | A registration projection contains exactly one welcome
+spec: RFC 2812 section 4.1.1 (numeric 001)
+status: stable
+utf8: relevant
+why: A duplicated welcome confuses multi-capability client state machines.
+state_line: :bot!u@h JOIN #room\r\n
+client: CAP LS 302\r\n
+client: NICK bot\r\n
+client: USER bot 0 * :phone\r\n
+check: after the preceding client line
+expect: welcome_count=0
+client: CAP END\r\n
+check: after the preceding client line
+expect: welcome_count=1
+expect: contains=JOIN #room
+client: PING :after\r\n
+check: after the preceding client line
+expect: welcome_count=1

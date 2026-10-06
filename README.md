@@ -19,3 +19,7 @@ Planning authority begins at:
 M001's bounded wire/domain/time/fault foundations and M002's one-network, one-local-client runtime are closed. The runtime uses injected I2P and local stream capabilities, with CAP/SASL registration, bounded state and queues, liveness, reconnect, and no-replay handling. It is not a complete daemon or router integration. M003 is eligible for planning; follow `plans/registry.md` for current status. See [architecture/overview.md](architecture/overview.md) and the milestone records under `plans/closure/bouncer-core/`.
 
 Research lives under plans/research/. Subsystem roadmaps live under plans/subsystems/. Bounded implementation handoffs live under plans/implementation/, and evidence-based completion records live under plans/closure/.
+
+## Conformance corpus
+
+`research/irc-conformance/` contains an independently authored IRC/IRCv3 conformance corpus derived from primary specifications, plus a committed runner per owned layer. `cargo test -p i2pr-irc-wire --test conformance` and `cargo test -p i2pr-irc-runtime --test conformance` execute it on every test run. External comparisons and per-candidate dispositions live in `research/irc-conformance/results/` and `plans/research/003-rust-irc-crate-conformance-results.md`.

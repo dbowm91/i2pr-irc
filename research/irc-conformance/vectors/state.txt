@@ -1,0 +1,278 @@
+## SV-001 | CASEMAPPING ascii folds only ASCII case
+spec: IRCv3 ISUPPORT CASEMAPPING (ascii)
+status: stable
+utf8: relevant
+why: Nick and channel comparison must follow the mapping the server advertises.
+line: :srv 005 bot CASEMAPPING=ascii\r\n
+nick_same: Bot,bot=true
+nick_same: nick[,nick{=false
+nick_same: nick^,nick~=false
+
+## SV-002 | CASEMAPPING rfc1459 folds the defined character classes
+spec: RFC 1459 casemapping (`{}`, `|`, and `^~` are case pairs); IRCv3 ISUPPORT CASEMAPPING (rfc1459)
+status: stable
+utf8: relevant
+why: The default mapping folds three specific character pairs; a bouncer comparing nicks naively gets this wrong.
+nick_same: Bot,bot=true
+nick_same: nick[,nick{=true
+nick_same: nick],nick}=true
+nick_same: nick^,nick~=true
+nick_same: nick[o[,nick{o[=true
+nick_same: nick[o\,nick[o|=true
+
+## SV-003 | rfc1459-strict stops folding the tilde
+spec: Modern IRC Client Protocol, RPL_ISUPPORT CASEMAPPING parameter (rfc1459-strict)
+status: stable
+utf8: relevant
+why: With rfc1459-strict `bot~` and `bot^` are different nicks; folding them would merge identities.
+line: :srv 005 bot CASEMAPPING=rfc1459-strict\r\n
+nick_same: bot~,bot^=false
+nick_same: nick[,nick{=true
+nick_same: Bot,bot=true
+
+## SV-003b | The older strict-rfc1459 spelling is honored too
+spec: IRC RPL_ISUPPORT draft spelling (strict-rfc1459)
+status: stable
+utf8: relevant
+why: Networks exist that advertise the older spelling; treating it as plain rfc1459 would merge identities.
+line: :srv 005 bot CASEMAPPING=strict-rfc1459\r\n
+nick_same: bot~,bot^=false
+nick_same: nick[,nick{=true
+
+## SV-004 | Default CHANTYPES classifies # and & only
+spec: RFC 2812 section 1.3 (channel types)
+status: stable
+utf8: relevant
+why: A target that is not a channel must not create channel state.
+line: :srv 005 bot CHANTYPES=#&\r\n
+line: :bot!u@h JOIN #room\r\n
+joined: #room
+line: :alice!u@h JOIN +lobby\r\n
+joined: #room
+members: #room: bot
+
+## SV-005 | Advertised CHANTYPES changes live classification
+spec: RFC 2812 section 1.3; ISUPPORT CHANTYPES
+status: stable
+utf8: relevant
+why: Networks that use `+` or `!` channels must be tracked, not silently dropped.
+line: :srv 005 bot CHANTYPES=#&+!\r\n
+line: :bot!u@h JOIN +lobby\r\n
+joined: +lobby
+members: +lobby: bot
+
+## SV-006 | Advertised PREFIX supplies the membership symbol set
+spec: ISUPPORT PREFIX (RFC 2812 section 4.2.2, IRCv3 extension)
+status: stable
+utf8: relevant
+why: Membership projection must use only the advertised symbols, never a hard-coded set.
+line: :srv 005 bot PREFIX=(qaohv)~&@%+\r\n
+line: :srv 353 bot = #room :~Owner &Admin @Op %Half +Voice plain\r\n
+symbols: #room: Owner=~, Admin=&, Op=@, Half=%, Voice=+, plain=
+
+## SV-007 | Malformed PREFIX leaves the previous mapping authoritative
+spec: ISUPPORT PREFIX grammar (balanced parentheses, equal lengths)
+status: stable
+utf8: irrelevant
+why: A malformed token must not silently replace a working mapping.
+line: :srv 005 bot PREFIX=(ov)@+\r\n
+line: :srv 005 bot PREFIX=(ov)@\r\n
+line: :srv 353 bot = #room :bot @Alice\r\n
+symbols: #room: Alice=@, bot=
+
+## SV-008 | Malformed CHANMODES leaves the previous classes authoritative
+spec: ISUPPORT CHANMODES grammar (four groups)
+status: stable
+utf8: irrelevant
+why: Wrong arity guesses would corrupt retained mode state.
+line: :srv 005 bot CHANMODES=beI,k,l,imnpst\r\n
+line: :srv 005 bot CHANMODES=beI,k,l\r\n
+line: :srv 324 bot #room +nt\r\n
+modes: #room: +nt
+modes_complete: #room: true
+
+## SV-009 | Parameterized channel modes keep their arguments
+spec: ISUPPORT CHANMODES class k; RFC 2812 section 4.2.2 (MODE)
+status: stable
+utf8: irrelevant
+why: A bouncer that drops mode arguments projects a false channel state to clients.
+line: :srv 324 bot #room +kl key 42\r\n
+modes: #room: +kl key 42
+modes_complete: #room: true
+
+## SV-010 | An undeclared mode letter makes the snapshot explicitly incomplete
+spec: ISUPPORT CHANMODES; a bouncer must not invent arity
+status: stable
+utf8: irrelevant
+why: Failing closed is required; a false 324 is worse than no 324.
+line: :srv 324 bot #room +nq\r\n
+modes_complete: #room: false
+
+## SV-011 | An authoritative RPL_CHANNELMODEIS restores completeness
+spec: RFC 2812 section 4.2.2 (numeric 324)
+status: stable
+utf8: irrelevant
+why: A later authoritative snapshot must be able to repair an incomplete one.
+line: :srv 324 bot #room +nq\r\n
+modes_complete: #room: false
+line: :srv 324 bot #room +nt\r\n
+modes: #room: +nt
+modes_complete: #room: true
+
+## SV-012 | RPL_NAMREPLY public visibility incorporates members
+spec: RFC 2812 section 3.7.2 (numeric 353)
+status: stable
+utf8: relevant
+why: Public channels are the common case and must be tracked completely.
+line: :srv 353 bot = #room :bot @Alice\r\n
+members: #room: @Alice, bot
+members_complete: #room: true
+
+## SV-013 | RPL_NAMREPLY secret visibility incorporates members
+spec: RFC 2812 section 3.7.2 (numeric 353); RFC 2812 section 4.2.2 (`@` visibility)
+status: stable
+utf8: relevant
+why: `@` is a legal visibility value; dropping it silently loses membership on +q/+S channels.
+line: :srv 353 bot @ #secret :bot @Alice\r\n
+members: #secret: @Alice, bot
+
+## SV-014 | RPL_NAMREPLY unlisted visibility incorporates members
+spec: RFC 2812 section 3.7.2 (numeric 353)
+status: stable
+utf8: relevant
+why: `*` is the third defined visibility value.
+line: :srv 353 bot * #quiet :bot\r\n
+members: #quiet: bot
+
+## SV-015 | An unknown visibility field is ignored without corrupting membership
+spec: RFC 2812 section 3.7.2 (visibility is one of `=`, `*`, `@`)
+status: stable
+utf8: relevant
+why: An unparseable reply must not be applied as if it were valid.
+line: :srv 353 bot = #room :bot @Alice\r\n
+line: :srv 353 bot ! #room :Intruder\r\n
+members: #room: @Alice, bot
+
+## SV-016 | A symbol outside the advertised PREFIX stays part of the nick
+spec: ISUPPORT PREFIX (only advertised symbols are prefixes)
+status: stable
+utf8: irrelevant
+why: Guessing membership symbols corrupts every member's rendered name.
+line: :srv 005 bot PREFIX=(ov)@+\r\n
+line: :srv 353 bot = #room :~Someone bot\r\n
+symbols: #room: ~Someone=, bot=
+members: #room: ~Someone, bot
+
+## SV-017 | A written JOIN is not membership until the server confirms
+spec: RFC 2812 section 3.3 (JOIN); the command itself proves nothing
+status: stable
+utf8: irrelevant
+why: This is the bouncer-specific truthfulness rule that Corrective 005 established.
+line: :bot!u@h JOIN #room\r\n
+joined: #room
+members: #room: bot
+
+## SV-018 | Standard channel-failure numerics are classified without membership
+spec: RFC 2812 section 3.7.2 (numerics 403, 405, 471, 473, 474, 475, 476)
+status: stable
+utf8: relevant
+why: A refused join must be visible as a failure and never projected as a channel.
+line: :srv 471 bot #full :Cannot join channel (+l)\r\n
+line: :srv 403 bot #room :No such channel\r\n
+line: :srv 475 bot #keyed :Cannot join channel (+k)\r\n
+rejected: #full=471, #keyed=475, #room=403
+joined:
+pending:
+
+## SV-019 | A rejection addressed with a different case addresses the same attempt
+spec: IRCv3 casemapping applies to channel names
+status: stable
+utf8: relevant
+why: A server may echo a differently cased channel name than the client sent.
+line: :srv 471 bot #FULL :Cannot join channel (+l)\r\n
+rejected: #FULL=471
+
+## SV-020 | A network-specific numeric is not classified as a join failure
+spec: nothing in the standards makes 437 a channel failure
+status: stable
+utf8: relevant
+why: Inventing classification for unknown numerics would risk misreporting membership.
+line: :srv 437 bot #room :Nick or channel is temporarily unavailable\r\n
+rejected:
+joined:
+
+## SV-021 | Self PART removes observed membership
+spec: RFC 2812 section 3.3 (PART)
+status: stable
+utf8: irrelevant
+why: Leaving a channel must remove it from every future client projection.
+line: :bot!u@h JOIN #room\r\n
+line: :bot!u@h PART #room\r\n
+joined:
+members: #room:
+
+## SV-022 | Being KICKed removes observed membership
+spec: RFC 2812 section 3.3 (KICK)
+status: stable
+utf8: irrelevant
+why: A kick is authoritative evidence that membership ended.
+line: :bot!u@h JOIN #room\r\n
+line: :op!u@h KICK #room bot :bye\r\n
+joined:
+members: #room:
+
+## SV-023 | Nick change is tracked and later events match the new nick
+spec: RFC 2812 section 3.1 (NICK)
+status: stable
+utf8: relevant
+why: Self events after a server-forced nick change must still be attributed correctly.
+line: :bot!u@h JOIN #room\r\n
+line: :bot!u@h NICK bot2\r\n
+line: :bot2!u@h JOIN #room\r\n
+members: #room: bot2
+nick_same: bot2,BOT2=true
+
+## SV-024 | Member ceiling marks the list incomplete rather than growing
+spec: i2pr-irc local ceiling: 2048 members per channel
+status: stable
+utf8: irrelevant
+why: An unbounded member list is a memory-growth vector on a hostile server.
+members_complete: #room: false
+
+## SV-025 | A member limit numeric is observed but creates no membership
+spec: RFC 2812 section 4.2.1 (numeric 367)
+status: stable
+utf8: irrelevant
+why: A channel-limits numeric is server information, not a join confirmation.
+line: :srv 367 bot #room 42\r\n
+joined:
+
+## SV-026 | ISUPPORT tokens are retained in a bounded set
+spec: RFC 2812 section 4.2.1 (numeric 005)
+status: stable
+utf8: irrelevant
+why: M003 must persist what the server advertised; the token set must stay bounded.
+line: :srv 005 bot CASEMAPPING=rfc1459\r\n
+line: :srv 005 bot CHANTYPES=#&\r\n
+line: :srv 005 bot PREFIX=(ov)@+\r\n
+line: :srv 005 bot CHANMODES=beI,k,l,imnpst\r\n
+line: :srv 005 bot NETWORK=i2p\r\n
+isupport: CASEMAPPING=rfc1459 CHANTYPES=#& PREFIX=(ov)@+ CHANMODES=beI,k,l,imnpst NETWORK=i2p
+
+## SV-027 | A topic larger than the local ceiling is omitted, not truncated
+spec: i2pr-irc local ceiling: 400-byte topics
+status: stable
+utf8: irrelevant
+why: A silently truncated topic is indistinguishable from a real short topic.
+line: :srv 332 bot #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n
+topic: #room: -
+
+## SV-028 | An authoritative self JOIN confirms a written desired attempt
+spec: RFC 2812 section 3.3 (JOIN echo for our own nick)
+status: stable
+utf8: irrelevant
+why: The positive authority for desired-state reconciliation after M003 persistence.
+line: :bot!u@h JOIN #room\r\n
+joined: #room
+pending:
+rejected:

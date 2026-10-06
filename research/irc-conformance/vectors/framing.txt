@@ -1,0 +1,123 @@
+## WF-001 | A line split across three chunks is decoded once
+spec: RFC 2812 section 2.3; incremental stream framing
+status: stable
+utf8: irrelevant
+why: A bouncer reads a live stream, so partial frames are the normal case.
+chunks: PIN|G :hel|lo\r\n
+lines: 1
+line: PING :hello
+
+## WF-002 | Two complete lines in one chunk are both delivered
+spec: RFC 2812 section 2.3
+status: stable
+utf8: irrelevant
+why: Coalesced reads must not lose the second message.
+chunks: PING :a\r\nPING :b\r\n
+lines: 2
+line: PING :a
+line: PING :b
+
+## WF-003 | One line per chunk boundary
+spec: RFC 2812 section 2.3
+status: stable
+utf8: irrelevant
+why: Chunk-aligned framing is the baseline for deterministic tests.
+chunks: PING :a\r\n|PING :b\r\n
+lines: 2
+line: PING :a
+line: PING :b
+
+## WF-004 | An over-long line is rejected through its terminating LF and the next line decodes
+spec: RFC 2812 section 2.3 (512 octets including CR-LF); RFC 2812 section 2.3 framing recovery
+status: stable
+utf8: irrelevant
+why: A hostile peer must not be able to desynchronize framing permanently.
+chunks: PRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\nPING :after\r\n
+lines: 1
+line_reject: oversized
+line: PING :after
+
+## WF-005 | A NUL byte mid-line is rejected and framing resumes
+spec: RFC 2812 section 2.3 (NUL is not permitted in a message)
+status: stable
+utf8: irrelevant
+why: Framing recovery must not depend on the rejected content being printable.
+chunks: PRIV\0MSG #room :hi\r\nPING :after\r\n
+lines: 1
+line_reject: nul
+line: PING :after
+
+## WF-006 | An empty chunk changes nothing
+spec: incremental stream framing
+status: stable
+utf8: irrelevant
+why: Empty reads are normal on a live socket and must not produce or drop frames.
+chunks: |PING :a\r\n
+lines: 1
+line: PING :a
+
+## WF-007 | A tagged line split inside the tag prefix
+spec: IRCv3 message-tags (tag prefix precedes the command)
+status: stable
+utf8: relevant
+why: Tag bytes and body bytes stream separately; the split may land anywhere.
+chunks: @key=va|lue :srv 001 bot :Welcome\r\n
+lines: 1
+line: @key=value :srv 001 bot :Welcome
+
+## WF-008 | An unterminated line produces nothing yet
+spec: RFC 2812 section 2.3
+status: stable
+utf8: irrelevant
+why: Partial frames must be buffered, not delivered or discarded.
+chunks: PING :partial
+lines: 0
+
+## WF-009 | A trailing line without CRLF is not delivered
+spec: RFC 2812 section 2.3 (CR-LF terminates a message)
+status: stable
+utf8: irrelevant
+why: Delivering an unterminated line would let a peer split a message at will.
+chunks: PING :a\r\nPING :b
+lines: 1
+line: PING :a
+
+## WF-010 | A NUL-only line is rejected without killing the stream
+spec: RFC 2812 section 2.3
+status: stable
+utf8: irrelevant
+why: NUL-only padding is a cheap probe against implementations that index strings.
+chunks: \0\r\nPING :after\r\n
+lines: 1
+line_reject: nul
+line: PING :after
+
+## WF-012 | Consecutive over-long lines each cost exactly one error
+spec: RFC 2812 section 2.3; framing recovery
+status: stable
+utf8: irrelevant
+why: A repeated hostile pattern must not accumulate error or line loss.
+chunks: PRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\nPRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\nPING :after\r\n
+lines: 1
+line_reject: oversized
+line_reject: oversized
+line: PING :after
+
+## WF-013 | An over-long line split across chunks still recovers at its own terminator
+spec: RFC 2812 section 2.3; incremental framing
+status: stable
+utf8: irrelevant
+why: Chunk boundaries must not change framing-recovery semantics.
+chunks: PRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\nPING :after\r\n
+lines: 1
+line_reject: oversized
+line: PING :after
+
+## WF-014 | Per-push decode overload is explicit and drops only the remainder
+spec: i2pr-irc local ceiling: 256 decoded messages per push
+status: stable
+utf8: irrelevant
+why: A single oversized push must be refused explicitly rather than buffered without limit.
+chunks: PING :a\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\r\nPING :b\nPING :b\r\n
+lines: 256
+line_reject: too_many_messages

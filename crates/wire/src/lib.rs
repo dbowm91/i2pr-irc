@@ -396,7 +396,11 @@ impl LineDecoder {
             };
             if self.buf.len() > cap {
                 self.buf.clear();
-                self.dropping = true;
+                // An over-long line is discarded through its own terminating LF.
+                // When the overflowing byte is that LF the line is already complete,
+                // so the next byte starts a fresh line; otherwise the rest of this
+                // line is still pending and must be dropped through its LF.
+                self.dropping = *byte != b'\n';
                 if out.len() == MAX_DECODED_MESSAGES_PER_PUSH {
                     self.dropping = bytes[index + 1..].last().is_some_and(|tail| *tail != b'\n');
                     out.push(Err(WireError::TooManyMessages));
@@ -641,6 +645,86 @@ mod tests {
         assert!(out[0].is_err());
         assert!(out[1].is_ok());
         assert!(d.buffered_len() <= MAX_TAGGED_LINE_BYTES);
+    }
+    #[test]
+    fn an_over_long_line_is_discarded_through_its_own_terminator_only() {
+        // The byte that overflows the ceiling is often the line's own LF. Recovery
+        // must not then wait for a second LF, which would silently discard the
+        // following real line.
+        let mut decoder = LineDecoder::default();
+        let mut input = vec![b'A'; MAX_LINE_BYTES + 1];
+        input.extend_from_slice(b"\r\nPING :after\r\n");
+        let out = decoder.push(&input);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], Err(WireError::TooLong));
+        assert_eq!(
+            out[1].as_ref().expect("second line decodes"),
+            b"PING :after\r\n"
+        );
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+    #[test]
+    fn a_mid_line_overflow_discards_through_the_pending_terminator() {
+        let mut decoder = LineDecoder::default();
+        let mut input = vec![b'A'; MAX_LINE_BYTES + 1];
+        input.extend_from_slice(b"tail\r\nPING :after\r\n");
+        let out = decoder.push(&input);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], Err(WireError::TooLong));
+        assert_eq!(
+            out[1].as_ref().expect("second line decodes"),
+            b"PING :after\r\n"
+        );
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+    #[test]
+    fn consecutive_over_long_lines_cost_exactly_one_error_each() {
+        let mut decoder = LineDecoder::default();
+        let mut input = Vec::new();
+        for index in 0..3 {
+            input.extend(std::iter::repeat_n(b'A', MAX_LINE_BYTES + index));
+            input.extend_from_slice(b"\r\n");
+        }
+        input.extend_from_slice(b"PING :after\r\n");
+        let out = decoder.push(&input);
+        assert_eq!(out.len(), 4, "{out:?}");
+        for item in &out[..3] {
+            assert_eq!(item, &Err(WireError::TooLong));
+        }
+        assert_eq!(
+            out[3].as_ref().expect("last line decodes"),
+            b"PING :after\r\n"
+        );
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+    #[test]
+    fn an_over_long_line_split_across_chunks_still_recovers() {
+        let mut decoder = LineDecoder::default();
+        let mut head = vec![b'A'; MAX_LINE_BYTES + 1];
+        head.push(b't');
+        assert_eq!(decoder.push(&head), vec![Err(WireError::TooLong)]);
+        let mut tail = b"ail\r\nPING :after\r\n".to_vec();
+        tail.extend_from_slice(&[b'B'; MAX_TAGGED_LINE_BYTES]);
+        let out = decoder.push(&tail);
+        assert_eq!(out[0].as_ref().expect("recovered line"), b"PING :after\r\n");
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+    #[test]
+    fn a_tagged_over_long_line_recovers_at_its_own_terminator() {
+        // A tagged line uses the larger aggregate ceiling, so its terminator can
+        // overflow for the same reason.
+        let mut decoder = LineDecoder::default();
+        let mut input = b"@".to_vec();
+        input.extend(std::iter::repeat_n(b'A', MAX_TAGGED_LINE_BYTES));
+        input.extend_from_slice(b"\r\nPING :after\r\n");
+        let out = decoder.push(&input);
+        assert_eq!(out.len(), 2, "{:?}", out.len());
+        assert_eq!(out[0], Err(WireError::TooLong));
+        assert_eq!(
+            out[1].as_ref().expect("second line decodes"),
+            b"PING :after\r\n"
+        );
+        assert_eq!(decoder.buffered_len(), 0);
     }
     #[test]
     fn line_decoder_bounds_outputs_per_push() {

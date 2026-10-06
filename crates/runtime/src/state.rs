@@ -723,7 +723,13 @@ impl NetworkState {
         if let Some(value) = token.strip_prefix("CASEMAPPING=") {
             self.casemapping = match value {
                 "ascii" => Casemapping::Ascii,
-                "strict-rfc1459" => Casemapping::StrictRfc1459,
+                // Both spellings are accepted: `rfc1459-strict` is the Modern IRC
+                // Client Protocol value and `strict-rfc1459` is the older
+                // RPL_ISUPPORT draft spelling. Folding `~`/`^` when the server
+                // said they are distinct would merge two identities, so an
+                // unrecognized spelling keeps the rfc1459 default rather than
+                // silently claiming strictness.
+                "rfc1459-strict" | "strict-rfc1459" => Casemapping::StrictRfc1459,
                 _ => Casemapping::Rfc1459,
             };
         } else if let Some(value) = token.strip_prefix("CHANTYPES=")
@@ -1107,6 +1113,27 @@ mod tests {
         state.apply_line(&line(b":srv MODE #room +v Stranger\r\n"));
         assert!(!state.channels["#room"].members_complete);
         assert!(!state.channels["#room"].modes.is_complete());
+    }
+
+    #[test]
+    fn both_strict_casemapping_spellings_are_honored() {
+        // The Modern IRC Client Protocol spells the value `rfc1459-strict`; the
+        // older RPL_ISUPPORT draft spells it `strict-rfc1459`. Recognizing only
+        // one of them folds `~`/`^` on a network that said they are distinct,
+        // which silently merges two identities.
+        for token in ["CASEMAPPING=rfc1459-strict", "CASEMAPPING=strict-rfc1459"] {
+            let mut state = NetworkState::new("bot", &[]);
+            state.apply_line(&line(format!(":srv 005 bot {token}\r\n").as_bytes()));
+            assert!(!state.same_nick("bot~", "bot^"), "{token}");
+            assert!(state.same_nick("bot[", "bot{"), "{token}");
+            assert!(state.same_nick("Bot", "bot"), "{token}");
+        }
+        // An unrecognized value keeps the documented rfc1459 default rather than
+        // claiming strictness the server never promised.
+        let mut state = NetworkState::new("bot", &[]);
+        state.apply_line(&line(b":srv 005 bot CASEMAPPING=rfc7613\r\n"));
+        assert!(state.same_nick("bot~", "bot^"));
+        assert!(state.same_nick("bot[", "bot{"));
     }
 
     #[test]

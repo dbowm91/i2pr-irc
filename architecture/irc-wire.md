@@ -6,7 +6,11 @@ The owned codec is byte-oriented and does not require UTF-8 for ordinary command
 
 RFC 2812 §2.3 limits an ordinary message body including CRLF to 512 bytes. IRCv3 Message Tags gives a separate 8191-byte maximum for the tag prefix including `@` and its terminating space; the remaining IRC message still has the 512-byte limit. Thus the maximum aggregate tagged line is 8703 bytes, checked as two independent regions. The tag data sent by a client and the tag data added by a server are each bounded to 4094 bytes by the direction-specific validator. The parser's overall structural region is bounded independently so it can represent relayed client-only and server tags.
 
-The current implementation also freezes maximum parameter count at 15, distinct tag-key count at 128, and token/prefix length at 512 bytes. These are local resource ceilings, not IRC protocol claims. Oversized lines are rejected and discarded through LF; a subsequent complete valid line can be decoded without retaining attacker-sized input. A single `push()` returns at most 256 decoded messages plus one `TooManyMessages` error; on that overload it discards the rest of that input chunk and, if needed, discards through the next LF to restore framing.
+The current implementation also freezes maximum parameter count at 15, distinct tag-key count at 128, and token/prefix length at 512 bytes. These are local resource ceilings, not IRC protocol claims. Oversized lines are rejected and discarded through their own terminating LF, so the first complete line after an over-long one still decodes. A single `push()` returns at most 256 decoded messages plus one `TooManyMessages` error; on that overload it discards the rest of that input chunk and, if needed, discards through the next LF to restore framing.
+
+A command token is either alphabetic or an exactly three-digit numeric, so a four-digit or two-digit numeric is rejected rather than relayed as an unknown command. Unknown alphabetic commands and unknown three-digit numerics are preserved verbatim and re-encode byte-identically.
+
+`research/irc-conformance/` holds the independently authored conformance corpus for this layer, including the size boundaries, tag semantics, and framing-recovery cases above. `cargo test -p i2pr-irc-wire --test conformance` executes it against the owned codec.
 
 ## Representation and preservation
 

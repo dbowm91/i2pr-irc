@@ -1,0 +1,336 @@
+## WV-001 | Two-parameter server command without a prefix
+spec: RFC 2812 section 2.3 (message format), section 3.7.2 (PING)
+status: stable
+utf8: relevant
+why: Baseline shape for every server line the runtime parses into observed state.
+input: PING :hello\r\n
+expect: ok
+command: PING
+param: hello
+
+## WV-002 | Prefix with nick, user, and host
+spec: RFC 2812 section 2.3 (prefix), section 3.1 (prefix formats)
+status: stable
+utf8: relevant
+why: Membership attribution depends on the prefix nick, not on free-form text.
+input: :alice!user@host JOIN #room\r\n
+expect: ok
+prefix: alice!user@host
+command: JOIN
+param: #room
+
+## WV-003 | Trailing parameter containing spaces
+spec: RFC 2812 section 2.3 (parameters, trailing form)
+status: stable
+utf8: relevant
+why: Chat and topic text is relayed verbatim; spaces must not be split.
+input: :alice!user@host PRIVMSG #room :hello there  general\r\n
+expect: ok
+prefix: alice!user@host
+command: PRIVMSG
+param: #room
+param: hello there  general
+
+## WV-004 | Empty trailing parameter
+spec: RFC 2812 section 2.3 (trailing parameter may be empty)
+status: stable
+utf8: relevant
+why: An empty final parameter is legal and must not be dropped or turned into an error.
+input: :alice!user@host PRIVMSG #room :\r\n
+expect: ok
+command: PRIVMSG
+param: #room
+param:
+
+## WV-005 | Middle parameter containing a colon
+spec: RFC 2812 section 2.3 (only the final parameter may begin with a colon)
+status: stable
+utf8: relevant
+why: A colon in a middle position is an ordinary byte, not a trailing marker.
+input: :alice!user@host PRIVMSG #room a:b :trailing\r\n
+expect: ok
+command: PRIVMSG
+param: #room
+param: a:b
+param: trailing
+
+## WV-006 | Unknown command is preserved
+spec: RFC 2812 section 2.3 (command is an opaque token)
+status: stable
+utf8: relevant
+why: Extensions must stay representable so the bouncer can relay them unchanged.
+input: :srv SOMENEWTHING #room\r\n
+expect: ok
+prefix: srv
+command: SOMENEWTHING
+param: #room
+
+## WV-007 | Unknown numeric is preserved with its parameters
+spec: RFC 2812 section 2.3 (numeric replies are commands)
+status: stable
+utf8: relevant
+why: Network-specific numerics must remain visible rather than being rejected.
+input: :srv 437 bot #room :Nick or channel is temporarily unavailable\r\n
+expect: ok
+command: 437
+param: bot
+param: #room
+param: Nick or channel is temporarily unavailable
+
+## WV-008 | RPL_NAMREPLY with secret visibility
+spec: RFC 2812 section 3.7.2 (RPL_NAMREPLY 353), RFC 2812 section 4.2.2
+status: stable
+utf8: relevant
+why: The visibility field is a reply-grammar value that must be preserved for membership.
+input: :srv 353 bot @ #secret :@Alice bot\r\n
+expect: ok
+command: 353
+param: bot
+param: @
+param: #secret
+param: @Alice bot
+
+## WV-009 | Maximum parameter count is accepted
+spec: RFC 2812 section 2.3 (message has at most 15 parameters)
+status: stable
+utf8: irrelevant
+why: A relayed 15-parameter message must not be truncated or rejected.
+input: JOIN #a #b #c #d #e #f #g #h #i #j #k #l #m #n\r\n
+expect: ok
+command: JOIN
+param: #a
+param: #b
+param: #c
+param: #d
+param: #e
+param: #f
+param: #g
+param: #h
+param: #i
+param: #j
+param: #k
+param: #l
+param: #m
+param: #n
+
+## WV-010 | Maximum body length including CRLF is accepted
+spec: RFC 2812 section 2.3 (512 octets including CR-LF)
+status: stable
+utf8: irrelevant
+why: The boundary case must parse; the owned codec claims exactly this ceiling.
+input: PRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n
+expect: ok
+command: PRIVMSG
+param: #room
+param: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+## WV-011 | Numeric reply with an empty final parameter
+spec: RFC 2812 section 2.3 (trailing parameter may be empty)
+status: stable
+utf8: relevant
+why: Numerics with empty text are common in real server output.
+input: :srv 366 bot #room :\r\n
+expect: ok
+command: 366
+param: bot
+param: #room
+param:
+
+## WV-012 | Server-time tag is retained as an opaque tag
+spec: IRCv3 server-time (stable)
+status: stable
+utf8: relevant
+why: M003 needs timestamps; the tag must survive parsing untouched.
+input: @time=2026-03-03T21:38:11.055Z :srv 001 bot :Welcome\r\n
+expect: ok
+tag: time=2026-03-03T21:38:11.055Z
+command: 001
+param: bot
+param: Welcome
+
+## WV-013 | Vendor-prefixed tag with a plus prefix is retained
+spec: IRCv3 message-tags (vendor prefix with `+`)
+status: stable
+utf8: relevant
+why: Vendor tags must not be dropped by a relay.
+input: @+draft/reply=abc :srv 001 bot :Welcome\r\n
+expect: ok
+tag: +draft/reply=abc
+command: 001
+
+## WV-014 | Valueless tag key is retained
+spec: IRCv3 message-tags (a tag key with no `=` has no value)
+status: stable
+utf8: relevant
+why: Presence-only tags are used by capability and notification mechanisms.
+input: @draft/reply :srv NOTICE * :hi\r\n
+expect: ok
+tag: draft/reply
+command: NOTICE
+
+## WV-015 | Empty tag value is retained as a key with no value
+spec: IRCv3 message-tags (an empty value is treated as absence of a value)
+status: stable
+utf8: relevant
+why: `key=` and bare `key` are equivalent; the distinction must not corrupt state.
+input: @key= :srv NOTICE * :hi\r\n
+expect: ok
+tag: key
+command: NOTICE
+
+## WV-016 | Duplicate tag keys retain the final value
+spec: IRCv3 message-tags (only one value per key is transmitted)
+status: stable
+utf8: relevant
+why: A relay must not emit two conflicting values for one key.
+input: @key=first;key=second :srv NOTICE * :hi\r\n
+expect: ok
+tag: key=second
+command: NOTICE
+
+## WV-017 | Escaped tag values are unescaped
+spec: IRCv3 message-tags (escaping of `;`, space, backslash, CR, LF)
+status: stable
+utf8: relevant
+why: Batch and history identifiers contain separators that must be escaped on the wire.
+input: @key=a\\:b\\sc :srv NOTICE * :hi\r\n
+expect: ok
+tag: key=a;b c
+command: NOTICE
+
+## WV-018 | An invalid tag escape discards the backslash
+spec: IRCv3 message-tags (an unknown escape drops the backslash)
+status: stable
+utf8: relevant
+why: A malformed escape must not change framing or leak a literal backslash.
+input: @key=a\\qb :srv NOTICE * :hi\r\n
+expect: ok
+tag: key=aqb
+command: NOTICE
+
+## WV-019 | A final lone backslash in a tag value emits no byte
+spec: IRCv3 message-tags (a lone trailing backslash is discarded)
+status: stable
+utf8: relevant
+why: Truncated tag data must not append a stray byte to the value.
+input: @key=abc\\ :srv NOTICE * :hi\r\n
+expect: ok
+tag: key=abc
+command: NOTICE
+
+## WV-020 | Invalid UTF-8 in an ordinary parameter stays byte-oriented
+spec: RFC 2812 section 2.3; i2pr-irc policy: ordinary fields are bytes
+status: stable
+utf8: relevant
+why: A hostile or binary relay must not force lossy transcoding of client bytes.
+input: PRIVMSG #room :A\xffB\r\n
+expect: ok
+command: PRIVMSG
+param: #room
+param: A\xffB
+
+## WV-021 | Invalid UTF-8 in a tag value keeps the key and drops the value
+spec: IRCv3 message-tags (invalid tag data may be dropped)
+status: stable
+utf8: relevant
+why: The specified drop-value behavior must not remove the key itself.
+input: @key=\xffbad :srv NOTICE * :hi\r\n
+expect: ok
+tag: key
+command: NOTICE
+
+## WV-022 | NUL is rejected anywhere in the line
+spec: RFC 2812 section 2.3; RFC 2812 section 2.3 forbids NUL in the message
+status: stable
+utf8: irrelevant
+why: NUL truncation attacks must not survive framing.
+input: PRIV\0MSG #room :hi\r\n
+expect: reject
+
+## WV-023 | Embedded carriage return is rejected
+spec: RFC 2812 section 2.3 (CR and LF are message delimiters only)
+status: stable
+utf8: irrelevant
+why: An embedded CR would let a peer forge message boundaries.
+input: PRIVMSG #ro\r om :hi\r\n
+expect: reject
+
+## WV-024 | Embedded line feed is rejected
+spec: RFC 2812 section 2.3 (LF terminates the message)
+status: stable
+utf8: irrelevant
+why: An embedded LF must not split one input line into two messages.
+input: PRIVMSG #room :hi\nthere\r\n
+expect: reject
+
+## WV-025 | Body of 511 bytes plus CRLF exceeds the 512-byte limit
+spec: RFC 2812 section 2.3 (512 octets including CR-LF)
+status: stable
+utf8: irrelevant
+why: The first rejected size is the exact boundary of the documented ceiling.
+input: PRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n
+expect: reject
+
+## WV-026 | Sixteen parameters exceed the limit
+spec: RFC 2812 section 2.3 (at most 15 parameters)
+status: stable
+utf8: irrelevant
+why: Excess parameters must be rejected rather than silently truncated.
+input: JOIN #a #b #c #d #e #f #g #h #i #j #k #l #m #n #o #p\r\n
+expect: reject
+
+## WV-027 | A single parameter longer than 512 bytes is rejected
+spec: i2pr-irc local ceiling: token and prefix length 512 bytes
+status: stable
+utf8: irrelevant
+why: A single unbounded token would be a memory-growth vector for a bouncer.
+input: PRIVMSG #room :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n
+expect: reject
+
+## WV-028 | A line with no command is rejected
+spec: RFC 2812 section 2.3 (a command is required)
+status: stable
+utf8: irrelevant
+why: An empty command cannot be dispatched and must not become a phantom message.
+input: :srv\r\n
+expect: reject
+
+## WV-029 | An empty line is rejected
+spec: RFC 2812 section 2.3
+status: stable
+utf8: irrelevant
+why: Blank lines must not produce messages.
+input: \r\n
+expect: reject
+
+## WV-030 | A leading-colon-only trailing parameter is legal
+spec: RFC 2812 section 2.3 (trailing parameter is introduced by a colon)
+status: stable
+utf8: relevant
+why: `:` as an entire trailing parameter is common in client protocol exchanges.
+input: CAP LS :\r\n
+expect: ok
+command: CAP
+param: LS
+param:
+
+## WV-031 | SASL payload survives as an opaque parameter
+spec: RFC 2812 section 31; IRCv3 SASL PLAIN (stable)
+status: stable
+utf8: relevant
+why: SASL base64 must be relayed without transformation; secrets must never be logged.
+input: AUTHENTICATE PLAIN\r\n
+expect: ok
+command: AUTHENTICATE
+param: PLAIN
+
+## WV-032 | Capability name with a plus prefix is an ordinary parameter
+spec: IRCv3 capability negotiation (stable)
+status: stable
+utf8: relevant
+why: `+draft/x` names must remain intact through parsing and projection.
+input: CAP REQ :message-tags away-notify +draft/chathistory\r\n
+expect: ok
+command: CAP
+param: REQ
+param: message-tags away-notify +draft/chathistory
