@@ -82,6 +82,7 @@ dependencies = [
  "async-trait",
  "base64",
  "i2pr-irc-core",
+ "i2pr-irc-store",
  "i2pr-irc-testkit",
  "i2pr-irc-wire",
  "thiserror",

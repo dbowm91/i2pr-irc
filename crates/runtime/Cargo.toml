@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 [dependencies]
 i2pr-irc-core = { path = "../core" }
+i2pr-irc-store = { path = "../store" }
 i2pr-irc-wire = { path = "../wire" }
 tokio.workspace = true
 thiserror.workspace = true

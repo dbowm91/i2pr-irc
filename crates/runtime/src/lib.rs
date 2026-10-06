@@ -4,7 +4,11 @@
 //! across connection generations. `LocalAcceptor` supplies at most one disposable
 //! downstream view at a time; client attachment is never a precondition for the
 //! upstream session and client detach never ends the upstream generation.
+pub mod catalog;
 pub mod downstream;
+pub mod owner;
+pub mod projection;
+pub mod session;
 pub mod state;
 
 use crate::downstream::{
@@ -812,7 +816,19 @@ async fn client_writer_exit(session_writer: &mut Option<SessionWriter>) -> Optio
     }
 }
 
-async fn stopped(stop: &mut watch::Receiver<bool>) {
+/// Applies a bounded deadline to a future that would otherwise park indefinitely.
+///
+/// A wall-clock timeout is used deliberately here: these are real network and I/O
+/// deadlines, and a virtual monotonic clock must not be able to expire them without
+/// the test actually advancing it.
+pub(crate) async fn timeout_bounded<T>(
+    duration: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(duration, future).await
+}
+
+pub(crate) async fn stopped(stop: &mut watch::Receiver<bool>) {
     loop {
         if *stop.borrow() {
             return;
@@ -822,7 +838,7 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
         }
     }
 }
-fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
+pub(crate) fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
     match error {
         Err(RuntimeError::Provider(_)) => "provider",
         Err(RuntimeError::Timeout) => "timeout",
@@ -850,7 +866,10 @@ pub(crate) fn valid_client_nick(bytes: &[u8]) -> bool {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || special(*b) || *b == b'-')
 }
-fn queue_control(sender: &mpsc::Sender<Vec<u8>>, line: &str) -> Result<(), RuntimeError> {
+pub(crate) fn queue_control(
+    sender: &mpsc::Sender<Vec<u8>>,
+    line: &str,
+) -> Result<(), RuntimeError> {
     if line.len() > i2pr_irc_wire::MAX_LINE_BYTES || !line.ends_with("\r\n") {
         return Err(RuntimeError::Protocol);
     }

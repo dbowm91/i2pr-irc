@@ -48,6 +48,17 @@ impl StoreError {
     }
 }
 
+impl CommitState {
+    /// Stable, non-secret classification for a local error reply.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::RolledBack => "rolled-back",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
 pub enum StoreErrorKind {
     /// The bounded ingress queue is full. Callers degrade explicitly; they never

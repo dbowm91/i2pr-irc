@@ -1,8 +1,8 @@
 # Bouncer Core M003-C — History Journal, Cursors, and Legacy Playback
 
-Status: blocked
+Status: ready for handoff
 
-Blocker:
+Blocker cleared:
 
 - `plans/closure/bouncer-core/008-status.md` accepted
 
