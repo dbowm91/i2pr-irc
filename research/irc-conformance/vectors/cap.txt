@@ -78,9 +78,9 @@ expect: welcome_count=1
 spec: IRCv3 capability negotiation (stable), ACK/NAK semantics
 status: stable
 utf8: relevant
-why: A capability must never be granted without implemented downstream semantics.
+why: A capability must never be granted without implemented downstream semantics. `echo-message` is requested upstream but is not served downstream, so it stands as the refusal case after M004-A promoted the tag surface.
 client: CAP LS 302\r\n
-client: CAP REQ :message-tags\r\n
+client: CAP REQ :echo-message\r\n
 check: after the preceding client line
 expect: negotiating=true
 expect: contains=CAP * NAK :Unsupported capabilities
@@ -94,16 +94,18 @@ check: after the preceding client line
 expect: ready=true
 expect: welcome_count=1
 
-## CV-006 | The bouncer advertises no downstream capabilities
+## CV-006 | The bouncer advertises only implemented downstream capabilities
 spec: IRCv3 capability negotiation (stable)
 status: stable
 utf8: relevant
-why: Advertising an unimplemented capability produces client-visible failures later.
+why: Advertising an unimplemented capability produces client-visible failures later. The served set is the history drafts plus the tag surface; anything not served must stay out of `CAP LS`.
 client: CAP LS 302\r\n
 check: after the preceding client line
 expect: contains=CAP * LS :
-expect: absent=message-tags
+expect: contains=message-tags
+expect: contains=labeled-response
 expect: absent=sasl
+expect: absent=echo-message
 expect: absent=away-notify
 
 ## CV-007 | CAP LIST reports the empty advertised set

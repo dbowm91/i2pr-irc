@@ -7,6 +7,7 @@
 pub mod capability;
 pub mod catalog;
 pub mod chathistory;
+pub mod ctcp;
 pub mod downstream;
 pub mod ircv3;
 pub mod journal;
@@ -787,16 +788,56 @@ fn apply_upstream_line<D: ByteStream>(
         }
         LineOutcome::Malformed => return Err(RuntimeError::Protocol),
     }
+    // CTCP privacy policy is applied before any client sees the frame, so a metadata
+    // probe never reaches a client that would answer it with its own hostname and
+    // software. The legacy supervisor shares this policy with the production owner
+    // rather than having its own: two network implementations must not disagree about
+    // what a client may observe.
+    let direction = match &message.command[..] {
+        [b'N', b'O', b'T', b'I', b'C', b'E'] => crate::ctcp::CtcpDirection::Reply,
+        _ => crate::ctcp::CtcpDirection::Query,
+    };
+    match crate::ctcp::inbound_action(&crate::ctcp::classify(message, direction)) {
+        crate::ctcp::InboundAction::FanOut => {}
+        crate::ctcp::InboundAction::Suppress => return Ok(None),
+        crate::ctcp::InboundAction::AnswerPing(_) => {
+            let ctcp = crate::ctcp::classify(message, direction);
+            let token = crate::ctcp::ping_reply_text(&ctcp).unwrap_or_default();
+            let target = message
+                .prefix
+                .as_deref()
+                .map(|prefix| {
+                    let split = prefix
+                        .iter()
+                        .position(|byte| *byte == b'!')
+                        .unwrap_or(prefix.len());
+                    String::from_utf8_lossy(&prefix[..split]).into_owned()
+                })
+                .filter(|sender| !sender.is_empty())
+                .unwrap_or_else(|| state.nick.clone());
+            queue_control(
+                control_tx,
+                &format!(":bouncer NOTICE {target} :\u{1}PING {token}\u{1}\r\n"),
+            )?;
+            return Ok(None);
+        }
+    }
     let Some(session) = session.filter(|session| session.is_ready()) else {
         return Ok(None);
     };
-    // Message-tag semantics are not advertised downstream, so tags are removed.
-    let outgoing = if message.tags.is_empty() {
-        raw
+    // Message-tag semantics are per session: a client that negotiated `message-tags`
+    // receives tags, and a client that did not never sees one.
+    let wants_tags = session.capabilities().negotiated_tags();
+    let outgoing = if message.tags.is_empty() || !wants_tags {
+        if message.tags.is_empty() {
+            raw
+        } else {
+            let mut untagged = message.clone();
+            untagged.tags.clear();
+            untagged.encode().map_err(|_| RuntimeError::Protocol)?
+        }
     } else {
-        let mut untagged = message.clone();
-        untagged.tags.clear();
-        untagged.encode().map_err(|_| RuntimeError::Protocol)?
+        message.encode().map_err(|_| RuntimeError::Protocol)?
     };
     match session.forward(outgoing) {
         Ok(()) => Ok(None),
@@ -1837,7 +1878,7 @@ mod tests {
         let welcome = read_until(&mut client, b"366 bot #room :End of NAMES list\r\n").await;
         let projection = String::from_utf8_lossy(&welcome);
         assert!(projection.contains("001 bot"));
-        assert!(projection.contains("CAP * NAK :Unsupported capabilities"));
+        assert!(projection.contains("CAP * ACK :message-tags"));
         assert!(projection.contains("433 * * :Nickname unavailable on this network"));
         assert!(projection.contains("CASEMAPPING=rfc1459"), "{projection}");
         assert!(projection.contains("332 bot #room :subject"));
@@ -1852,7 +1893,11 @@ mod tests {
             .await
             .unwrap();
         let forwarded = read_until(&mut client, b"NOTICE mobile :tagged\r\n").await;
-        assert!(!String::from_utf8_lossy(&forwarded).contains("@time="));
+        assert!(
+            String::from_utf8_lossy(&forwarded).contains("@time="),
+            "a client that negotiated message-tags receives tags: {}",
+            String::from_utf8_lossy(&forwarded)
+        );
         client.write_all(b"PRIVMSG #room :hello\r\n").await.unwrap();
         assert_eq!(
             Message::parse(b"PRIVMSG #room :hello\r\n")
@@ -2002,7 +2047,7 @@ mod tests {
         let mut client = local.take_peer().await;
         client
             .write_all(
-                b"CAP LS 302\r\nCAP REQ :message-tags\r\nNICK bot\r\nUSER bot 0 * :phone\r\n",
+                b"CAP LS 302\r\nCAP REQ :echo-message\r\nNICK bot\r\nUSER bot 0 * :phone\r\n",
             )
             .await
             .unwrap();

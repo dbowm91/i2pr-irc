@@ -39,6 +39,13 @@ pub fn project(
             ))?;
         }
     }
+    // `CLIENTTAGDENY=*` tells a client that every client-only tag it sends will be
+    // silently ignored, so it can remove UI that depends on one. This bouncer denies
+    // them all: the client-only allowlist is empty, so advertising anything narrower
+    // would be a promise it does not keep.
+    handle.queue_normal(&format!(
+        ":bouncer 005 {target} CLIENTTAGDENY=* :are supported by this server\r\n"
+    ))?;
     for channel in state.joined_channels() {
         handle.queue_normal(&format!(":{} JOIN {channel}\r\n", state.nick))?;
         // The read-marker draft requires the server to send the channel's marker after

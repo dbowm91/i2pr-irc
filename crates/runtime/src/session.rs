@@ -98,6 +98,13 @@ pub struct SessionCapabilities {
     /// This is tracked separately from `explicit_history` because the two drafts are
     /// independent: a client may negotiate either, both, or neither.
     pub read_markers: bool,
+    /// The client negotiated `message-tags`, so tags may be forwarded to it.
+    ///
+    /// A client that did not negotiate it must never receive a tagged frame: it has no
+    /// way to parse one, and forwarding anyway would be sending a message it cannot
+    /// read. This is tracked per session because the fanout path delivers one upstream
+    /// line to many sessions with different surfaces.
+    pub message_tags: bool,
 }
 impl Default for SessionCapabilities {
     fn default() -> Self {
@@ -105,6 +112,7 @@ impl Default for SessionCapabilities {
             legacy_backlog: true,
             explicit_history: false,
             read_markers: false,
+            message_tags: false,
         }
     }
 }
@@ -130,6 +138,11 @@ impl SessionCapabilities {
         self.read_markers
     }
 
+    /// True when this client negotiated the message-tag surface.
+    pub fn negotiated_tags(&self) -> bool {
+        self.message_tags
+    }
+
     /// Applies a client's successful `CAP REQ`, recording that it manages history.
     pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
         Self {
@@ -137,6 +150,10 @@ impl SessionCapabilities {
             explicit_history: self.explicit_history
                 || crate::chathistory::session_manages_history(enabled),
             read_markers: self.read_markers || crate::chathistory::session_manages_markers(enabled),
+            message_tags: self.message_tags
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::MESSAGE_TAGS),
         }
     }
 }
@@ -648,4 +665,19 @@ pub(crate) fn queue_acknowledged(
         ))
         .map_err(|_| RuntimeError::QueueOverloaded)?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn negotiating_message_tags_is_observed_by_the_owner() {
+        let mut enabled = BTreeSet::new();
+        enabled.insert(crate::capability::MESSAGE_TAGS.to_owned());
+        let caps = SessionCapabilities::default().with_negotiated(&enabled);
+        assert!(caps.negotiated_tags(), "message-tags must be observable");
+        assert!(!SessionCapabilities::default().negotiated_tags());
+    }
 }

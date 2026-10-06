@@ -35,26 +35,34 @@ pub const UPSTREAM_FOUNDATIONAL: [&str; 5] = [
 /// [`crate::downstream::DOWNSTREAM_ADVERTISED`], because a `CAP LS` the client cannot
 /// rely on is a lie it has no way to detect.
 ///
-/// `labeled-response` and its `message-tags`/`batch` prerequisites are deliberately
-/// absent. Response routing is live for this bouncer's own upstream correlation, but
-/// serving a client's labels also requires downstream message-tag mediation and a
-/// truthful `CLIENTTAGDENY`, neither of which exists yet. They are named in
-/// [`DOWNSTREAM_DEFERRED_FOUNDATIONAL`] so that withholding them is a reviewable
-/// decision rather than an omission, and are promoted together when the mediator lands.
-pub const DOWNSTREAM_FOUNDATIONAL: [&str; 0] = [];
+/// M004-A promotes the tag surface now that the client-tag mediator and
+/// `CLIENTTAGDENY` are live. `batch` is required alongside `labeled-response`: a client
+/// that could not read a batch could not tell a multipart answer from a truncated one.
+/// `server-time` stays withheld, so the mediated tag set is exactly what this build
+/// forwards.
+pub const DOWNSTREAM_FOUNDATIONAL: [&str; 3] = [MESSAGE_TAGS, BATCH, LABELED_RESPONSE];
 
-/// Capabilities withheld downstream until the client-tag mediator is live.
-///
-/// Advertising any of these now would promise label semantics this build cannot honour:
-/// a client that negotiated them would attach tags the live session has no policy to
-/// forward or deny.
-pub const DOWNSTREAM_DEFERRED_FOUNDATIONAL: [&str; 3] =
-    ["message-tags", "batch", "labeled-response"];
+/// The message-tag capability.
+pub const MESSAGE_TAGS: &str = "message-tags";
+/// The batch capability.
+pub const BATCH: &str = "batch";
+/// The labeled-response capability.
+pub const LABELED_RESPONSE: &str = "labeled-response";
 
-/// `server-time` is withheld downstream alongside the deferred set.
+/// Capabilities this build implements but does not serve downstream.
 ///
-/// It is a message-tag capability: serving it means forwarding the tag, which is the
-/// same mediator that gates `message-tags`.
+/// Kept as reviewable constants so that "advertised yet" is a decision someone made
+/// rather than an omission someone forgot. `echo-message` is requested upstream but is
+/// not served downstream, because confirming a message requires implementing the
+/// confirmation and nothing does yet.
+pub const DOWNSTREAM_DEFERRED_FOUNDATIONAL: [&str; 0] = [];
+/// `echo-message` is withheld: no confirmation path is implemented downstream.
+pub const DOWNSTREAM_DEFERRED_ECHO: [&str; 1] = ["echo-message"];
+
+/// `server-time` is withheld downstream.
+///
+/// It is a message-tag capability, and serving it would widen the mediated tag set beyond
+/// the one this build forwards deliberately.
 pub const DOWNSTREAM_DEFERRED_SERVER_TIME: [&str; 1] = ["server-time"];
 
 /// Draft history capabilities, delegated to the versioned adapter so no `draft/...`

@@ -598,6 +598,17 @@ pub struct NetworkSnapshot {
     /// because it is never shown to any client -- delivering it would hand one client's
     /// discarded reply to another.
     pub orphaned_replies_dropped: u64,
+    /// Inbound CTCP frames suppressed by the privacy policy.
+    ///
+    /// A metadata probe, a DCC request or an unknown command reaching an attached
+    /// client would either prompt it to auto-reveal its client software or offer it a
+    /// direct-connect request, so those frames never leave this process.
+    pub ctcp_suppressed: u64,
+    /// Client frames withheld by the outbound privacy policy.
+    ///
+    /// A blocked frame is never transmitted upstream and never fanned out, so this is
+    /// the only record that it happened.
+    pub client_frames_blocked: u64,
     pub backlog_delivered: u64,
     /// True when more retained history exists beyond what the cap delivered.
     pub backlog_truncated: bool,
@@ -1457,6 +1468,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             rebuild_reply(message, route.downstream_label.as_deref())
         });
         let fans_out = matches!(outcome, RouteOutcome::Fanout);
+        // Only used to address a CTCP reply when the sender carried no usable prefix.
+        let nick_hint = self.snapshot.borrow().nick.clone().unwrap_or_default();
         match outcome {
             RouteOutcome::Fanout => {}
             RouteOutcome::Dropped => {
@@ -1484,18 +1497,44 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             }
         }
         if fans_out {
-            // Message-tag semantics are not advertised downstream yet, so tags are
-            // removed rather than forwarded under a capability the client did not
-            // negotiate.
-            let outgoing = if message.tags.is_empty() {
-                raw.to_vec()
+            // CTCP is classified before it reaches any client. Only an ACTION is chat;
+            // a PING query is answered by the bouncer itself rather than handed to a
+            // client that would answer it with its own hostname and software; and every
+            // metadata probe, DCC request and unknown command is suppressed entirely.
+            match self.apply_inbound_ctcp(message, sessions, control_tx, &nick_hint) {
+                InboundCtcp::Deliver => {}
+                // The frame is consumed: answered privately, or suppressed. State has
+                // already been applied and durable history still keeps the message it
+                // actually carried, because this is a privacy decision about what a
+                // client may observe, not about whether the event happened.
+                InboundCtcp::Answered | InboundCtcp::Suppressed => {
+                    return Ok(FanoutReport { desynchronized });
+                }
+            }
+            // Tags are delivered per session, because the tag surface is negotiated per
+            // session. A client that negotiated `message-tags` can parse them; a client
+            // that did not must never receive one, since it has no way to read a frame
+            // whose first bytes are a tag.
+            let untagged = if message.tags.is_empty() {
+                None
             } else {
-                let mut untagged = message.clone();
-                untagged.tags.clear();
-                untagged.encode().map_err(|_| RuntimeError::Protocol)?
+                let mut bare = message.clone();
+                bare.tags.clear();
+                Some(bare.encode().map_err(|_| RuntimeError::Protocol)?)
+            };
+            let tagged = if message.tags.is_empty() {
+                None
+            } else {
+                Some(message.encode().map_err(|_| RuntimeError::Protocol)?)
             };
             for (id, task) in sessions {
-                if task.handle().fanout(outgoing.clone()).is_err() {
+                let wants_tags = task.handle().capabilities().negotiated_tags();
+                let line = match (&tagged, &untagged) {
+                    (Some(tagged), _) if wants_tags => tagged.clone(),
+                    (_, Some(untagged)) => untagged.clone(),
+                    _ => raw.to_vec(),
+                };
+                if task.handle().fanout(line).is_err() {
                     // Bounded fanout: the owner never awaits the session, so a stalled
                     // client cannot delay the Network or any other client. What it cannot
                     // do is keep the client: it has now skipped a live frame, so it is
@@ -1661,6 +1700,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     SessionIntent::Forward { wire, class } => {
                         let class_label = class.as_str();
+                        // Privacy mediation runs before anything is queued upstream and
+                        // before any durable or diagnostic side effect, so a blocked
+                        // frame is never transmitted, fanned out, or recorded as sent.
+                        let wire = match self.mediate_client_frame(sessions, session, wire) {
+                            Some(wire) => wire,
+                            None => return Ok(()),
+                        };
                         // A query whose reply the client expects to correlate is routed,
                         // not blindly forwarded: without a route its numeric replies
                         // would fan out to every attached client, disclosing one client's
@@ -1887,6 +1933,111 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             .send_modify(|snapshot| snapshot.last_error = Some("route-refused"));
     }
 
+    /// Applies the upstream-to-downstream CTCP policy to one frame.
+    ///
+    /// This is the boundary that keeps an anonymity network's anonymity from being undone by
+    /// the client software sitting behind it. An upstream `CLIENTINFO` query, if fanned out,
+    /// would cause every attached client to answer with its own hostname and version — and
+    /// that answer is what identifies this Operator's client on a network where the address is
+    /// supposed to be unlinkable.
+    ///
+    /// The reply to a `PING` is addressed to the sender's own nick so it returns privately
+    /// rather than being observed by the rest of the channel.
+    fn apply_inbound_ctcp(
+        &self,
+        message: &Message,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        control_tx: &mpsc::Sender<Vec<u8>>,
+        nick: &str,
+    ) -> InboundCtcp {
+        let direction = match &message.command[..] {
+            [b'N', b'O', b'T', b'I', b'C', b'E'] => crate::ctcp::CtcpDirection::Reply,
+            _ => crate::ctcp::CtcpDirection::Query,
+        };
+        let ctcp = crate::ctcp::classify(message, direction);
+        match crate::ctcp::inbound_action(&ctcp) {
+            crate::ctcp::InboundAction::FanOut => InboundCtcp::Deliver,
+            crate::ctcp::InboundAction::Suppress => {
+                self.snapshot.send_modify(|snapshot| {
+                    snapshot.ctcp_suppressed = snapshot.ctcp_suppressed.saturating_add(1)
+                });
+                InboundCtcp::Suppressed
+            }
+            crate::ctcp::InboundAction::AnswerPing(_) => {
+                let Some(token) = crate::ctcp::ping_reply_text(&ctcp) else {
+                    return InboundCtcp::Suppressed;
+                };
+                let target = message
+                    .prefix
+                    .as_deref()
+                    .map(|prefix| {
+                        let split = prefix
+                            .iter()
+                            .position(|byte| *byte == b'!')
+                            .unwrap_or(prefix.len());
+                        String::from_utf8_lossy(&prefix[..split]).into_owned()
+                    })
+                    .filter(|sender| !sender.is_empty())
+                    .unwrap_or_else(|| nick.to_owned());
+                let line = format!(":bouncer NOTICE {target} :\u{1}PING {token}\u{1}\r\n");
+                // Queued to upstream, not to clients: the answer reveals the bouncer's own
+                // fixed token and nothing about who is attached.
+                if queue_control(control_tx, &line).is_err() {
+                    self.snapshot.send_modify(|snapshot| {
+                        snapshot.ctcp_suppressed = snapshot.ctcp_suppressed.saturating_add(1)
+                    });
+                    return InboundCtcp::Suppressed;
+                }
+                let _ = sessions;
+                InboundCtcp::Answered
+            }
+        }
+    }
+
+    /// Applies the client-to-upstream privacy policy to one frame.
+    ///
+    /// Returns the bytes to forward, or `None` when the frame is blocked.
+    ///
+    /// Two independent policies apply here, and both run *before* the frame is queued,
+    /// so a blocked frame is never transmitted upstream, never fanned out, and never
+    /// recorded as sent:
+    ///
+    /// - **CTCP**: a metadata *reply* from a local client is how that client's software
+    ///   and hostname would reach the upstream server and become this Operator's
+    ///   fingerprint. `DCC` in any form is blocked outright. `ACTION` and `PING` are the
+    ///   allowlist; everything else is denied by default.
+    /// - **Tags**: client-supplied tags are denied by default. The one exception is the
+    ///   response label, which is this bouncer's own correlation mechanism: it is
+    ///   consumed by the router, translated to an opaque upstream token, and restored
+    ///   only to the client that sent it. It never reaches the server.
+    fn mediate_client_frame(
+        &self,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        session: SessionId,
+        wire: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        let message = Message::parse(&wire).ok()?;
+        let direction = match &message.command[..] {
+            [b'N', b'O', b'T', b'I', b'C', b'E'] => crate::ctcp::CtcpDirection::Reply,
+            _ => crate::ctcp::CtcpDirection::Query,
+        };
+        let ctcp = crate::ctcp::classify(&message, direction);
+        if crate::ctcp::outbound_action(&ctcp) == crate::ctcp::OutboundAction::Block {
+            self.snapshot.send_modify(|snapshot| {
+                snapshot.client_frames_blocked = snapshot.client_frames_blocked.saturating_add(1)
+            });
+            return None;
+        }
+        // Tag mediation applies to every forwarded frame, not only chat, so a client
+        // cannot smuggle a forged `msgid` onto a MODE or a NICK.
+        let negotiated = sessions
+            .get(&session)
+            .map(|task| task.handle().capabilities().negotiated_tags())
+            .unwrap_or(false);
+        let (mediated, _) = crate::ircv3::mediate_client_tags(&message, negotiated);
+        mediated.encode().ok()
+    }
+
     /// Tells one client its durable operation failed, without touching the Network.
     fn report_local_error(
         &self,
@@ -1954,6 +2105,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             ":bouncer NOTICE {nick} :Bouncer could not accept that command for upstream delivery ({class} refused)\r\n"
         ));
     }
+}
+
+/// What the bouncer did with one inbound CTCP frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundCtcp {
+    /// Ordinary chat or an action: deliver as usual.
+    Deliver,
+    /// The bouncer answered a `PING` itself and delivered nothing to clients.
+    Answered,
+    /// Suppressed: a metadata probe, a DCC request, or an unknown command.
+    Suppressed,
 }
 
 /// Current read marker per channel, for a client's initial MARKREAD set.

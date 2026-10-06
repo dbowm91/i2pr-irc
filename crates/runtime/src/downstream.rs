@@ -25,7 +25,13 @@ use tokio::{
 ///
 /// This is the live authority. The reviewable rationale for each entry, and the list of
 /// capabilities deliberately withheld, live in [`crate::capability`].
-pub const DOWNSTREAM_ADVERTISED: &[&str] = &[CHATHISTORY_CAPABILITY, READ_MARKER_CAPABILITY];
+pub const DOWNSTREAM_ADVERTISED: &[&str] = &[
+    CHATHISTORY_CAPABILITY,
+    READ_MARKER_CAPABILITY,
+    crate::capability::MESSAGE_TAGS,
+    crate::capability::BATCH,
+    crate::capability::LABELED_RESPONSE,
+];
 
 /// The exact `CAP LS` and `CAP REQ` support set for this generation.
 ///
@@ -444,6 +450,11 @@ impl<D: ByteStream> DownstreamSession<D> {
                 downstream_supported().join(" ")
             ),
         )
+    }
+
+    /// The negotiated capability set, as the owner's view of this session.
+    pub fn capabilities(&self) -> crate::session::SessionCapabilities {
+        crate::session::SessionCapabilities::default().with_negotiated(&self.negotiated)
     }
 
     /// The capabilities this client currently holds negotiated.
@@ -949,11 +960,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cap_req_is_refused_locally_and_still_awaits_cap_end() {
+    async fn a_cap_req_naming_one_unavailable_capability_is_refused_as_a_whole() {
         let mut harness = Harness::new(NetworkState::new("bot", &[]));
         harness.send(b"CAP LS 302\r\n").expect("cap ls accepted");
+        // `echo-message` is requested upstream but is not served downstream, so a
+        // request naming it must be refused rather than half-acknowledged.
         harness
-            .send(b"CAP REQ :message-tags\r\n")
+            .send(b"CAP REQ :message-tags echo-message\r\n")
             .expect("cap req accepted");
         harness.send(b"NICK bot\r\n").expect("nick accepted");
         harness

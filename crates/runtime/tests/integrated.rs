@@ -1694,11 +1694,15 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
                 .contains(&name.as_str())),
         "advertisement: {advertised:?}"
     );
-    // The label surface is withheld until the client-tag mediator is live, even though
-    // upstream negotiation does have it: serving a client's labels downstream needs
-    // mediation and a truthful CLIENTTAGDENY that do not exist yet.
-    for name in ["message-tags", "server-time", "batch", "labeled-response"] {
-        assert!(!advertised.contains(&name.to_owned()), "{name}");
+    // M004-A promoted the tag surface: the mediator and a truthful CLIENTTAGDENY now
+    // exist, so `message-tags`, `batch` and `labeled-response` are served. `server-time`
+    // and `echo-message` remain withheld, because neither has implemented downstream
+    // semantics.
+    for served in ["message-tags", "batch", "labeled-response"] {
+        assert!(advertised.contains(&served.to_owned()), "{served}");
+    }
+    for withheld in ["server-time", "echo-message"] {
+        assert!(!advertised.contains(&withheld.to_owned()), "{withheld}");
     }
     let history = i2pr_irc_runtime::chathistory::capability_advertisement(false);
     assert_eq!(
@@ -1708,12 +1712,18 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
             i2pr_irc_runtime::chathistory::READ_MARKER_CAPABILITY.to_owned()
         ]
     );
-    assert!(
-        advertised
+    // The advertisement is the union of the history adapter's capabilities and the
+    // foundational tag surface, and nothing else.
+    let mut expected = history.clone();
+    expected.extend(
+        ["message-tags", "batch", "labeled-response"]
             .iter()
-            .all(|name| history.iter().any(|served| served == name)),
-        "the history adapter's capabilities are the ones served live"
+            .map(|name| (*name).to_owned()),
     );
+    expected.sort();
+    let mut actual = advertised.clone();
+    actual.sort();
+    assert_eq!(actual, expected);
 }
 
 // ========================================================== SECURITY / PRIVACY

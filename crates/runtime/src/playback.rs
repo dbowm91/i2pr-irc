@@ -235,6 +235,7 @@ mod tests {
         let legacy = SessionCapabilities::default();
         assert!(wants_backlog(legacy));
         let explicit = SessionCapabilities {
+            message_tags: false,
             legacy_backlog: true,
             explicit_history: true,
             read_markers: false,
@@ -247,6 +248,7 @@ mod tests {
         // the bouncer owes this client a read marker, so suppressing the backlog must
         // not be inferred from read-marker negotiation either.
         let markers_only = SessionCapabilities {
+            message_tags: false,
             legacy_backlog: true,
             explicit_history: false,
             read_markers: true,

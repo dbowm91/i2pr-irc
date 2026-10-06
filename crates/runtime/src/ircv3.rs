@@ -17,8 +17,8 @@
 //!   arbitrary client tags upstream would let one client forge another client's
 //!   metadata. Widening this is M004's decision, under explicit review.
 
-use crate::RuntimeError;
-use i2pr_irc_wire::{IrcTimestamp, MAX_TAG_PREFIX_BYTES, MSGID_TAG, Message, TIME_TAG};
+use crate::{RuntimeError, routing::LABEL_TAG};
+use i2pr_irc_wire::{IrcTimestamp, MAX_TAG_PREFIX_BYTES, Message, TIME_TAG};
 
 /// Ceiling on simultaneous open batches for one generation.
 pub const MAX_OPEN_BATCHES: usize = 64;
@@ -173,44 +173,35 @@ pub enum TagDisposition {
     Rejected,
 }
 
-/// The conservative client-tag policy.
+/// The conservative client-tag policy: deny by default.
 ///
-/// A tag the bouncer understands and needs for its own semantics is forwarded; any
-/// other client-only tag is stripped. Nothing is forwarded that could forge another
-/// client's identity or mislead the server about who sent what.
+/// A client tag is untrusted input that the upstream server will believe. A forged
+/// `msgid` lets one client claim another's history position; a client-supplied `time`
+/// lets one client misorder what everyone else sees; and an arbitrary vendor or
+/// client-only tag is a channel the bouncer cannot reason about. So the default is to
+/// remove everything the client sent unless a reviewed extension defines what that tag
+/// means and who may set it.
+///
+/// Exactly one tag survives, and it is not really the client's: the response label is
+/// this bouncer's own correlation mechanism. It is consumed by the response router,
+/// translated to an opaque generation-local token, and restored only to the client that
+/// sent it. It is never forwarded to the server in the client's spelling, so two clients
+/// choosing the same label cannot collide.
+///
+/// The client-only allowlist is intentionally empty. Adding to it requires a separate
+/// privacy and timing review, because a client-only tag is relayed verbatim to everyone
+/// else on the network.
 pub fn mediate_client_tags(message: &Message, negotiated: bool) -> (Message, TagDisposition) {
-    if !negotiated {
-        // A client that did not negotiate `message-tags` must not receive tags at
-        // all. Returning the message unchanged while reporting `Stripped` would be
-        // a lie the client has no way to detect.
-        return (strip_all_tags(message), TagDisposition::Stripped);
-    }
-    if message.tags.is_empty() {
-        return (message.clone(), TagDisposition::Stripped);
-    }
+    let _ = negotiated;
     let mut mediated = message.clone();
     let mut stripped_any = false;
     for name in message.tags.keys().collect::<Vec<_>>() {
-        match name.as_slice() {
-            TIME_TAG => {
-                // Only a well-formed client server-time is tolerated; a bogus value
-                // would let a client misorder history by eye.
-                if message.server_time().is_none() {
-                    mediated.tags.remove(name);
-                    stripped_any = true;
-                }
-            }
-            MSGID_TAG => {
-                if message.msgid().is_none() {
-                    mediated.tags.remove(name);
-                    stripped_any = true;
-                }
-            }
-            _ => {
-                mediated.tags.remove(name);
-                stripped_any = true;
-            }
+        if name.as_slice() == LABEL_TAG.as_bytes() {
+            // Retained for the router; see the note above.
+            continue;
         }
+        mediated.tags.remove(name);
+        stripped_any = true;
     }
     let disposition = if stripped_any {
         TagDisposition::Stripped
@@ -270,23 +261,52 @@ pub fn validate_tag_budget(message: &Message) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use i2pr_irc_wire::MSGID_TAG;
 
     fn parse(raw: &str) -> Message {
         Message::parse(raw.as_bytes()).expect("parses")
     }
 
     #[test]
-    fn client_only_tags_are_stripped_rather_than_forwarded() {
+    fn client_only_and_forged_tags_are_stripped_rather_than_forwarded() {
         // A forged msgid or an unknown client tag must never reach upstream: that is
-        // how one client could impersonate another client's metadata.
+        // how one client could impersonate another client's metadata. M004-A tightened
+        // this from "forward a well-formed msgid" to deny by default.
         let forged = parse("@msgid=spoofed;+custom=1 :a!b@c PRIVMSG #room :hi\r\n");
         let (mediated, disposition) = mediate_client_tags(&forged, true);
         assert_eq!(disposition, TagDisposition::Stripped);
-        assert!(mediated.tags.contains_key(MSGID_TAG));
+        assert!(
+            !mediated.tags.contains_key(MSGID_TAG),
+            "even a well-formed client msgid must not reach upstream"
+        );
         assert!(
             !mediated.tags.contains_key(b"+custom".as_slice()),
             "an unknown client tag must be stripped"
         );
+    }
+
+    #[test]
+    fn the_response_label_is_the_only_tag_a_client_may_supply() {
+        // The label is the bouncer's own correlation mechanism, not client metadata:
+        // the router translates it to an opaque upstream token and restores it only to
+        // the client that sent it.
+        let labeled = parse("@label=mine WHOIS alice\r\n");
+        let (mediated, disposition) = mediate_client_tags(&labeled, true);
+        assert_eq!(disposition, TagDisposition::Forwarded);
+        assert_eq!(
+            mediated.tags.get(LABEL_TAG.as_bytes()),
+            Some(&Some(b"mine".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_client_only_allowlist_is_empty() {
+        // Every `+` tag is denied, including ones a client might consider its own.
+        for name in ["+typing", "+draft/reply", "+example/vendor"] {
+            let raw = format!("@{name}=1 :a!b@c PRIVMSG #room :hi\r\n");
+            let (mediated, _) = mediate_client_tags(&parse(&raw), true);
+            assert!(mediated.tags.is_empty(), "{name} must be denied by default");
+        }
     }
 
     #[test]
@@ -307,20 +327,16 @@ mod tests {
     }
 
     #[test]
-    fn a_well_formed_client_server_time_is_tolerated_but_never_orders_history() {
+    fn a_client_supplied_time_is_removed_even_though_it_parses() {
+        // Parsing is not authorisation. A client that could set its own timestamp could
+        // make its message look older or newer than it is to every other participant.
         let message = parse("@time=2023-11-14T22:13:20.000Z :a!b@c PRIVMSG #room :hi\r\n");
         let (mediated, disposition) = mediate_client_tags(&message, true);
-        assert_eq!(disposition, TagDisposition::Forwarded);
-        assert_eq!(
-            mediated
-                .server_time()
-                .map(|time| time.to_string())
-                .as_deref(),
-            Some("2023-11-14T22:13:20.000Z"),
-            "a conformant client timestamp is forwarded verbatim"
+        assert_eq!(disposition, TagDisposition::Stripped);
+        assert!(
+            mediated.tags.is_empty(),
+            "a client must not be able to assert its own message time"
         );
-        // The value is metadata on the message; ordering stays with HistoryEventId,
-        // which this function cannot see or influence.
     }
 
     #[test]
