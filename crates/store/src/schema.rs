@@ -1,13 +1,19 @@
-//! Schema version 1 and its transactional migration harness.
+//! Schema versions 1 and 2 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
 //! a storage migration.
 use crate::{StoreError, StoreErrorKind};
+use i2pr_irc_wire::IrcTimestamp;
 use rusqlite::Connection;
 
-/// The one schema version this build creates and understands.
-pub const SCHEMA_VERSION: i64 = 1;
+/// The newest schema version this build creates and understands.
+///
+/// Version 2 changes only how a history event's protocol timestamp is stored; see
+/// [`HISTORY_EVENTS_V2`] for why.
+pub const SCHEMA_VERSION: i64 = 2;
+/// Oldest schema version this build can migrate forward from.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
 /// without this exact value is refused rather than adopted.
 pub const APPLICATION_ID: i64 = 0x6932_7072;
@@ -17,19 +23,24 @@ pub const MIN_SQLITE_VERSION: (u32, u32, u32) = (3, 37, 0);
 const MAX_APPLICATION_ID: i64 = 0x7fff_ffff;
 /// SQLite's ceiling on `user_version`.
 const MAX_USER_VERSION: i64 = 1_000_000_000;
+/// Rows copied per step while migrating, so a large table never has to be
+/// materialized in memory at once. The migration still runs in one transaction.
+const MIGRATION_BATCH_ROWS: i64 = 256;
 
 /// Result of validating an existing database before any request is served.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenDisposition {
-    /// Fresh database; schema 1 must be created.
+    /// Fresh database; the current schema must be created.
     Fresh,
-    /// This application's database at schema 1.
+    /// This application's database at an older schema, migrated forward by
+    /// [`open_and_migrate`] before any request is served.
+    Migrated { from: i64 },
+    /// This application's database already at the current schema.
     Current,
 }
 
-/// Schema 1. Every table is STRICT, so a value of the wrong storage class is
-/// rejected by SQLite instead of being coerced into an ambiguous row.
-pub(crate) const SCHEMA_V1: &str = r#"
+/// Tables that are identical in every schema version, before `history_events`.
+const SCHEMA_HEAD: &str = r#"
 CREATE TABLE networks (
     network_id      INTEGER PRIMARY KEY,
     endpoint        TEXT NOT NULL,
@@ -69,25 +80,10 @@ CREATE TABLE buffers (
     target          TEXT NOT NULL,
     UNIQUE (network_id, canonical_key)
 ) STRICT;
+"#;
 
-CREATE TABLE history_events (
-    -- AUTOINCREMENT is monotonic and never reuses a deleted rowid, so a retained
-    -- cursor can never later alias a different event after retention.
-    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    network_id      INTEGER NOT NULL
-                    REFERENCES networks(network_id) ON DELETE CASCADE,
-    buffer_id       INTEGER NOT NULL
-                    REFERENCES buffers(buffer_id) ON DELETE CASCADE,
-    received_at     INTEGER NOT NULL,
-    server_time     INTEGER,
-    msgid           TEXT,
-    direction       INTEGER NOT NULL,
-    event_class     TEXT NOT NULL,
-    payload         BLOB NOT NULL
-) STRICT;
-
-CREATE INDEX history_by_buffer ON history_events (buffer_id, event_id);
-
+/// Tables that are identical in every schema version, after `history_events`.
+const SCHEMA_TAIL: &str = r#"
 CREATE TABLE client_cursors (
     client_id       INTEGER NOT NULL
                     REFERENCES clients(client_id) ON DELETE CASCADE,
@@ -103,6 +99,90 @@ CREATE TABLE read_markers (
     event_id        INTEGER NOT NULL
 ) STRICT;
 "#;
+
+/// Schema 1 `history_events`: protocol timestamp held as whole epoch seconds.
+///
+/// Retained verbatim because a v1 database is exactly what schema 2 must migrate,
+/// and because it documents what the migration is correcting.
+pub(crate) const HISTORY_EVENTS_V1: &str = r#"
+CREATE TABLE history_events (
+    -- AUTOINCREMENT is monotonic and never reuses a deleted rowid, so a retained
+    -- cursor can never later alias a different event after retention.
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_id      INTEGER NOT NULL
+                    REFERENCES networks(network_id) ON DELETE CASCADE,
+    buffer_id       INTEGER NOT NULL
+                    REFERENCES buffers(buffer_id) ON DELETE CASCADE,
+    received_at     INTEGER NOT NULL,
+    server_time     INTEGER,
+    msgid           TEXT,
+    direction       INTEGER NOT NULL,
+    event_class     TEXT NOT NULL,
+    payload         BLOB NOT NULL
+) STRICT;
+"#;
+
+/// Index over the history table, identical in every schema version.
+pub(crate) const HISTORY_EVENTS_INDEX: &str =
+    "CREATE INDEX history_by_buffer ON history_events (buffer_id, event_id);";
+
+/// Schema 2 `history_events`: protocol timestamp held as canonical validated text.
+///
+/// The change from v1 is `server_time` only. v1 stored whole epoch seconds, which
+/// cannot represent the millisecond precision that the IRCv3 `server-time`
+/// extension requires and cannot represent a leap second at all, so a conformant
+/// upstream timestamp was truncated on the way in and an invalid one could be
+/// replayed on the way out. v2 stores the canonical `YYYY-MM-DDThh:mm:ss.sssZ`
+/// string, which round-trips exactly.
+///
+/// `received_at` is deliberately left as local whole seconds. It is diagnostic
+/// metadata and has never been a protocol value; upgrading it would invent
+/// precision the process does not actually have.
+pub(crate) const HISTORY_EVENTS_V2: &str = r#"
+CREATE TABLE history_events (
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_id      INTEGER NOT NULL
+                    REFERENCES networks(network_id) ON DELETE CASCADE,
+    buffer_id       INTEGER NOT NULL
+                    REFERENCES buffers(buffer_id) ON DELETE CASCADE,
+    received_at     INTEGER NOT NULL,
+    -- Canonical server-time text, or NULL when the upstream sent none. The GLOB
+    -- constrains the wire *shape* at the storage layer; calendar validity is
+    -- enforced by the Rust parser on the way in and out.
+    server_time     TEXT
+                    CHECK (server_time IS NULL OR server_time GLOB
+                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    msgid           TEXT,
+    direction       INTEGER NOT NULL,
+    event_class     TEXT NOT NULL,
+    payload         BLOB NOT NULL
+) STRICT;
+"#;
+
+/// Composes a complete schema from its shared parts.
+///
+/// `concat!` cannot reference a const, so the pieces are joined at runtime instead.
+/// That keeps one definition of every unchanged table rather than duplicating all
+/// eight tables per version.
+fn compose(head: &str, history: &str, tail: &str) -> String {
+    let mut sql = String::with_capacity(head.len() + history.len() + tail.len());
+    sql.push_str(head);
+    sql.push_str(history);
+    sql.push_str(HISTORY_EVENTS_INDEX);
+    sql.push_str(tail);
+    sql
+}
+
+/// Schema 1, used to build migration fixtures. A v1 database is exactly what the
+/// schema 2 migration must handle.
+pub(crate) fn schema_v1() -> String {
+    compose(SCHEMA_HEAD, HISTORY_EVENTS_V1, SCHEMA_TAIL)
+}
+
+/// The current schema, created directly when no database exists yet.
+pub(crate) fn schema_v2() -> String {
+    compose(SCHEMA_HEAD, HISTORY_EVENTS_V2, SCHEMA_TAIL)
+}
 
 /// Refuses a database this build must not serve before any migration runs.
 pub(crate) fn classify(connection: &Connection) -> Result<OpenDisposition, ClassifyError> {
@@ -149,13 +229,15 @@ pub(crate) fn classify(connection: &Connection) -> Result<OpenDisposition, Class
     if application_id != APPLICATION_ID {
         return Err(FOREIGN);
     }
-    // Schema 1 is the only version this build knows. Anything else, including a
-    // version an older build wrote, is refused rather than guessed at: a wrong guess
-    // would reinterpret durable meaning.
-    if user_version == SCHEMA_VERSION {
-        Ok(OpenDisposition::Current)
-    } else {
-        Err(TOO_NEW)
+    // A version this build can still migrate forward from is upgraded; anything else,
+    // including a version a *newer* build wrote, is refused rather than guessed at,
+    // because a wrong guess would reinterpret durable meaning.
+    match user_version {
+        version if version == SCHEMA_VERSION => Ok(OpenDisposition::Current),
+        version if (MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION).contains(&version) => {
+            Ok(OpenDisposition::Migrated { from: version })
+        }
+        _ => Err(TOO_NEW),
     }
 }
 
@@ -196,7 +278,8 @@ fn sqlite_version() -> (u32, u32, u32) {
     )
 }
 
-/// Applies the open policy: connection pragmas, identity, and schema 1 creation.
+/// Applies the open policy: connection pragmas, identity, schema creation, and any
+/// forward migration.
 ///
 /// The whole operation runs in one transaction. A failure leaves the database at its
 /// previous version rather than half migrated, and a partially created schema is
@@ -219,39 +302,44 @@ pub(crate) fn open_and_migrate(
     connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    let disposition =
-        classify(connection).map_err(|error| StoreError::new(open_error_kind(&error)))?;
-    if disposition == OpenDisposition::Current {
-        // Prove the promised schema is actually present before serving requests. A
-        // database that claims our version but lost a promised table is corrupt, and
-        // serving it would reinterpret durable meaning silently.
-        let present = table_names(connection).map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-        if !["networks", "history_events", "client_cursors", "buffers"]
-            .iter()
-            .all(|name| present.iter().any(|table| table == name))
-        {
-            return Err(StoreError::new(StoreErrorKind::Corrupt(
-                "missing schema table",
-            )));
+    match classify(connection).map_err(|error| StoreError::new(open_error_kind(&error)))? {
+        OpenDisposition::Current => {
+            // Prove the promised schema is actually present before serving requests. A
+            // database that claims our version but lost a promised table is corrupt, and
+            // serving it would reinterpret durable meaning silently.
+            verify_promised_tables(connection)?;
+            Ok(OpenDisposition::Current)
         }
-        return Ok(disposition);
+        OpenDisposition::Migrated { from } => {
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            migrate_forward(&transaction, from)?;
+            verify_promised_tables(&transaction)?;
+            transaction
+                .commit()
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            Ok(OpenDisposition::Migrated { from })
+        }
+        OpenDisposition::Fresh => {
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            transaction
+                .execute_batch(&schema_v2())
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            transaction
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            transaction
+                .commit()
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            Ok(OpenDisposition::Fresh)
+        }
     }
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    transaction
-        .execute_batch(SCHEMA_V1)
-        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    transaction
-        .pragma_update(None, "application_id", APPLICATION_ID)
-        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    transaction
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
-        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    transaction
-        .commit()
-        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    Ok(OpenDisposition::Fresh)
 }
 
 /// Every user table present, used to verify the promised schema before serving.
@@ -265,4 +353,164 @@ pub(crate) fn table_names(connection: &Connection) -> Result<Vec<String>, rusqli
         names.push(row?);
     }
     Ok(names)
+}
+
+/// Confirms the tables this build promises are present inside the migration
+/// transaction, so a migration that "succeeds" structurally but drops a table is
+/// refused before it can commit.
+fn verify_promised_tables(connection: &Connection) -> Result<(), StoreError> {
+    let present = table_names(connection).map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    if REQUIRED_TABLES
+        .iter()
+        .all(|name| present.iter().any(|table| table == name))
+    {
+        Ok(())
+    } else {
+        Err(StoreError::new(StoreErrorKind::Corrupt(
+            "missing schema table",
+        )))
+    }
+}
+
+/// Tables that must exist before this build serves any request.
+const REQUIRED_TABLES: &[&str] = &[
+    "networks",
+    "history_events",
+    "client_cursors",
+    "buffers",
+    "read_markers",
+];
+
+/// Migrates an already-open transaction forward to [`SCHEMA_VERSION`].
+///
+/// Only the v1 -> v2 step exists. Each step rebuilds just the table whose
+/// representation changed; nothing else is touched, so event ids, cursors, and read
+/// markers keep pointing at the same rows.
+fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result<(), StoreError> {
+    match from {
+        1 => migrate_1_to_2(transaction),
+        _ => Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
+    }
+}
+
+/// One v1 history row, as read by the batched migration scan.
+type V1Row = (
+    i64,            // event_id
+    i64,            // network_id
+    i64,            // buffer_id
+    i64,            // received_at
+    Option<i64>,    // server_time
+    Option<String>, // msgid
+    i64,            // direction
+    String,         // event_class
+    Vec<u8>,        // payload
+);
+
+/// Rebuilds `history_events` with canonical text `server_time`.
+///
+/// `AUTOINCREMENT` semantics survive because every `event_id` is copied explicitly:
+/// re-inserting the maximum rowid moves `sqlite_sequence` forward, so the next
+/// allocated id is still strictly greater than any id ever issued. A retained
+/// cursor therefore cannot later alias a different event.
+fn migrate_1_to_2(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    // Build the v2 table under a temporary name, then swap, so the original v1 table
+    // is only dropped once every row has been copied successfully. The index is
+    // deliberately *not* created yet: its name still belongs to the v1 table, and it
+    // is rebuilt after the swap under its real name.
+    let staging = HISTORY_EVENTS_V2.replacen(
+        "CREATE TABLE history_events (",
+        "CREATE TABLE history_events_v2 (",
+        1,
+    );
+    transaction
+        .execute_batch(&staging)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+
+    // Copy in bounded batches so an arbitrarily large history table never has to be
+    // materialized at once. The surrounding transaction keeps this all-or-nothing.
+    let mut last_event_id: i64 = 0;
+    loop {
+        let batch = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload
+                     FROM history_events WHERE event_id > ?1 ORDER BY event_id LIMIT ?2",
+                )
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![last_event_id, MIGRATION_BATCH_ROWS],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                        ))
+                    },
+                )
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            rows.collect::<Result<Vec<V1Row>, _>>()
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for row in &batch {
+            insert_migrated_event(transaction, row)?;
+            last_event_id = row.0;
+        }
+    }
+
+    transaction
+        .execute_batch(
+            "DROP TABLE history_events;
+             ALTER TABLE history_events_v2 RENAME TO history_events;",
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    transaction
+        .execute_batch(HISTORY_EVENTS_INDEX)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// Re-inserts one v1 row into the v2 staging table, converting its protocol
+/// timestamp.
+///
+/// A v1 `server_time` that cannot be expressed as a canonical protocol timestamp is
+/// migrated as NULL rather than failing the whole database. v1 accepted any integer
+/// seconds within a +/-32.5e9 window, which reaches back before year 1 and so
+/// contains values no conformant `server-time` could ever denote. Under the protocol
+/// an unrepresentable timestamp is equivalent to no timestamp, and the local
+/// `received_at` that carries retention meaning is preserved regardless, so nulling
+/// costs no canonical order.
+fn insert_migrated_event(
+    transaction: &rusqlite::Transaction<'_>,
+    row: &V1Row,
+) -> Result<(), StoreError> {
+    let canonical = row.4.and_then(|seconds| {
+        // v1 truncated to whole seconds. That precision loss is unrecoverable and is
+        // deliberately not invented back here.
+        seconds
+            .checked_mul(1_000)
+            .and_then(IrcTimestamp::from_unix_millis)
+            .map(|value| value.to_string())
+    });
+    transaction
+        .execute(
+            "INSERT INTO history_events_v2
+                (event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![row.0, row.1, row.2, row.3, canonical, row.5, row.6, row.7, row.8],
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
 }

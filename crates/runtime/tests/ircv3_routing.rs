@@ -643,17 +643,21 @@ fn client_only_tags_are_default_deny() {
 #[test]
 fn a_server_time_is_preserved_or_synthesized_but_never_orders_history() {
     use i2pr_irc_runtime::ircv3::synthesize_server_time;
-    let mut preserved = parse("@time=1600000000 :a!b@c PRIVMSG #room :hi\r\n");
+    let mut preserved = parse("@time=2020-09-13T12:26:40.123Z :a!b@c PRIVMSG #room :hi\r\n");
     synthesize_server_time(&mut preserved, i2pr_irc_core::WallTime(1_700_000_000));
     assert_eq!(
-        preserved.time(),
-        Some(1_600_000_000),
-        "a real value is not overwritten"
+        preserved.server_time().map(|time| time.to_string()),
+        Some("2020-09-13T12:26:40.123Z".to_owned()),
+        "a real value is not overwritten, and milliseconds survive"
     );
 
     let mut synthesized = parse(":a!b@c PRIVMSG #room :hi\r\n");
     synthesize_server_time(&mut synthesized, i2pr_irc_core::WallTime(1_700_000_000));
-    assert_eq!(synthesized.time(), Some(1_700_000_000));
+    assert_eq!(
+        synthesized.server_time().map(|time| time.to_string()),
+        Some("2023-11-14T22:13:20.000Z".to_owned()),
+        "a synthesized timestamp is canonical text, never an integer epoch"
+    );
 }
 
 #[test]
@@ -665,11 +669,11 @@ fn tags_never_change_canonical_history_order() {
     for pair in events.windows(2) {
         assert!(pair[0] < pair[1]);
     }
-    let mut tagged = parse("@time=9999999999 :a!b@c PRIVMSG #room :first\r\n");
+    let mut tagged = parse("@time=2286-11-20T17:46:40.000Z :a!b@c PRIVMSG #room :first\r\n");
     i2pr_irc_runtime::ircv3::synthesize_server_time(&mut tagged, i2pr_irc_core::WallTime(1));
     assert_eq!(
-        tagged.time(),
-        Some(9_999_999_999),
+        tagged.server_time().map(|time| time.to_string()),
+        Some("2286-11-20T17:46:40.000Z".to_owned()),
         "a skewed tag is carried as metadata and still does not reorder anything"
     );
 }

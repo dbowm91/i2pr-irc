@@ -16,6 +16,17 @@ use i2pr_irc_store::{
 };
 use i2pr_irc_wire::Message;
 
+/// A canonical `server-time` value for an epoch-second reading.
+///
+/// Fixtures must use the real wire grammar: an integer epoch is *not* a valid
+/// `server-time`, so a fixture using one would be testing a value the parser is
+/// right to reject.
+fn stamp(epoch_seconds: i64) -> String {
+    i2pr_irc_wire::IrcTimestamp::from_unix_millis(epoch_seconds * 1_000)
+        .expect("representable")
+        .to_string()
+}
+
 // ------------------------------------------------------------------- fixtures
 
 fn store() -> (Store, StoreHandle) {
@@ -138,13 +149,13 @@ async fn canonical_order_is_local_sequence_not_any_timestamp() {
 
     // Receive time advances, but server-time goes backwards on every line.
     let mut ids = Vec::new();
-    for index in 0..4u64 {
+    for index in 0..4i64 {
         wall.advance(10).expect("clock advances");
         // Tags precede the prefix; server-time deliberately runs backwards while
         // receive time advances.
         let line = format!(
             "@time={} :a!b@c PRIVMSG #room :m{index}\r\n",
-            1_700_000_000 - index
+            stamp(1_700_000_000 - index)
         );
         let outcome = journal
             .ingest(buffer, &message(&line))
@@ -172,10 +183,10 @@ async fn canonical_order_is_local_sequence_not_any_timestamp() {
     assert_eq!(
         order,
         vec![
-            "@time=1700000000 :a!b@c PRIVMSG #room :m0",
-            "@time=1699999999 :a!b@c PRIVMSG #room :m1",
-            "@time=1699999998 :a!b@c PRIVMSG #room :m2",
-            "@time=1699999997 :a!b@c PRIVMSG #room :m3",
+            format!("@time={} :a!b@c PRIVMSG #room :m0", stamp(1_700_000_000)),
+            format!("@time={} :a!b@c PRIVMSG #room :m1", stamp(1_699_999_999)),
+            format!("@time={} :a!b@c PRIVMSG #room :m2", stamp(1_699_999_998)),
+            format!("@time={} :a!b@c PRIVMSG #room :m3", stamp(1_699_999_997)),
         ]
     );
 }
@@ -191,7 +202,11 @@ async fn server_time_and_msgid_are_preserved_as_metadata_only() {
     journal
         .ingest(
             buffer,
-            &message("@time=1700000000.500;msgid=abc123 :a!b@c PRIVMSG #room :hi\r\n"),
+            &message(&format!(
+                "@time={};msgid=abc123 :a!b@c PRIVMSG #room :hi\r\n",
+                i2pr_irc_wire::IrcTimestamp::from_unix_millis(1_700_000_000_500)
+                    .expect("representable")
+            )),
         )
         .await
         .expect("ingests");
@@ -200,8 +215,8 @@ async fn server_time_and_msgid_are_preserved_as_metadata_only() {
         .await
         .expect("backlog");
     assert_eq!(
-        events[0].server_time.map(|t| t.unix_seconds()),
-        Some(1_700_000_000)
+        events[0].server_time.map(|time| time.to_string()),
+        Some("2023-11-14T22:13:20.500Z".to_owned())
     );
     assert_eq!(events[0].msgid.as_deref(), Some("abc123"));
     assert!(
@@ -692,7 +707,10 @@ fn a_retained_event_round_trips_through_the_store_unchanged() {
         network: NetworkId(1),
         buffer: i2pr_irc_store::BufferId(1),
         received_at: i2pr_irc_core::WallTime(1234),
-        server_time: Some(i2pr_irc_core::WallTime(1_700_000_000)),
+        server_time: Some(
+            i2pr_irc_wire::IrcTimestamp::from_unix_millis(1_700_000_000_123)
+                .expect("representable"),
+        ),
         msgid: Some("m1".into()),
         direction: EventDirection::Inbound,
         event_class: "PRIVMSG".into(),

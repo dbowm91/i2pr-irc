@@ -674,7 +674,11 @@ async fn an_incompatible_schema_is_a_startup_failure_not_a_runtime_state() {
     let path = dir.db("schema.sqlite3");
     let first = Store::open(&StorePath::File(path.clone())).expect("store opens");
     first.shutdown().expect("shuts down");
-    i2pr_irc_store::testing::stamp(&path, i2pr_irc_store::APPLICATION_ID, 2);
+    i2pr_irc_store::testing::stamp(
+        &path,
+        i2pr_irc_store::APPLICATION_ID,
+        i2pr_irc_store::SCHEMA_VERSION + 1,
+    );
     assert_eq!(
         Store::open(&StorePath::File(path))
             .err()
@@ -890,11 +894,16 @@ async fn deterministic_ordering_holds_across_identical_and_skewed_timestamps() {
     let mut ids = Vec::new();
     for index in 0..4i64 {
         let raw = if index == 3 {
-            format!("@time={} :a!u@h PRIVMSG #room :m{index}\r\n", 1700 - index)
+            format!(
+                "@time={} :a!u@h PRIVMSG #room :m{index}\r\n",
+                i2pr_irc_wire::IrcTimestamp::from_unix_millis(1_700_000_000_000 - index)
+                    .expect("representable")
+            )
         } else {
             format!(
                 "@time={};msgid=m{index} :a!u@h PRIVMSG #room :m{index}\r\n",
-                1700 - index
+                i2pr_irc_wire::IrcTimestamp::from_unix_millis(1_700_000_000_000 - index)
+                    .expect("representable")
             )
         };
         if let IngestOutcome::Recorded { event } = journal

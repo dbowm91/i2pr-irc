@@ -19,7 +19,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-/// Every table the frozen schema version 1 contains, in SQLite's name order.
+/// Every table the schema contains, in SQLite's name order.
+///
+/// The table *set* has been identical across every schema version so far; only the
+/// representation of `history_events.server_time` changed.
 pub const EXPECTED_TABLES: [&str; 8] = [
     "buffers",
     "client_cursors",
@@ -30,6 +33,25 @@ pub const EXPECTED_TABLES: [&str; 8] = [
     "networks",
     "read_markers",
 ];
+
+/// Creates a database at schema version 1 and returns a raw connection to it.
+///
+/// Used to build migration fixtures: a v1 database is exactly what the v1 -> v2
+/// migration must handle, and it cannot be produced by this build's own `open`
+/// because that always migrates.
+pub fn create_v1_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v1())
+        .expect("schema 1 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 1)
+        .expect("user_version is writable");
+    connection
+}
 
 /// A temporary directory owned by one test, removed when the guard is dropped.
 #[derive(Debug)]
@@ -152,4 +174,40 @@ pub fn foreign_keys_enabled(path: &Path) -> bool {
         .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
         .unwrap_or(0)
         != 0
+}
+
+/// Reads one optional text column.
+pub fn optional_text(path: &Path, sql: &str, args: &[i64]) -> Option<String> {
+    let connection = raw(path);
+    let mut statement = connection.prepare(sql).expect("query is valid");
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(args.iter()))
+        .expect("query executes");
+    rows.next()
+        .expect("at most one row")
+        .and_then(|row| row.get::<_, String>(0).ok())
+}
+
+/// The next rowid `AUTOINCREMENT` would hand out for a table, which is how a test
+/// proves that migration did not reset event-id monotonicity.
+pub fn autoincrement_sequence(path: &Path, table: &str) -> Option<i64> {
+    raw(path)
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+}
+
+/// Declared storage type and constraints for one column, so a test can assert the
+/// schema shape rather than inferring it from behaviour.
+pub fn column_type(path: &Path, table: &str, column: &str) -> String {
+    raw(path)
+        .query_row(
+            "SELECT type FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default()
 }

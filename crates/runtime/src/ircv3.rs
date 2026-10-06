@@ -18,7 +18,7 @@
 //!   metadata. Widening this is M004's decision, under explicit review.
 
 use crate::RuntimeError;
-use i2pr_irc_wire::{MAX_TAG_PREFIX_BYTES, MSGID_TAG, Message, TIME_TAG};
+use i2pr_irc_wire::{IrcTimestamp, MAX_TAG_PREFIX_BYTES, MSGID_TAG, Message, TIME_TAG};
 
 /// Ceiling on simultaneous open batches for one generation.
 pub const MAX_OPEN_BATCHES: usize = 64;
@@ -195,7 +195,7 @@ pub fn mediate_client_tags(message: &Message, negotiated: bool) -> (Message, Tag
             TIME_TAG => {
                 // Only a well-formed client server-time is tolerated; a bogus value
                 // would let a client misorder history by eye.
-                if message.time().is_none() {
+                if message.server_time().is_none() {
                     mediated.tags.remove(name);
                     stripped_any = true;
                 }
@@ -225,15 +225,28 @@ pub fn mediate_client_tags(message: &Message, negotiated: bool) -> (Message, Tag
 ///
 /// This never changes durable order: `server-time` is metadata, and the canonical
 /// order remains `HistoryEventId`.
+///
+/// The synthesized value is always the canonical `YYYY-MM-DDThh:mm:ss.sssZ` form.
+/// An integer epoch is *not* a `server-time` value, so emitting one would be a tag
+/// the recipient cannot parse.
 pub fn synthesize_server_time(message: &mut Message, receive: i2pr_irc_core::WallTime) {
     if message.tags.contains_key(TIME_TAG) {
         // A real upstream value is preserved rather than overwritten.
         return;
     }
-    message.tags.insert(
-        TIME_TAG.to_vec(),
-        Some(receive.unix_seconds().to_string().into_bytes()),
-    );
+    // The local clock has whole-second resolution, so the milliseconds are `.000`
+    // rather than invented precision.
+    let Some(timestamp) = receive
+        .unix_seconds()
+        .checked_mul(1_000)
+        .and_then(IrcTimestamp::from_unix_millis)
+    else {
+        // An unrepresentable wall clock leaves the tag absent, which is honest.
+        return;
+    };
+    message
+        .tags
+        .insert(TIME_TAG.to_vec(), Some(timestamp.to_string().into_bytes()));
 }
 
 /// Removes every tag from a message for a client that did not negotiate
@@ -280,6 +293,8 @@ mod tests {
     fn a_malformed_client_tag_is_stripped_rather_than_trusted() {
         for raw in [
             "@time=notanumber :a!b@c PRIVMSG #room :hi\r\n",
+            "@time=1700000000 :a!b@c PRIVMSG #room :hi\r\n",
+            "@time=2019-01-04T14:33:26.123 :a!b@c PRIVMSG #room :hi\r\n",
             "@msgid= :a!b@c PRIVMSG #room :hi\r\n",
         ] {
             let message = parse(raw);
@@ -293,17 +308,24 @@ mod tests {
 
     #[test]
     fn a_well_formed_client_server_time_is_tolerated_but_never_orders_history() {
-        let message = parse("@time=1700000000 :a!b@c PRIVMSG #room :hi\r\n");
+        let message = parse("@time=2023-11-14T22:13:20.000Z :a!b@c PRIVMSG #room :hi\r\n");
         let (mediated, disposition) = mediate_client_tags(&message, true);
         assert_eq!(disposition, TagDisposition::Forwarded);
-        assert_eq!(mediated.time(), Some(1_700_000_000));
+        assert_eq!(
+            mediated
+                .server_time()
+                .map(|time| time.to_string())
+                .as_deref(),
+            Some("2023-11-14T22:13:20.000Z"),
+            "a conformant client timestamp is forwarded verbatim"
+        );
         // The value is metadata on the message; ordering stays with HistoryEventId,
         // which this function cannot see or influence.
     }
 
     #[test]
     fn tags_are_dropped_entirely_when_the_client_did_not_negotiate_them() {
-        let message = parse("@time=1700000000 :a!b@c PRIVMSG #room :hi\r\n");
+        let message = parse("@time=2023-11-14T22:13:20.000Z :a!b@c PRIVMSG #room :hi\r\n");
         let (mediated, _) = mediate_client_tags(&message, false);
         assert!(mediated.tags.is_empty());
         let bare = strip_all_tags(&message);
@@ -312,13 +334,32 @@ mod tests {
 
     #[test]
     fn synthesis_never_overwrites_a_real_upstream_time() {
-        let mut preserved = parse("@time=1600000000 :a!b@c PRIVMSG #room :hi\r\n");
+        let mut preserved = parse("@time=2020-09-13T12:26:40.123Z :a!b@c PRIVMSG #room :hi\r\n");
         synthesize_server_time(&mut preserved, i2pr_irc_core::WallTime(1_700_000_000));
-        assert_eq!(preserved.time(), Some(1_600_000_000));
+        assert_eq!(
+            preserved.server_time().map(|time| time.to_string()),
+            Some("2020-09-13T12:26:40.123Z".to_owned()),
+            "milliseconds survive synthesis being skipped"
+        );
 
         let mut synthesized = parse(":a!b@c PRIVMSG #room :hi\r\n");
         synthesize_server_time(&mut synthesized, i2pr_irc_core::WallTime(1_700_000_000));
-        assert_eq!(synthesized.time(), Some(1_700_000_000));
+        assert_eq!(
+            synthesized.server_time().map(|time| time.to_string()),
+            Some("2023-11-14T22:13:20.000Z".to_owned()),
+            "a synthesized timestamp is canonical text, never an integer epoch"
+        );
+    }
+
+    #[test]
+    fn synthesis_preserves_a_leap_second_instead_of_normalising_it() {
+        let mut preserved = parse("@time=2012-06-30T23:59:60.419Z :a!b@c PRIVMSG #room :hi\r\n");
+        synthesize_server_time(&mut preserved, i2pr_irc_core::WallTime(1_700_000_000));
+        assert_eq!(
+            preserved.server_time().map(|time| time.to_string()),
+            Some("2012-06-30T23:59:60.419Z".to_owned()),
+            "a leap second must not be rewritten to :59 or rolled forward"
+        );
     }
 
     #[test]

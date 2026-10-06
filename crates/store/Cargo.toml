@@ -13,6 +13,9 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Migration fixtures must build a schema-1 database and read raw rows, so these
+# tests talk to SQLite directly rather than only through the API under test.
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["test-util", "rt"] }
 
 [lints]

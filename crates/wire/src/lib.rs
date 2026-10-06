@@ -1,6 +1,10 @@
 //! Bounded byte-oriented IRC/IRCv3 message representation.
 use std::collections::BTreeMap;
 
+pub mod timestamp;
+
+pub use timestamp::{IrcTimestamp, TIMESTAMP_BYTES, TimestampError};
+
 /// Maximum ordinary IRC message size, including CRLF (RFC 2812 §2.3).
 pub const MAX_LINE_BYTES: usize = 512;
 /// Maximum tag prefix, including `@` and the separating space (IRCv3 message-tags).
@@ -17,9 +21,6 @@ pub const MAX_DECODED_MESSAGES_PER_PUSH: usize = 256;
 pub const TIME_TAG: &[u8] = b"time";
 /// IRCv3 `msgid` tag name.
 pub const MSGID_TAG: &[u8] = b"msgid";
-/// Upper bound on an acceptable `server-time`, mirroring the runtime's `WallTime`.
-/// A tag outside this window is treated as absent rather than trusted.
-pub const MAX_SERVER_TIME_SECONDS: i64 = 32_503_680_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -216,25 +217,18 @@ impl Message {
         })
     }
 
-    /// Validates the directional 4094-byte tag-data limit without changing representation.
     /// The upstream `server-time` tag, if present and well formed.
     ///
     /// This is metadata only. It never participates in ordering: canonical history
     /// order is the locally assigned sequence, so a skewed, repeated, or missing
-    /// server time cannot reorder retained history. The wire layer returns raw
-    /// seconds; bounding them into a `WallTime` is the caller's decision.
-    pub fn time(&self) -> Option<i64> {
+    /// server time cannot reorder retained history.
+    ///
+    /// Returns [`None`] for a tag that is absent, valueless, or not the canonical
+    /// `YYYY-MM-DDThh:mm:ss.sssZ` form — including a bare integer epoch, which is
+    /// *not* a valid `server-time` and must not be interpreted as one.
+    pub fn server_time(&self) -> Option<IrcTimestamp> {
         let value = self.tags.get(TIME_TAG)?.as_ref()?;
-        let seconds: Vec<u8> = value
-            .iter()
-            .copied()
-            .take_while(|byte| *byte != b'.')
-            .collect();
-        if seconds.is_empty() {
-            return None;
-        }
-        let parsed = std::str::from_utf8(&seconds).ok()?.parse::<i64>().ok()?;
-        (parsed.checked_abs()? <= MAX_SERVER_TIME_SECONDS).then_some(parsed)
+        IrcTimestamp::parse(value).ok()
     }
     /// The upstream `msgid` tag, if present and well formed.
     ///

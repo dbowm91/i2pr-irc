@@ -256,9 +256,10 @@ impl HistoryJournal {
             network: self.network,
             buffer,
             received_at: self.wall.now(),
-            server_time: message
-                .time()
-                .and_then(i2pr_irc_core::WallTime::from_unix_seconds),
+            // Preserved exactly as the upstream stated it, including millisecond
+            // precision and a leap second. `None` means the upstream sent none and
+            // it is never invented from local time.
+            server_time: message.server_time(),
             msgid: message.msgid().map(str::to_owned),
             direction: EventDirection::Inbound,
             event_class: command,

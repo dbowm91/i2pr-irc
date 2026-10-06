@@ -31,14 +31,14 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
 // ---------------------------------------------------------------- schema/open
 
 #[test]
-fn fresh_database_creates_exactly_schema_version_one() {
+fn fresh_database_creates_exactly_schema_version_two() {
     let dir = testing::temp_dir("fresh");
     let path = dir.db("fresh.sqlite3");
     let store = store_at(&path);
     assert_eq!(
         testing::tables(&path),
         EXPECTED_TABLES.to_vec(),
-        "schema 1 is exactly the frozen table set"
+        "the table set is unchanged from schema 1"
     );
     assert_eq!(
         testing::identity(&path),
@@ -46,6 +46,11 @@ fn fresh_database_creates_exactly_schema_version_one() {
             i2pr_irc_store::APPLICATION_ID,
             i2pr_irc_store::SCHEMA_VERSION
         )
+    );
+    assert_eq!(
+        testing::column_type(&path, "history_events", "server_time"),
+        "TEXT",
+        "schema 2 stores the protocol timestamp as canonical text"
     );
     assert!(
         testing::foreign_keys_enabled(&path),
@@ -89,7 +94,11 @@ fn a_newer_schema_version_is_refused_at_startup() {
     let dir = testing::temp_dir("toonew");
     let path = dir.db("toonew.sqlite3");
     store_at(&path).shutdown().expect("store shuts down");
-    testing::stamp(&path, i2pr_irc_store::APPLICATION_ID, 2);
+    testing::stamp(
+        &path,
+        i2pr_irc_store::APPLICATION_ID,
+        i2pr_irc_store::SCHEMA_VERSION + 1,
+    );
     assert_eq!(
         Store::open(&StorePath::File(path.clone()))
             .err()
@@ -131,6 +140,354 @@ fn strict_tables_reject_a_wrong_storage_class() {
             .to_string()
             .contains("cannot store TEXT value in INTEGER column"),
         "expected a STRICT storage-class rejection, got: {error}"
+    );
+}
+
+// ------------------------------------------------------- schema 1 -> 2 migration
+
+/// Builds a v1 database holding `events` history rows.
+///
+/// Each entry is `(event_id, received_at, server_time)`; `server_time` is the v1
+/// whole-second representation and is inserted verbatim.
+fn v1_fixture(path: &std::path::Path, events: &[(i64, i64, Option<i64>)]) {
+    let connection = testing::create_v1_database(path);
+    connection
+        .execute_batch(
+            "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname)
+                  VALUES (1, 'irc.example.i2p', 0, 'bot', 'user', 'bouncer')",
+        )
+        .expect("network fixture applies");
+    connection
+        .execute_batch(
+            "INSERT INTO buffers (buffer_id, network_id, kind, canonical_key, target)
+                  VALUES (1, 1, 0, x'23', '#room')",
+        )
+        .expect("buffer fixture applies");
+    for (event_id, received_at, server_time) in events {
+        connection
+            .execute(
+                "INSERT INTO history_events
+                    (event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload)
+                 VALUES (?1, 1, 1, ?2, ?3, ?4, 0, 'PRIVMSG', ?5)",
+                rusqlite::params![
+                    event_id,
+                    received_at,
+                    server_time,
+                    format!("msg-{event_id}"),
+                    format!(":a!b@c PRIVMSG #room :m{event_id}").into_bytes(),
+                ],
+            )
+            .expect("history fixture applies");
+    }
+}
+
+#[test]
+fn a_schema_one_database_is_migrated_to_two_on_open() {
+    let dir = testing::temp_dir("migrate");
+    let path = dir.db("migrate.sqlite3");
+    // 1546612406 seconds is 2019-01-04T14:33:26Z, the timestamp used in the
+    // IRCv3 chathistory specification examples.
+    v1_fixture(&path, &[(1, 1_546_612_400, Some(1_546_612_406))]);
+    assert_eq!(testing::identity(&path).1, 1, "fixture is at schema 1");
+
+    let store = store_at(&path);
+    assert_eq!(testing::identity(&path).1, 2, "open migrates forward");
+
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 1",
+            &[],
+        )
+        .as_deref(),
+        Some("2019-01-04T14:33:26.000Z"),
+        "a v1 whole-second value becomes a canonical millisecond timestamp"
+    );
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        1,
+        "migration must not lose rows"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn migration_preserves_event_ids_cursors_and_read_markers() {
+    let dir = testing::temp_dir("identity");
+    let path = dir.db("identity.sqlite3");
+    v1_fixture(
+        &path,
+        &[(7, 100, Some(100)), (8, 200, Some(200)), (9, 300, None)],
+    );
+    {
+        let connection = testing::raw(&path);
+        connection
+            .execute_batch("INSERT INTO clients (client_id, login) VALUES (1, 'operator')")
+            .expect("client fixture applies");
+        connection
+            .execute_batch(
+                "INSERT INTO client_cursors (client_id, buffer_id, event_id)
+                      VALUES (1, 1, 8)",
+            )
+            .expect("cursor fixture applies");
+        connection
+            .execute_batch("INSERT INTO read_markers (buffer_id, event_id) VALUES (1, 7)")
+            .expect("marker fixture applies");
+    }
+
+    let store = store_at(&path);
+    assert_eq!(
+        testing::optional_i64(
+            &path,
+            "SELECT event_id FROM client_cursors WHERE client_id = 1",
+            &[],
+        ),
+        Some(8),
+        "a durable cursor must still point at the same event"
+    );
+    assert_eq!(
+        testing::optional_i64(&path, "SELECT event_id FROM read_markers", &[]),
+        Some(7),
+        "a durable read marker must still point at the same event"
+    );
+    assert_eq!(
+        testing::optional_i64(
+            &path,
+            "SELECT event_id FROM history_events WHERE msgid = 'msg-8'",
+            &[],
+        ),
+        Some(8),
+        "event identity is stable across migration"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn migration_keeps_autoincrement_monotonic_so_a_cursor_cannot_alias() {
+    let dir = testing::temp_dir("monotonic");
+    let path = dir.db("monotonic.sqlite3");
+    v1_fixture(&path, &[(4, 1, None), (11, 2, None), (29, 3, None)]);
+
+    let store = store_at(&path);
+    assert_eq!(
+        testing::autoincrement_sequence(&path, "history_events"),
+        Some(29),
+        "the sequence must carry the highest migrated id forward"
+    );
+
+    // A new event must be allocated strictly above every previously issued id,
+    // otherwise a retained cursor could later alias a different event.
+    let buffer = store
+        .handle()
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    let appended = store
+        .handle()
+        .append_history(&[NewHistoryEvent {
+            network: NetworkId(1),
+            buffer,
+            received_at: WallTime(9),
+            server_time: None,
+            msgid: None,
+            direction: EventDirection::Inbound,
+            event_class: "PRIVMSG".into(),
+            payload: b":a!b@c PRIVMSG #room :after-migration".to_vec(),
+        }])
+        .await
+        .expect("append succeeds")
+        .last
+        .expect("identity assigned");
+    assert!(
+        appended.0 > 29,
+        "event {appended:?} must exceed every pre-migration id so no retained cursor aliases it"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn migration_moves_every_row_across_the_batched_boundary() {
+    let dir = testing::temp_dir("batched");
+    let path = dir.db("batched.sqlite3");
+    // More rows than the migration's internal batch size, so the copy genuinely
+    // iterates instead of succeeding in one step.
+    let rows: Vec<(i64, i64, Option<i64>)> = (1..=1_000)
+        .map(|id| (id, 1_000 + id, Some(1_546_612_406)))
+        .collect();
+    v1_fixture(&path, &rows);
+
+    let store = store_at(&path);
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        1_000
+    );
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 1000",
+            &[],
+        )
+        .as_deref(),
+        Some("2019-01-04T14:33:26.000Z"),
+        "the final row of the last batch is converted too"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn a_null_server_time_stays_absent_rather_than_becoming_invented() {
+    let dir = testing::temp_dir("nulltime");
+    let path = dir.db("nulltime.sqlite3");
+    v1_fixture(&path, &[(1, 500, None)]);
+    let store = store_at(&path);
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 1",
+            &[],
+        ),
+        None,
+        "an absent upstream timestamp must not be fabricated from local time"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn a_v1_server_time_outside_the_protocol_window_migrates_as_absent() {
+    let dir = testing::temp_dir("outofrange");
+    let path = dir.db("outofrange.sqlite3");
+    // v1 accepted any integer seconds within +/-32.5e9. The negative end of that
+    // window still lands inside the four-digit year range (it reaches year 940),
+    // so the interesting case is a value the protocol window cannot express at
+    // all -- well before year 1, which no conformant server-time could denote.
+    v1_fixture(
+        &path,
+        &[
+            (1, 500, Some(-100_000_000_000)),
+            (2, 501, Some(-32_503_680_000)),
+            (3, 502, None),
+        ],
+    );
+    let store = store_at(&path);
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 1",
+            &[],
+        ),
+        None,
+        "an unrepresentable v1 timestamp becomes absent"
+    );
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 2",
+            &[],
+        )
+        .as_deref(),
+        Some("0940-01-01T00:00:00.000Z"),
+        "a v1 value that is still representable is converted, not dropped"
+    );
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        3,
+        "every row is retained; only an inexpressible timestamp is dropped"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn the_v2_timestamp_column_rejects_a_non_conformant_shape() {
+    let dir = testing::temp_dir("shape");
+    let path = dir.db("shape.sqlite3");
+    store_at(&path).shutdown().expect("store shuts down");
+    let error = testing::expect_rejected(
+        &path,
+        "INSERT INTO history_events
+            (network_id, buffer_id, received_at, server_time, direction, event_class, payload)
+         VALUES (1, 1, 0, '1700000000', 0, 'PRIVMSG', x'00')",
+    );
+    assert!(
+        error.to_string().contains("CHECK constraint failed"),
+        "expected the storage-level shape check to reject an integer epoch, got: {error}"
+    );
+}
+
+#[test]
+fn a_migration_that_fails_leaves_the_version_one_database_intact() {
+    let dir = testing::temp_dir("rollback");
+    let path = dir.db("rollback.sqlite3");
+    v1_fixture(&path, &[(1, 1_000, Some(1_546_612_406)), (2, 2_000, None)]);
+
+    // Occupy the name the migration needs for its staging table, so the migration
+    // fails partway. The store must refuse rather than serve a half-migrated file.
+    testing::execute(&path, "CREATE TABLE history_events_v2 (occupied INTEGER)");
+
+    assert!(
+        Store::open(&StorePath::File(path.clone())).is_err(),
+        "a migration that cannot complete must not succeed"
+    );
+    assert_eq!(
+        testing::identity(&path).1,
+        1,
+        "a failed migration must leave the version one database untouched"
+    );
+    assert_eq!(
+        testing::count(
+            &path,
+            "SELECT count(*) FROM history_events WHERE msgid = 'msg-1'"
+        ),
+        1,
+        "the original v1 rows are still present and readable"
+    );
+    assert_eq!(
+        testing::optional_i64(&path, "SELECT occupied FROM history_events_v2", &[]),
+        None,
+        "the obstructing table is not consumed or partially populated"
+    );
+
+    // Once the obstruction is cleared the same file migrates cleanly, proving the
+    // failure rolled back rather than leaving a permanently poisoned database.
+    testing::execute(&path, "DROP TABLE history_events_v2");
+    let store = store_at(&path);
+    assert_eq!(testing::identity(&path).1, 2);
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 1",
+            &[],
+        )
+        .as_deref(),
+        Some("2019-01-04T14:33:26.000Z")
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn reopening_an_already_migrated_database_does_not_migrate_again() {
+    let dir = testing::temp_dir("idem");
+    let path = dir.db("idem.sqlite3");
+    v1_fixture(&path, &[(1, 1_000, Some(1_546_612_406))]);
+    store_at(&path).shutdown().expect("first open migrates");
+    let after_first = testing::tables(&path);
+    store_at(&path)
+        .shutdown()
+        .expect("second open is a plain reopen");
+    assert_eq!(
+        testing::tables(&path),
+        after_first,
+        "migration is not repeated"
+    );
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT server_time FROM history_events WHERE event_id = 1",
+            &[],
+        )
+        .as_deref(),
+        Some("2019-01-04T14:33:26.000Z"),
+        "a second open must not re-truncate an already canonical timestamp"
     );
 }
 
@@ -290,7 +647,11 @@ async fn canonical_order_is_local_identity_not_wall_time() {
             network,
             buffer,
             received_at: WallTime(1000),
-            server_time: Some(WallTime(999 - index)),
+            // Descending server time, so timestamp order and local order disagree.
+            server_time: Some(
+                i2pr_irc_wire::IrcTimestamp::from_unix_millis((999 - index) * 1_000)
+                    .expect("representable"),
+            ),
             msgid: None,
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),

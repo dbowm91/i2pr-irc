@@ -7,6 +7,7 @@ use crate::{
     model::*,
 };
 use i2pr_irc_core::{BufferId, Casemapping, ClientId, HistoryEventId, I2pEndpoint, NetworkId};
+use i2pr_irc_wire::IrcTimestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// SQLite stores 64-bit integers; a value that cannot round-trip as one is corrupt
@@ -515,7 +516,7 @@ pub(crate) fn append_history(
                     to_sql_id(event.network.0)?,
                     to_sql_id(event.buffer.0)?,
                     event.received_at.unix_seconds(),
-                    event.server_time.map(|time| WallTimeSeconds(time.unix_seconds())),
+                    event.server_time.map(|time| ServerTimeText(time.to_string())),
                     event.msgid,
                     event_direction_code(event.direction),
                     event.event_class,
@@ -536,15 +537,11 @@ pub(crate) fn append_history(
     Ok(result)
 }
 
-struct WallTimeSeconds(i64);
-impl rusqlite::ToSql for WallTimeSeconds {
+/// Canonical `server-time` text on its way into the v2 column.
+struct ServerTimeText(String);
+impl rusqlite::ToSql for ServerTimeText {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        Ok(rusqlite::types::ToSqlOutput::from(self.0))
-    }
-}
-impl rusqlite::types::FromSql for WallTimeSeconds {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        value.as_i64().map(Self)
+        Ok(rusqlite::types::ToSqlOutput::from(self.0.as_str()))
     }
 }
 
@@ -579,7 +576,7 @@ pub(crate) fn query_history(
             row.get::<_, i64>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
-            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, String>(7)?,
@@ -622,11 +619,14 @@ pub(crate) fn query_history(
         }
         let received_at = i2pr_irc_core::WallTime::from_unix_seconds(received_at)
             .ok_or_else(|| StoreError::new(StoreErrorKind::Corrupt("history receive timestamp")))?;
+        // The v2 column carries canonical text. Anything that does not parse is
+        // durable corruption, not a value to guess at: replaying a rewritten
+        // timestamp would make the bouncer disagree with the upstream silently.
         let server_time = server_time
             .map(|value| {
-                i2pr_irc_core::WallTime::from_unix_seconds(value).ok_or(StoreError::new(
-                    StoreErrorKind::Corrupt("history server timestamp"),
-                ))
+                IrcTimestamp::parse_str(&value).map_err(|_| {
+                    StoreError::new(StoreErrorKind::Corrupt("history server timestamp"))
+                })
             })
             .transpose()?;
         events.push(HistoryEvent {

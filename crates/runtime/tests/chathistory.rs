@@ -301,7 +301,10 @@ async fn a_replayed_line_carries_a_truthful_target_type_and_time() {
     assert_eq!(message.command.as_slice(), b"PRIVMSG");
     assert!(message.params.contains(&b"#room".to_vec()));
     assert!(message.params.contains(&b"message 0".to_vec()));
-    assert!(message.time().is_some(), "server-time is always present");
+    assert!(
+        message.server_time().is_some(),
+        "server-time is always present"
+    );
     assert!(
         reply.lines[0].ends_with(b"\r\n"),
         "each replayed line is exactly one complete frame"

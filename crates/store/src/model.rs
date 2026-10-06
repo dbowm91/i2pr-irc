@@ -6,6 +6,7 @@
 use i2pr_irc_core::{
     BufferId, Casemapping, ClientId, HistoryEventId, I2pEndpoint, NetworkId, WallTime,
 };
+use i2pr_irc_wire::IrcTimestamp;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum durable Networks one catalog may hold.
@@ -239,7 +240,12 @@ pub struct HistoryEvent {
     pub network: NetworkId,
     pub buffer: BufferId,
     pub received_at: WallTime,
-    pub server_time: Option<WallTime>,
+    /// The upstream protocol timestamp exactly as the server stated it.
+    ///
+    /// `None` means the upstream sent no `server-time`; it is never synthesized
+    /// from local time, because a fabricated upstream claim is a lie the client
+    /// cannot detect. Ordering never depends on this value.
+    pub server_time: Option<IrcTimestamp>,
     pub msgid: Option<String>,
     pub direction: EventDirection,
     /// Stable protocol class retained for truthful replay decisions.
@@ -254,7 +260,12 @@ pub struct NewHistoryEvent {
     pub network: NetworkId,
     pub buffer: BufferId,
     pub received_at: WallTime,
-    pub server_time: Option<WallTime>,
+    /// The upstream protocol timestamp exactly as the server stated it.
+    ///
+    /// `None` means the upstream sent no `server-time`; it is never synthesized
+    /// from local time, because a fabricated upstream claim is a lie the client
+    /// cannot detect. Ordering never depends on this value.
+    pub server_time: Option<IrcTimestamp>,
     pub msgid: Option<String>,
     pub direction: EventDirection,
     pub event_class: String,

@@ -28,7 +28,7 @@ use crate::{
 };
 use i2pr_irc_core::{BufferId, HistoryEventId};
 use i2pr_irc_store::{HistoryEvent, RetentionRequest};
-use i2pr_irc_wire::{MAX_LINE_BYTES, MSGID_TAG, Message, TIME_TAG};
+use i2pr_irc_wire::{IrcTimestamp, MAX_LINE_BYTES, MSGID_TAG, Message, TIME_TAG};
 use std::collections::BTreeSet;
 
 /// The chathistory capability name this adapter implements.
@@ -415,10 +415,19 @@ fn render_one(event: &HistoryEvent, remaining_bytes: usize) -> Option<Vec<u8>> {
     framed.extend_from_slice(b"\r\n");
     let mut message = Message::parse(&framed).ok()?;
     message.tags.clear();
-    let time = event
-        .server_time
-        .unwrap_or(event.received_at)
-        .unix_seconds();
+    // Replay the upstream timestamp verbatim. When the upstream never sent one, a
+    // valid local millisecond timestamp is synthesized rather than leaving the tag
+    // absent, so a client that relies on `server-time` always has a well-formed
+    // value. Either way this is metadata: ordering stays `HistoryEventId`.
+    let time = event.server_time.or_else(|| {
+        IrcTimestamp::from_unix_millis(
+            event
+                .received_at
+                .unix_seconds()
+                .checked_mul(1_000)
+                .unwrap_or_default(),
+        )
+    })?;
     message
         .tags
         .insert(TIME_TAG.to_vec(), Some(time.to_string().into_bytes()));
@@ -645,7 +654,9 @@ mod tests {
             network: i2pr_irc_core::NetworkId(1),
             buffer: BufferId(1),
             received_at: i2pr_irc_core::WallTime(500),
-            server_time: Some(i2pr_irc_core::WallTime(1_700_000_000)),
+            server_time: Some(
+                IrcTimestamp::from_unix_millis(1_700_000_000_620).expect("representable"),
+            ),
             msgid: None,
             direction: i2pr_irc_store::EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
@@ -653,8 +664,12 @@ mod tests {
         };
         let line = render_one(&event, 4096).expect("renders");
         let parsed = Message::parse(&line).expect("parses");
-        // The real upstream value is preferred over the local receive time.
-        assert_eq!(parsed.time(), Some(1_700_000_000));
+        // The real upstream value is preferred over the local receive time, and is
+        // replayed as canonical text with its milliseconds intact.
+        assert_eq!(
+            parsed.server_time().map(|time| time.to_string()),
+            Some("2023-11-14T22:13:20.620Z".to_owned())
+        );
         assert!(
             parsed.msgid().is_none(),
             "a msgid must not be invented when none was preserved"
@@ -676,8 +691,33 @@ mod tests {
         };
         let line = render_one(&event, 4096).expect("renders");
         let parsed = Message::parse(&line).expect("parses");
-        assert_eq!(parsed.time(), Some(4242));
+        assert_eq!(
+            parsed.server_time().map(|time| time.to_string()),
+            Some("1970-01-01T01:10:42.000Z".to_owned()),
+            "a locally synthesized timestamp is canonical text, never an integer epoch"
+        );
         assert_eq!(parsed.msgid(), Some("real"));
+    }
+
+    #[test]
+    fn a_leap_second_replays_without_being_normalised() {
+        let event = HistoryEvent {
+            event: HistoryEventId(1),
+            network: i2pr_irc_core::NetworkId(1),
+            buffer: BufferId(1),
+            received_at: i2pr_irc_core::WallTime(500),
+            server_time: Some(IrcTimestamp::parse_str("2012-06-30T23:59:60.419Z").expect("parses")),
+            msgid: None,
+            direction: i2pr_irc_store::EventDirection::Inbound,
+            event_class: "PRIVMSG".into(),
+            payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
+        };
+        let line = render_one(&event, 4096).expect("renders");
+        let parsed = Message::parse(&line).expect("parses");
+        assert_eq!(
+            parsed.server_time().map(|time| time.to_string()),
+            Some("2012-06-30T23:59:60.419Z".to_owned())
+        );
     }
 
     #[test]
