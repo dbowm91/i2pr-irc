@@ -16,6 +16,7 @@ use i2pr_irc_runtime::{
     journal::{BacklogCap, HistoryJournal, IngestOutcome},
     owner::{MAX_SESSIONS_PER_NETWORK, NetworkOwner, NetworkSnapshot, Phase},
     reconnect::ReconnectScheduler,
+    resource::ResourceLedger,
 };
 use i2pr_irc_store::{
     BufferKind, NetworkRecord, STORE_BUSY_TIMEOUT_MS, Store, StoreErrorKind, StoreHandle, StorePath,
@@ -105,19 +106,16 @@ impl Online {
                 }))
                 .expect("queue");
         }
+        let reconnect = ReconnectScheduler::default();
         let context = SupervisorContext {
             network: NetworkId(network),
             record: Arc::new(record(network, nick, channels)),
             store: store.clone(),
             status: watch::channel(Default::default()).0,
+            resources: ResourceLedger::new(reconnect.clone(), store.clone()),
         };
-        let owner = NetworkOwner::new(
-            Shared(provider.clone()),
-            context,
-            store,
-            ReconnectScheduler::default(),
-        )
-        .expect("owner constructs");
+        let owner = NetworkOwner::new(Shared(provider.clone()), context, store, reconnect)
+            .expect("owner constructs");
         let snapshot = owner.subscribe_snapshot();
         let (command_tx, command_rx) = mpsc::channel(64);
         let handle = SupervisorHandle::new(NetworkId(network), command_tx.clone());

@@ -12,6 +12,7 @@ use i2pr_irc_runtime::{
     },
     owner::{MAX_SESSIONS_PER_NETWORK, NetworkOwner, Phase},
     reconnect::ReconnectScheduler,
+    resource::ResourceLedger,
 };
 use i2pr_irc_store::{NetworkRecord, Store, StoreHandle, StorePath, StoredSecret};
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
@@ -108,19 +109,17 @@ impl Harness {
         for _ in 0..4 {
             provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         }
+        let reconnect = ReconnectScheduler::default();
+        let resources = ResourceLedger::new(reconnect.clone(), store.clone());
         let context = SupervisorContext {
             network: NetworkId(network),
             record: Arc::new(record(network, nick, channels)),
             store: store.clone(),
             status: watch::channel(Default::default()).0,
+            resources: resources.clone(),
         };
-        let owner = NetworkOwner::new(
-            Shared(provider.clone()),
-            context,
-            store,
-            ReconnectScheduler::default(),
-        )
-        .expect("owner constructs");
+        let owner = NetworkOwner::new(Shared(provider.clone()), context, store, reconnect)
+            .expect("owner constructs");
         let snapshot = owner.subscribe_snapshot();
         let (command_tx, command_rx) = mpsc::channel(64);
         let handle = SupervisorHandle::new(NetworkId(network), command_tx.clone());

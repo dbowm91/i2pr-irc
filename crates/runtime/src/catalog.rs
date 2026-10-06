@@ -9,7 +9,7 @@
 //! the right one. That is what keeps "one live owner per Network" true at scale.
 use crate::{
     RuntimeError, downstream::DownstreamDisposition, reconnect::ReconnectScheduler,
-    session::SessionEvent, session::SessionIntent,
+    resource::ResourceLedger, session::SessionEvent, session::SessionIntent,
 };
 use i2pr_irc_core::{
     ByteStream, ClientId, ConnectionGeneration, NetworkId, SessionId, SessionIdAllocator,
@@ -151,6 +151,11 @@ pub struct NetworkCatalog {
     /// supervised Networks and the router: each one's backoff is deliberately
     /// independent, so without a shared gate a shared outage becomes a connect stampede.
     reconnect: ReconnectScheduler,
+    /// Process-wide bounded resource accounting.
+    ///
+    /// Also process-wide by necessity: proving that a many-Network campaign settled back
+    /// to its baseline requires one reading of the whole process, not one per Network.
+    resources: ResourceLedger,
 }
 
 impl NetworkCatalog {
@@ -165,18 +170,28 @@ impl NetworkCatalog {
     /// depending on the wall-clock production values.
     pub fn with_reconnect(store: StoreHandle, reconnect: ReconnectScheduler) -> Self {
         let (statuses, _) = watch::channel(CatalogStatus::default());
+        let resources = ResourceLedger::new(reconnect.clone(), store.clone());
         Self {
             store,
             handles: BTreeMap::new(),
             statuses,
             sessions: SessionIdAllocator::new(),
             reconnect,
+            resources,
         }
     }
 
     /// The process-wide connect budget every supervised Network is gated by.
     pub fn reconnect(&self) -> &ReconnectScheduler {
         &self.reconnect
+    }
+
+    /// Process-wide bounded resource accounting.
+    ///
+    /// Handed to every owner so each publishes its own gauges; read through it to take a
+    /// baseline, drive a campaign, and assert the process settled back down.
+    pub fn resources(&self) -> &ResourceLedger {
+        &self.resources
     }
 
     pub fn store(&self) -> &StoreHandle {
@@ -298,6 +313,8 @@ pub struct SupervisorContext {
     pub record: Arc<NetworkRecord>,
     pub store: StoreHandle,
     pub status: watch::Sender<CatalogStatus>,
+    /// Process-wide resource accounting this owner publishes its gauges into.
+    pub resources: ResourceLedger,
 }
 
 /// A stop request the catalog records for diagnostics.

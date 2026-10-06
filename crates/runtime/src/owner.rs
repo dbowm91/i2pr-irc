@@ -22,6 +22,7 @@ use crate::{
     playback::PlaybackOutcome,
     projection,
     reconnect::{ReconnectScheduler, jitter_entropy},
+    resource::{NetworkGauges, ResourceLedger},
     routing::{
         BatchRole, Incoming, LABEL_TAG, RequestClass, ResponseRouter, RouteOutcome, RouteRefusal,
         Routed, RoutingRequest,
@@ -592,6 +593,12 @@ pub struct NetworkSnapshot {
     pub upstream_capabilities: String,
     /// Routes currently open for this generation. Never durable.
     pub response_routes: usize,
+    /// Batch references currently attributed to one of those routes.
+    ///
+    /// Tracked only so a labeled reply's continuation frames can reach the session that
+    /// asked the question. A batch whose owning route is gone is pruned rather than kept,
+    /// so this must fall back to zero when routing settles.
+    pub open_batches: usize,
     /// Correlated replies dropped because no live route claimed them.
     ///
     /// A reply that carries a response label but matches no route is orphaned: its
@@ -638,6 +645,12 @@ pub struct NetworkOwner<P> {
     /// Held by handle, never owned: one Network's retry timing must not be able to
     /// affect another's, and every attempt in this process shares one budget.
     reconnect: ReconnectScheduler,
+    /// Process-wide resource accounting.
+    ///
+    /// Held by handle for the same reason as the scheduler: an owner that owned it could
+    /// keep reporting after it stopped, and one owner dropping it would stop the others
+    /// being measurable.
+    resources: ResourceLedger,
 }
 
 impl<P: I2pStreamProvider> NetworkOwner<P> {
@@ -653,6 +666,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             state.phase = Some(Phase::Idle);
             state.nick = Some(context.record.nick.clone());
         });
+        // An owner task exists from construction, so it is counted from construction. The
+        // `Drop` below is what makes the count return to baseline.
+        context.resources.register(context.network)?;
+        let resources = context.resources.clone();
         Ok(Self {
             provider,
             network: context.network,
@@ -660,7 +677,29 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             store,
             snapshot,
             reconnect,
+            resources,
         })
+    }
+
+    /// Process-wide resource accounting this owner publishes into.
+    pub fn resources(&self) -> &ResourceLedger {
+        &self.resources
+    }
+
+    /// Publishes this owner's resting gauges, used when a generation ends.
+    ///
+    /// A Network that is between generations still exists and still holds its owner task
+    /// and its attached sessions, so only the per-generation gauges fall to zero. An
+    /// owner that reported itself entirely empty here would make a restarting Network
+    /// look like a leak-free one.
+    fn publish_resting_gauges(&self) {
+        let _ = self.resources.observe(
+            self.network,
+            NetworkGauges {
+                owner_tasks: 1,
+                ..NetworkGauges::ZERO
+            },
+        );
     }
 
     /// The process-wide connect budget this Network is gated by.
@@ -709,26 +748,57 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     /// every subscriber once per line.
     fn publish_gauges(
         &self,
-        sessions: usize,
+        sessions: &BTreeMap<SessionId, SessionTask>,
         router: &ResponseRouter,
         normal_tx: &mpsc::Sender<OutboundIntent>,
         control_tx: &mpsc::Sender<Vec<u8>>,
+        reconcile_pending: usize,
+        history_queued: usize,
     ) {
         let normal_depth = NORMAL_QUEUE_CAPACITY - normal_tx.capacity();
         let control_depth = CONTROL_QUEUE_CAPACITY - control_tx.capacity();
         let routes = router.open_routes();
+        let batches = router.open_batches();
+        let attached = sessions.len();
+        // The deepest queue across attached sessions, not the sum. A sum would report one
+        // pathological client as if every client were that far behind, which is the
+        // opposite of what the number is for.
+        let (mut session_normal, mut session_control) = (0, 0);
+        for task in sessions.values() {
+            let (normal, control) = task.handle().queue_depths();
+            session_normal = session_normal.max(normal);
+            session_control = session_control.max(control);
+        }
+        let owner_owned = NetworkGauges {
+            owner_tasks: 1,
+            session_tasks: attached,
+            session_normal,
+            session_control,
+            upstream_normal: normal_depth,
+            upstream_control: control_depth,
+            response_routes: routes,
+            open_batches: batches,
+            desired_reconcile: reconcile_pending,
+            history_ingest: history_queued,
+        };
+        // The ledger is the process-wide accounting surface, so a refusal here is counted
+        // there and never propagated: refusing to report a gauge must not stop the
+        // Network, because the Network is real and the diagnostic is not.
+        let _ = self.resources.observe(self.network, owner_owned);
         self.snapshot.send_if_modified(|snapshot| {
-            if snapshot.attached_sessions == sessions
+            if snapshot.attached_sessions == attached
                 && snapshot.upstream_normal_queue_depth == normal_depth
                 && snapshot.upstream_control_queue_depth == control_depth
                 && snapshot.response_routes == routes
+                && snapshot.open_batches == batches
             {
                 return false;
             }
-            snapshot.attached_sessions = sessions;
+            snapshot.attached_sessions = attached;
             snapshot.upstream_normal_queue_depth = normal_depth;
             snapshot.upstream_control_queue_depth = control_depth;
             snapshot.response_routes = routes;
+            snapshot.open_batches = batches;
             true
         });
     }
@@ -829,6 +899,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 }
                 Err(error) => Err(error),
             };
+            // The generation's per-generation state is gone: routes, batches, upstream
+            // queues and the ingest queue all died with it. The owner task itself did
+            // not, so only the generation-scoped gauges fall to zero here.
+            self.publish_resting_gauges();
             // A registration rejection means the credentials or configuration were
             // refused. Retrying the identical request cannot succeed, and each attempt
             // would spend a permit the whole process shares, so the Network is marked
@@ -1355,7 +1429,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // Published after the turn so the snapshot reflects settled state. The
             // upstream writer drains on its own task, so publishing before the turn
             // would always report the queue exactly as the turn found it.
-            self.publish_gauges(sessions.len(), &router, &normal_tx, &control_tx);
+            self.publish_gauges(
+                &sessions,
+                &router,
+                &normal_tx,
+                &control_tx,
+                reconcile.pending.len(),
+                INGEST_QUEUE_CAPACITY - ingest_tx.capacity(),
+            );
         };
 
         // Deterministic teardown: every session and the writer are owned here, so no
@@ -2146,6 +2227,18 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let _ = task.handle().queue_control(&format!(
             ":bouncer NOTICE {nick} :Bouncer could not accept that command for upstream delivery ({class} refused)\r\n"
         ));
+    }
+}
+
+/// Stopping an owner removes it from process-wide accounting.
+///
+/// This is the only path that clears the ledger entry, so a campaign that starts and
+/// stops Networks can assert the process returned to its baseline. It runs on drop rather
+/// than at the end of `serve` because an owner abandoned before it ever served -- a
+/// dropped task handle, an aborted supervisor -- must still stop being counted.
+impl<P> Drop for NetworkOwner<P> {
+    fn drop(&mut self) {
+        self.resources.forget(self.network);
     }
 }
 

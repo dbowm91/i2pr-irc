@@ -68,12 +68,57 @@ struct State {
     write_wakers: [Option<Waker>; 2],
     captured: [Vec<u8>; 2],
     trace_truncated: [bool; 2],
+    /// Bytes handed over by `release_after` that actually reached the peer's buffer.
+    delivered: [usize; 2],
     script: FaultScript,
 }
 struct Shared(Mutex<State>);
 #[derive(Clone)]
 pub struct FaultController(Arc<Shared>);
 impl FaultController {
+    /// Releases bytes to one side after a delay, modelling a slow link.
+    ///
+    /// This is deliberately different from [`Self::stall_read`]. A stall is a wall the
+    /// test lowers and raises, which proves a peer does not spin while nothing is
+    /// arriving. A delay is bytes that *are* on their way, which proves a bounded reader
+    /// survives them arriving late and out of an empty queue. Both are needed: one is a
+    /// missing event, the other is a slow one.
+    ///
+    /// The bytes are dropped rather than queued if the peer's buffer is already full, so a
+    /// delayed release cannot manufacture unbounded buffering behind the capacity the
+    /// script already declares.
+    ///
+    /// Panics outside a Tokio runtime, because a delayed release is a task and a task
+    /// needs a scheduler. That is a fixture bug rather than a production condition, so it
+    /// fails loudly instead of silently never delivering.
+    pub fn release_after(&self, side: usize, delay: std::time::Duration, bytes: Vec<u8>) {
+        assert!(side < 2, "side must be 0 or 1");
+        let shared = self.0.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let mut s = shared.0.lock().expect("fixture lock poisoned");
+            if s.read_closed[side] || s.write_closed[1 - side] {
+                return;
+            }
+            let room = s.script.capacity.saturating_sub(s.input[side].len());
+            let n = bytes.len().min(room);
+            if n == 0 {
+                return;
+            }
+            s.input[side].extend(&bytes[..n]);
+            s.delivered[side] = s.delivered[side].saturating_add(n);
+            wake(&mut s.read_wakers[side]);
+        });
+    }
+
+    /// True once every byte this controller was asked to deliver has arrived.
+    pub fn delivered(&self, side: usize) -> usize {
+        if side > 1 {
+            return 0;
+        }
+        self.0.0.lock().expect("fixture lock poisoned").delivered[side]
+    }
+
     pub fn stall_read(&self, side: usize, stalled: bool) {
         if side > 1 {
             return;
@@ -169,6 +214,7 @@ impl ScriptedStream {
             write_wakers: [None, None],
             captured: [Vec::new(), Vec::new()],
             trace_truncated: [false; 2],
+            delivered: [0; 2],
             script,
         };
         let shared = Arc::new(Shared(Mutex::new(state)));
@@ -688,5 +734,51 @@ mod tests {
         assert_eq!(c.bytes_written(0), b"se");
         assert!(c.trace_truncated(0));
         assert_eq!(c.descriptor("bounded").script.seed, 0);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_release_arrives_late_and_is_counted() {
+        let (_a, mut b, c) = ScriptedStream::pair(FaultScript::default());
+        // `b` is side 1, so the bytes must be released into side 1's buffer. A fixed
+        // length read is used rather than `read_to_end`, which would only return once the
+        // peer shut down and so would test shutdown instead of delay.
+        let read = tokio::spawn(async move {
+            let mut bytes = [0u8; 6];
+            b.read_exact(&mut bytes).await.unwrap();
+            bytes
+        });
+        c.release_after(
+            1,
+            std::time::Duration::from_millis(20),
+            b"PING\r\n".to_vec(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert_eq!(
+            c.delivered(1),
+            0,
+            "nothing may be delivered before the delay elapses"
+        );
+        assert_eq!(&read.await.unwrap(), b"PING\r\n");
+        assert_eq!(c.delivered(1), 6);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_release_never_exceeds_the_declared_capacity() {
+        let (_a, _b, c) = ScriptedStream::pair(FaultScript {
+            capacity: 4,
+            ..FaultScript::default()
+        });
+        c.release_after(
+            1,
+            std::time::Duration::from_millis(5),
+            b"far too many bytes".to_vec(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            c.buffered_len(1),
+            4,
+            "a delayed release must not buffer past the capacity the script declares"
+        );
+        assert_eq!(c.delivered(1), 4);
     }
 }

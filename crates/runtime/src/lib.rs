@@ -15,6 +15,7 @@ pub mod owner;
 pub mod playback;
 pub mod projection;
 pub mod reconnect;
+pub mod resource;
 pub mod routing;
 pub mod session;
 pub mod state;
@@ -82,6 +83,11 @@ pub enum Phase {
 pub enum RuntimeError {
     #[error("provider failure: {0}")]
     Provider(#[from] ProviderError),
+    /// The process-wide resource ledger already tracks the supervised-Network ceiling, so
+    /// this owner cannot be accounted for. Reported as an overload because that is what
+    /// it is: the process is supervising as much as it is permitted to.
+    #[error("bounded resource ledger overloaded")]
+    LedgerRefused(#[from] crate::resource::LedgerRefused),
     #[error("operation timed out")]
     Timeout,
     #[error("protocol failure")]
@@ -906,6 +912,7 @@ pub(crate) fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
         Err(RuntimeError::QueueOverloaded) => "queue-overload",
         Err(RuntimeError::GenerationExhausted) => "generation-exhausted",
         Err(RuntimeError::AmbiguousBuffer(_)) => "ambiguous-buffer",
+        Err(RuntimeError::LedgerRefused(_)) => "ledger-overload",
         Ok(()) => "stopped",
     }
 }
