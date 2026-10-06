@@ -167,7 +167,8 @@ One exception is recorded as UF-018-1 below: `catalog::MAX_TOTAL_SESSIONS` is de
 neither enforced nor asserted. The session population is still bounded — by
 `MAX_SUPERVISED_NETWORKS` (64, enforced at `catalog.rs:212`) times `MAX_SESSIONS_PER_NETWORK`
 (64, enforced in `owner.rs`) — but that product is 4096, not the 1024 the unused constant
-declares.
+declares. **Since Corrective 019 the constant no longer exists**; it was deleted rather than
+enforced. The paragraph above is left as M004 recorded it.
 
 ## Static network-boundary evidence
 
@@ -286,6 +287,22 @@ Two further corrections recorded by that review:
   `ctcp::` module; the *enforcement site* is duplicated logic (`lib.rs:798-831` vs
   `owner.rs:1563`). There is no shared guard.
 
+### Disposition: all three findings closed by Corrective 019
+
+Corrective 019 implemented the corrected remedies above and closed all three findings.
+Evidence is in `plans/closure/bouncer-core/019-status.md`; summarised here so this record's
+findings section is not left reading as open work.
+
+| Finding | Status | What closed it |
+|---|---|---|
+| UF-015-1 | **Closed** | `NetworkSupervisor`, `UpstreamConfig`, the legacy `NetworkSnapshot`, `AcceptFuture` and the legacy-only helpers are gated `#[cfg(test)]`. The production build no longer contains a second Network owner. The two behaviours that made deletion unsafe — the SASL PLAIN handshake and the upstream `QUIT` fence — now have production-path coverage in `crates/runtime/tests/corrective_019.rs`, so the legacy suite is redundant rather than load-bearing. |
+| UF-017-1 | **Closed** | The campaign steps virtual time in a loop and now measures 52 attempts for 4 Networks over 3000s, against a ceiling of 64 that is **mutation-verified**: with `Backoff` base and cap set to zero the same campaign measures 100 and fails. The `timeout_bounded` doc comment is corrected. |
+| UF-018-1 | **Closed** | `catalog::MAX_TOTAL_SESSIONS` is deleted; no source references it. The 012 ceiling row is amended to the real derived bound of 4096. |
+
+The two correction bullets above — the false `timeout_bounded` comment and the overstated
+"shared policy" comment — are also applied. The latter is annotated rather than merely
+corrected, because the whole duplicated enforcement site is now test-only.
+
 None of this changes any M004 claim. M004 closed correctly: the findings were real,
 recorded honestly, non-blocking, and M004's own invariants were not weakened to reach
 closure. What was wrong was the proposed remedy, and that is what Corrective 019 fixes.
@@ -354,7 +371,7 @@ Plan 018 section 8 forbids closing M004 with any of the following. None is prese
 | client-dependent upstream fingerprint | None. Registration and CTCP visibility are client-independent. |
 | environment/secret leakage | None. See the negative matrix. |
 | dead response-routing machinery | None. Routes open, route, and close on live traffic. |
-| unbounded reconnect admission | None on the production path. Four explicit ceilings. The legacy supervisor in UF-015-1 sits outside them. |
+| unbounded reconnect admission | None on the production path. Four explicit ceilings. The legacy supervisor in UF-015-1 sits outside them; Corrective 019 since gated it out of the production build. |
 | starvation | None. FIFO fairness proven. |
 | task/queue/resource leak | None. Every campaign settles to baseline. |
 | hidden replay of ambiguous user traffic | None. Refusals are reported, never retried; intents are generation-stamped. |

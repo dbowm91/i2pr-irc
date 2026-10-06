@@ -26,20 +26,20 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | Corrective 019 ready; M005 planning eligible | Corrective 014 and M004-A/B/C/D are closed, so M004 is complete. UF-015-1, UF-017-1 and UF-018-1 are owned by Corrective 019; independent review revised two of the three remedies the M004 closure record proposed. M005 remains planning/research eligible and is not blocked by this corrective. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | Corrective 019 closed; M005 planning eligible | Corrective 014, M004-A/B/C/D and Corrective 019 are closed, so M004 is complete with no open findings. UF-015-1, UF-017-1 and UF-018-1 were all closed by Corrective 019 after independent review revised two of the three remedies the M004 closure record proposed. M005 remains planning/research eligible and was never blocked by this corrective. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core Corrective 019 — Close M004 Findings and Restore Sole-Owner Evidence | ready | invariant + testability corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/019-status.md |
-
+| _(none)_ | | | | |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core Corrective 019 — Close M004 Findings and Restore Sole-Owner Evidence | closed | invariant + testability corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/019-status.md |
 | Bouncer Core M004-D / Plan 018 — Integrated Anonymity Qualification and M004 Closure | closed | invariant qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/018-status.md |
 | Bouncer Core M004-C / Plan 017 — Adverse-Network and Resource Qualification | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/017-status.md |
 | Bouncer Core M004-B / Plan 016 — Global Reconnect Budget | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/016-status.md |
@@ -104,17 +104,16 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Implement only:
+Plan or research only:
 
-- `plans/implementation/bouncer-core/019-m004-findings-corrective.md`
+- bouncer-core M005 — no implementation plan exists yet.
 
-Corrective 019 closes the three findings M004 left open. It adds no protocol feature and no
-dependency: it gates a duplicate network owner out of the shipped API, deletes an unenforced
-stale constant, repairs one vacuous qualification campaign, and ports two production
-behaviours that are currently tested only by the code being gated.
+Corrective 019 is closed (`plans/closure/bouncer-core/019-status.md`). It left M004 with no
+open findings: it gated the duplicate network owner out of the shipped API, deleted an
+unenforced stale constant, repaired a vacuous qualification campaign into one whose bound is
+mutation-verified, and ported two production behaviours that had previously been tested only
+by the code being gated.
 
-M005 planning and research remain eligible alongside it. This corrective does not block or
-change M005 scope.
-
-Router integration remains blocked behind M005, and no router-specific implementation is
-authorized by M004 closure alone.
+M005 was never blocked by Corrective 019 and its scope is unchanged by it. Router
+integration remains blocked behind M005, and no router-specific implementation is authorized
+by M004 closure alone.
