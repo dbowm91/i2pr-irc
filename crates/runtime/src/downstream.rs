@@ -702,7 +702,7 @@ fn queue_bytes(sender: &mpsc::Sender<Vec<u8>>, bytes: Vec<u8>) -> Result<(), Run
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::NetworkState;
+    use crate::state::{DesiredChannelPolicy, NetworkState};
 
     /// A session plus the queues a test observes directly.
     struct Harness {
@@ -759,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_projects_retained_state_truthfully() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         // Membership is only ever established by the server's own JOIN.
         state.begin_desired_join("#room");
         state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
@@ -795,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_mode_state_omits_the_mode_projection() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv 005 bot CHANMODES=beI,k,l,imnpst\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv MODE #room +nq\r\n").unwrap());
@@ -810,7 +810,7 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_membership_omits_the_names_projection() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         state.apply_line(&Message::parse(b":bot!u@h JOIN #room\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv 353 bot = #room :bot\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv MODE #room +v Stranger\r\n").unwrap());
@@ -910,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_desired_channel_without_confirmation_is_never_projected() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         state.begin_desired_join("#room");
         state.apply_line(&Message::parse(b":srv 332 bot #room :subject\r\n").unwrap());
         state.apply_line(&Message::parse(b":srv 353 bot = #room :bot\r\n").unwrap());
@@ -1069,7 +1069,10 @@ mod tests {
 
     #[test]
     fn cap_acknowledges_only_capabilities_the_session_really_implements() {
-        let mut harness = Harness::new(NetworkState::new("bot", &["#room".into()]));
+        let mut harness = Harness::new(NetworkState::new(
+            "bot",
+            &[DesiredChannelPolicy::attached("#room")],
+        ));
         harness.register();
 
         // A supported capability is acknowledged and retained.
@@ -1105,7 +1108,10 @@ mod tests {
     #[test]
     fn chathistory_isupport_is_advertised_only_to_a_negotiated_client() {
         // A client that never negotiated the capability must not be told it exists.
-        let mut harness = Harness::new(NetworkState::new("bot", &["#room".into()]));
+        let mut harness = Harness::new(NetworkState::new(
+            "bot",
+            &[DesiredChannelPolicy::attached("#room")],
+        ));
         harness.register();
         harness.send(b"JOIN #room\r\n").expect("accepted");
         let out = harness.drain_normal();
@@ -1114,7 +1120,10 @@ mod tests {
             "an un-negotiated client must not receive the history ISUPPORT: {out}"
         );
 
-        let mut harness = Harness::new(NetworkState::new("bot", &["#room".into()]));
+        let mut harness = Harness::new(NetworkState::new(
+            "bot",
+            &[DesiredChannelPolicy::attached("#room")],
+        ));
         harness
             .send(b"CAP REQ :draft/chathistory\r\n")
             .expect("accepted");

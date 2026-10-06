@@ -27,7 +27,7 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 3
+## Schema version 4
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
@@ -35,7 +35,7 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 |---|---|
 | `networks` | durable Network configuration, including its operator-facing display name |
 | `network_secrets` | restart-required SASL material, typed separately |
-| `desired_channels` | durable operator intent, ordered |
+| `desired_channels` | durable operator intent, ordered, with its bouncer-owned presentation flag |
 | `clients` | durable client lineage |
 | `buffers` | stable per-Network buffer identity |
 | `history_events` | bounded durable history |
@@ -71,6 +71,26 @@ It is display only. It never participates in lookup, routing, or identity, and i
 Existing rows receive `network-<id>`, derived only from the durable `NetworkId` the row already carries. That is deterministic, stable across restarts, and carries no endpoint, nick, path, or machine detail. `fallback_display_name` is the single definition, so a writer cannot invent a second spelling.
 
 The value is validated as a single bounded IRC token (ASCII graphic, no space, no parameter separator, at most `MAX_DISPLAY_NAME_BYTES`) because it is interpolated into operator-facing numeric replies and must not be able to change how the surrounding reply parses.
+
+### What version 4 added, and why
+
+Version 4 adds `desired_channels.detached`: whether a channel the bouncer still holds is presented to attached sessions.
+
+Desired membership and detached presentation are separate durable facts, and storing the second one is what makes it survive a restart. A derived rule — "hidden because something is happening right now" — would restore a different policy after a restart than the one the Operator set, and would let a reconnect disagree with what every client was just shown.
+
+The flag is constrained to `0` or `1` at the storage layer. A value outside that range is refused on read as `Corrupt` rather than coerced, because guessing which end of an unrecognised value was meant would show or hide a channel nobody chose. The store also refuses to open a database that claims the current version but has lost a promised column: a table that survived a migration without `detached` would be served as though every channel were attached.
+
+A detached channel is still a desired channel. `detach` is a single `UPDATE`, not a delete-and-reinsert, so the durable position never moves; detaching and reattaching cannot reorder a Network's channel list.
+
+`NetworkRecord::validate` requires positions to be strictly increasing. Order is therefore total and a reloaded list means exactly what the saved one meant, without depending on how a list happened to be built. Gaps are allowed, because removing one channel must not renumber the others. Targets are casemap-unique under Rfc1459, matching the durable primary key, so a duplicate is reported before SQLite sees it.
+
+### Migrating version 3
+
+The v3 → v4 step is a single `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT 0 CHECK (detached IN (0, 1))`, inside the same migration transaction as every other step. `ADD COLUMN` cannot rebuild the table, so the column is appended rather than inserted; SQLite permits `NOT NULL` on an added column exactly when the default is not `NULL`, which is what makes the one-statement migration sound.
+
+Existing rows become **attached**. That is the only safe default: a channel that was joined before this build existed has been presented to clients this whole time, and marking it detached would remove a channel from every client's view without anyone having asked.
+
+The `CHECK` reads an out-of-range value as corruption rather than as a policy, so a row that reached the table through a future writer, a repaired dump, or a hand-edited file is refused instead of being interpreted.
 
 ### Migrating version 2
 

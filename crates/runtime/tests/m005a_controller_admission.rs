@@ -24,8 +24,8 @@ use i2pr_irc_runtime::{
     controller::MAX_CONTROL_SNAPSHOT_NETWORKS,
 };
 use i2pr_irc_store::{
-    NetworkRecord, SavedNetwork, Store, StoreError, StoreHandle, StorePath,
-    testing as store_testing,
+    DesiredChannelRecord, NetworkRecord, SavedNetwork, Store, StoreError, StoreHandle, StorePath,
+    attached_channels, testing as store_testing,
 };
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultController, FaultScript, ScriptedStream};
 use std::{sync::Arc, time::Duration};
@@ -529,7 +529,7 @@ async fn change_stops_the_old_owner_and_starts_exactly_one_replacement() {
     runtime.wait_live(NetworkId(1)).await;
 
     let mut candidate = record(1, "renamed");
-    candidate.desired_channels = vec!["#new".into()];
+    candidate.desired_channels = attached_channels(&["#new"]);
     runtime
         .control
         .change(candidate)
@@ -540,7 +540,7 @@ async fn change_stops_the_old_owner_and_starts_exactly_one_replacement() {
     let durable = runtime.store.1.load_networks().await.expect("durable read");
     assert_eq!(durable.len(), 1, "change replaces rather than adds");
     assert_eq!(durable[0].nick, "renamed");
-    assert_eq!(durable[0].desired_channels, vec!["#new".to_owned()]);
+    assert_eq!(durable[0].desired_channels, attached_channels(&["#new"]));
 
     let snapshot = runtime.snapshot().await;
     assert_eq!(
@@ -1155,10 +1155,10 @@ async fn an_adopted_session_answers_a_command_only_a_bound_client_may_issue() {
         .await
         .expect("client asks to join");
     let stored = wait_for_durable_channels(&runtime.store.1, NetworkId(1), |channels| {
-        channels.iter().any(|channel| channel == "#admitted")
+        channels.iter().any(|channel| channel.target == "#admitted")
     })
     .await;
-    assert_eq!(stored, vec!["#admitted".to_owned()]);
+    assert_eq!(stored, attached_channels(&["#admitted"]));
     client
         .end
         .write_all(b"QUIT\r\n")
@@ -1168,13 +1168,17 @@ async fn an_adopted_session_answers_a_command_only_a_bound_client_may_issue() {
 }
 
 /// Waits for one Network's durable desired channels to satisfy `ready`.
+///
+/// The predicate is handed channel names rather than records: these tests are about
+/// which channels are durable, not about their presentation, which Plan 021 qualifies
+/// directly in `m005b_detached_policy`.
 async fn wait_for_durable_channels<F>(
     store: &StoreHandle,
     network: NetworkId,
     ready: F,
-) -> Vec<String>
+) -> Vec<DesiredChannelRecord>
 where
-    F: Fn(&[String]) -> bool,
+    F: Fn(&[DesiredChannelRecord]) -> bool,
 {
     let deadline = tokio::time::Instant::now() + CEILING;
     loop {

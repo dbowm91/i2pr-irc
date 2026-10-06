@@ -85,3 +85,12 @@ The clamp rule has two halves, and both matter:
 ## A cursor needs a durable client lineage
 
 Playback state has to survive a restart, so it cannot hang off a locally invented client id. `ensure_client` resolves (or creates) the durable `ClientId` first; the store's foreign keys then guarantee no cursor can reference a lineage that does not exist.
+## Ingestion is not gated by what a client may see
+
+History ingestion and downstream presentation are separate decisions, and detaching separates them explicitly.
+
+A detached channel's traffic is withheld from fanout and from projection, and it is still applied to network state and still written to durable history. Filtering at ingestion instead would mean that reattaching a channel destroyed whatever happened while it was hidden — which would make hiding a channel indistinguishable, to the Operator, from losing it, and would make the retained history depend on whether anyone happened to be watching.
+
+The consequence for replay is that a buffer table contains detached channels. Every replay path filters by visibility rather than trusting the buffer list: legacy automatic backlog skips detached buffers, and the read-marker projection only covers visible channels. A client must not be handed messages from a channel it has just been told the bouncer does not show.
+
+Cursors are unaffected. They stay per-`(ClientId, BufferId)` and private, they remain the single delivery boundary, and they still advance only after the session writer confirms the bytes reached the socket. A client that was disconnected for an entire detached interval returns with its cursor where it left it and can query the retained history normally. No second cursor or replay model exists for detached channels, and none is needed: reattaching restores *visibility*, not history, so the ordinary cursor semantics already describe what the client should receive.

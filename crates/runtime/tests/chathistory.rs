@@ -40,7 +40,7 @@ async fn journal_for(handle: &StoreHandle) -> HistoryJournal {
             username: "user".into(),
             realname: "bouncer".into(),
             sasl: None,
-            desired_channels: vec!["#room".into()],
+            desired_channels: i2pr_irc_store::attached_channels(&["#room"]),
         })
         .await
         .expect("network saved");

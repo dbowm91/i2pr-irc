@@ -46,7 +46,27 @@ pub fn project(
     handle.queue_normal(&format!(
         ":bouncer 005 {target} CLIENTTAGDENY=* :are supported by this server\r\n"
     ))?;
-    for channel in state.joined_channels() {
+    for channel in state.visible_channels() {
+        project_channel(handle, state, target, &channel, read_markers)?;
+    }
+    Ok(())
+}
+
+/// Projects one channel's current state, in the order a client needs it.
+///
+/// This is the whole per-channel contract: JOIN, then the read marker the draft
+/// requires to follow it, then topic, modes, and names, then the end of names. Reattaching
+/// a single channel reuses it verbatim, which is what keeps a reattached channel from
+/// looking different from one that was attached when the client connected.
+pub fn project_channel(
+    handle: &SessionHandle,
+    state: &NetworkState,
+    target: &str,
+    channel: &str,
+    read_markers: Option<&BTreeMap<String, IrcTimestamp>>,
+) -> Result<(), RuntimeError> {
+    let channel = channel.to_owned();
+    {
         handle.queue_normal(&format!(":{} JOIN {channel}\r\n", state.nick))?;
         // The read-marker draft requires the server to send the channel's marker after
         // the JOIN and before RPL_ENDOFNAMES. It is emitted from the JOIN rather than
@@ -60,7 +80,7 @@ pub fn project(
             ))?;
         }
         let Some(channel_state) = state.channels.get(&channel) else {
-            continue;
+            return Ok(());
         };
         if let Some(topic) = &channel_state.topic {
             let prefix = format!(":bouncer 332 {target} {channel} :");
@@ -104,6 +124,21 @@ pub fn project(
         }
     }
     Ok(())
+}
+
+/// The bouncer-owned `PART` that tells attached sessions a channel was detached.
+///
+/// The prefix is the bouncer's own reserved name rather than the Operator's nick and
+/// rather than anybody upstream, because nothing happened to anybody in the room: the
+/// channel is still joined and still collecting history. A frame attributed to a real
+/// participant would be a false statement about a real event that did not occur.
+pub fn detach_line(channel: &str) -> String {
+    format!(":bouncer PART {channel} :Bouncer detached this channel\r\n")
+}
+
+/// The bouncer-owned `JOIN` that opens a reattached channel's projection.
+pub fn reattach_join_line(channel: &str) -> String {
+    format!(":bouncer JOIN {channel}\r\n")
 }
 
 /// Joins a prefix and a possibly-oversized value into one line that respects

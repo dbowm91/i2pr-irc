@@ -1,4 +1,4 @@
-//! Schema versions 1 through 3 and their transactional migration harness.
+//! Schema versions 1 through 4 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -11,8 +11,10 @@ use rusqlite::Connection;
 ///
 /// Version 2 changes only how a history event's protocol timestamp is stored; see
 /// [`HISTORY_EVENTS_V2`] for why. Version 3 adds the operator-chosen `display_name`
-/// a Network is listed under; see [`NETWORKS_V2`] and [`migrate_2_to_3`].
-pub const SCHEMA_VERSION: i64 = 3;
+/// a Network is listed under; see [`NETWORKS_V2`] and [`migrate_2_to_3`]. Version 4
+/// adds the bouncer-owned `detached` presentation flag on a desired channel; see
+/// [`DESIRED_CHANNELS_V3`] and [`migrate_3_to_4`].
+pub const SCHEMA_VERSION: i64 = 4;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -72,16 +74,11 @@ CREATE TABLE networks (
 ) STRICT;
 "#;
 
-/// Tables that are identical in every schema version, after `networks` and before
-/// `history_events`.
-const SCHEMA_TABLES: &str = r#"
-CREATE TABLE network_secrets (
-    network_id      INTEGER PRIMARY KEY
-                    REFERENCES networks(network_id) ON DELETE CASCADE,
-    sasl_username   TEXT NOT NULL,
-    sasl_password   BLOB NOT NULL
-) STRICT;
-
+/// The `desired_channels` table as schema 1, 2, and 3 created it.
+///
+/// Retained verbatim so the v3 -> v4 migration rebuilds exactly the representation it
+/// is replacing rather than one reconstructed from a newer declaration.
+const DESIRED_CHANNELS_V3: &str = r#"
 CREATE TABLE desired_channels (
     network_id      INTEGER NOT NULL
                     REFERENCES networks(network_id) ON DELETE CASCADE,
@@ -90,7 +87,30 @@ CREATE TABLE desired_channels (
     position        INTEGER NOT NULL,
     PRIMARY KEY (network_id, casemap_key)
 ) STRICT;
+"#;
 
+/// The `desired_channels` table as schema 4 creates it.
+///
+/// `detached` is a bouncer-owned *presentation* decision about a channel that is still
+/// desired and still joined upstream. It is constrained to 0 or 1 at the storage layer
+/// because a value outside that range would be read back as an unknown policy, and the
+/// store refuses to guess which end of an unrecognized value was meant.
+const DESIRED_CHANNELS_V4: &str = r#"
+CREATE TABLE desired_channels (
+    network_id      INTEGER NOT NULL
+                    REFERENCES networks(network_id) ON DELETE CASCADE,
+    casemap_key     BLOB NOT NULL,
+    target          TEXT NOT NULL,
+    position        INTEGER NOT NULL,
+    detached        INTEGER NOT NULL DEFAULT 0
+                    CHECK (detached IN (0, 1)),
+    PRIMARY KEY (network_id, casemap_key)
+) STRICT;
+"#;
+
+/// Tables that are identical in every schema version, after `desired_channels` and
+/// before `history_events`.
+const SCHEMA_TABLES: &str = r#"
 CREATE TABLE clients (
     client_id       INTEGER PRIMARY KEY,
     login           TEXT NOT NULL UNIQUE
@@ -184,15 +204,32 @@ CREATE TABLE history_events (
 ) STRICT;
 "#;
 
+/// Tables that are identical in every schema version, before `desired_channels`.
+const SCHEMA_HEAD: &str = r#"
+CREATE TABLE network_secrets (
+    network_id      INTEGER PRIMARY KEY
+                    REFERENCES networks(network_id) ON DELETE CASCADE,
+    sasl_username   TEXT NOT NULL,
+    sasl_password   BLOB NOT NULL
+) STRICT;
+"#;
+
 /// Composes a complete schema from its shared parts.
 ///
 /// `concat!` cannot reference a const, so the pieces are joined at runtime instead.
 /// That keeps one definition of every unchanged table rather than duplicating all
 /// eight tables per version.
-fn compose(networks: &str, history: &str, tail: &str) -> String {
+fn compose(desired_channels: &str, networks: &str, history: &str, tail: &str) -> String {
     let mut sql = String::with_capacity(
-        networks.len() + history.len() + tail.len() + HISTORY_EVENTS_INDEX.len(),
+        SCHEMA_HEAD.len()
+            + desired_channels.len()
+            + networks.len()
+            + history.len()
+            + tail.len()
+            + HISTORY_EVENTS_INDEX.len(),
     );
+    sql.push_str(SCHEMA_HEAD);
+    sql.push_str(desired_channels);
     sql.push_str(networks);
     sql.push_str(SCHEMA_TABLES);
     sql.push_str(history);
@@ -204,7 +241,12 @@ fn compose(networks: &str, history: &str, tail: &str) -> String {
 /// Schema 1, used to build migration fixtures. A v1 database is exactly what the
 /// schema 2 migration must handle.
 pub(crate) fn schema_v1() -> String {
-    compose(NETWORKS_V2, HISTORY_EVENTS_V1, SCHEMA_TAIL)
+    compose(
+        DESIRED_CHANNELS_V3,
+        NETWORKS_V2,
+        HISTORY_EVENTS_V1,
+        SCHEMA_TAIL,
+    )
 }
 
 /// Schema 2, used to build the fixture the schema 3 migration must handle.
@@ -212,12 +254,32 @@ pub(crate) fn schema_v1() -> String {
 /// It is a real declaration rather than "v3 minus a column" so the fixture cannot
 /// silently drift into describing a shape this build never actually wrote.
 pub(crate) fn schema_v2() -> String {
-    compose(NETWORKS_V2, HISTORY_EVENTS_V2, SCHEMA_TAIL)
+    compose(
+        DESIRED_CHANNELS_V3,
+        NETWORKS_V2,
+        HISTORY_EVENTS_V2,
+        SCHEMA_TAIL,
+    )
+}
+
+/// Schema 3, used to build the fixture the schema 4 migration must handle.
+pub(crate) fn schema_v3() -> String {
+    compose(
+        DESIRED_CHANNELS_V3,
+        NETWORKS_V3,
+        HISTORY_EVENTS_V2,
+        SCHEMA_TAIL,
+    )
 }
 
 /// The current schema, created directly when no database exists yet.
-pub(crate) fn schema_v3() -> String {
-    compose(NETWORKS_V3, HISTORY_EVENTS_V2, SCHEMA_TAIL)
+pub(crate) fn schema_v4() -> String {
+    compose(
+        DESIRED_CHANNELS_V4,
+        NETWORKS_V3,
+        HISTORY_EVENTS_V2,
+        SCHEMA_TAIL,
+    )
 }
 
 /// Refuses a database this build must not serve before any migration runs.
@@ -344,6 +406,7 @@ pub(crate) fn open_and_migrate(
             // database that claims our version but lost a promised table is corrupt, and
             // serving it would reinterpret durable meaning silently.
             verify_promised_tables(connection)?;
+            verify_promised_columns(connection)?;
             Ok(OpenDisposition::Current)
         }
         OpenDisposition::Migrated { from } => {
@@ -352,6 +415,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             migrate_forward(&transaction, from)?;
             verify_promised_tables(&transaction)?;
+            verify_promised_columns(&transaction)?;
             transaction
                 .commit()
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
@@ -362,7 +426,7 @@ pub(crate) fn open_and_migrate(
                 .unchecked_transaction()
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
-                .execute_batch(&schema_v3())
+                .execute_batch(&schema_v4())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -411,11 +475,39 @@ fn verify_promised_tables(connection: &Connection) -> Result<(), StoreError> {
 /// Tables that must exist before this build serves any request.
 const REQUIRED_TABLES: &[&str] = &[
     "networks",
+    "desired_channels",
     "history_events",
     "client_cursors",
     "buffers",
     "read_markers",
 ];
+
+/// Columns this build promises, beyond the mere presence of their table.
+///
+/// A table that survived a migration without one of its promised columns would be
+/// served as though the policy it carries were absent. That is the failure mode schema
+/// version 4 exists to prevent, so the column is checked rather than assumed from the
+/// table being there.
+const REQUIRED_COLUMNS: &[(&str, &str)] = &[("desired_channels", "detached")];
+
+/// Confirms every promised column is present on its table.
+fn verify_promised_columns(connection: &Connection) -> Result<(), StoreError> {
+    for (table, column) in REQUIRED_COLUMNS {
+        let present: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                (table, column),
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+        if present != 1 {
+            return Err(StoreError::new(StoreErrorKind::Corrupt(
+                "missing schema column",
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Migrates an already-open transaction forward to [`SCHEMA_VERSION`].
 ///
@@ -430,6 +522,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
         match version {
             1 => migrate_1_to_2(transaction)?,
             2 => migrate_2_to_3(transaction)?,
+            3 => migrate_3_to_4(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -543,6 +636,33 @@ fn migrate_2_to_3(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreEr
         .execute_batch(
             "ALTER TABLE networks ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
              UPDATE networks SET display_name = 'network-' || network_id;",
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// Adds the bouncer-owned `desired_channels.detached` column.
+///
+/// Existing rows are marked attached. That is the only safe default: a channel that
+/// was joined before this build existed has been presented downstream this whole time,
+/// and silently marking it detached would remove a channel from a client's view
+/// without anyone having asked for it.
+///
+/// `ALTER TABLE ... ADD COLUMN` cannot rebuild the table the way a full rebuild would,
+/// so this deliberately keeps the existing column order and appends one NOT NULL column
+/// with a constant default. SQLite permits NOT NULL on an added column exactly when the
+/// default is not NULL, which is what makes the one-statement migration sound: every
+/// row is visible to a reader as attached the instant the statement succeeds, and the
+/// surrounding transaction means a reader never sees a half-added column.
+fn migrate_3_to_4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction
+        .execute_batch(
+            "ALTER TABLE desired_channels
+                 ADD COLUMN detached INTEGER NOT NULL DEFAULT 0
+                 CHECK (detached IN (0, 1));",
         )
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     transaction

@@ -393,6 +393,8 @@ pub fn intent_class(intent: &SessionIntent) -> &'static str {
         SessionIntent::Forward { .. } => "forward",
         SessionIntent::Join { .. } => "join",
         SessionIntent::Part { .. } => "part",
+        SessionIntent::Detach { .. } => "detach",
+        SessionIntent::Reattach { .. } => "reattach",
         SessionIntent::RequestProjection => "projection",
         SessionIntent::HistoryQuery { .. } => "history-query",
         SessionIntent::MarkerUpdate { .. } => "marker-update",

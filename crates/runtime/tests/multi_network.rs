@@ -15,7 +15,8 @@ use i2pr_irc_runtime::{
     resource::ResourceLedger,
 };
 use i2pr_irc_store::{
-    NetworkRecord, Store, StoreHandle, StorePath, StoredSecret, fallback_display_name,
+    NetworkRecord, Store, StoreHandle, StorePath, StoredSecret, attached_channels,
+    fallback_display_name,
 };
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
 use std::{sync::Arc, time::Duration};
@@ -41,7 +42,12 @@ fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
         username: "user".into(),
         realname: "bouncer".into(),
         sasl: None,
-        desired_channels: channels.iter().map(|value| (*value).to_owned()).collect(),
+        desired_channels: i2pr_irc_store::attached_channels(
+            &channels
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 
@@ -423,7 +429,7 @@ async fn restart_rebuilds_networks_from_durable_state_without_sessions() {
         .expect("network one");
     assert_eq!(
         first.desired_channels,
-        vec!["#alpha".to_owned(), "#beta".to_owned()]
+        attached_channels(&["#alpha", "#beta"])
     );
     assert!(
         catalog.is_empty(),
@@ -631,7 +637,10 @@ async fn a_join_commits_durably_before_upstream_bytes_exist() {
     read_until(upstream, b"JOIN #newroom\r\n").await;
     let stored = handle.load_networks().await.expect("catalog loads");
     assert!(
-        stored[0].desired_channels.contains(&"#newroom".to_owned()),
+        stored[0]
+            .desired_channels
+            .iter()
+            .any(|entry| entry.target == "#newroom"),
         "durable intent must exist before the upstream JOIN is observable"
     );
 }
@@ -717,7 +726,7 @@ async fn desired_state_persists_through_a_restart() {
     let restored = catalog.load_desired_state().await.expect("catalog loads");
     assert_eq!(
         restored[0].desired_channels,
-        vec!["#alpha".to_owned(), "#beta".to_owned()]
+        attached_channels(&["#alpha", "#beta"])
     );
 }
 

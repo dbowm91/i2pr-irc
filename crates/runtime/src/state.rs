@@ -15,8 +15,39 @@
 //!   the outcome is still outstanding, or which standard numeric rejected it.
 //! - [`NetworkState::self_channels`] is observed membership, added only by an
 //!   authoritative server event such as a self JOIN and removed by self PART/KICK.
+//!
+//! A fourth distinction sits on top of the first: a desired channel may be *detached*,
+//! meaning it stays joined and still collects history while its live presentation is
+//! suppressed for attached sessions. Membership and presentation are separate facts, and
+//! only [`NetworkState::visible_channels`] may be shown to a client.
 use i2pr_irc_core::Casemapping;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// One channel of durable intent handed to a generation: what to hold, and whether to
+/// show it.
+///
+/// The runtime keeps its own copy so a generation never borrows a store handle or a
+/// record that could change underneath it. The supervisor re-reads it at each generation
+/// boundary, which is what makes a mid-generation detach survive a reconnect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesiredChannelPolicy {
+    pub target: String,
+    pub detached: bool,
+}
+impl DesiredChannelPolicy {
+    pub fn attached(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            detached: false,
+        }
+    }
+    pub fn detached(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            detached: true,
+        }
+    }
+}
 
 pub const MAX_CHANNELS: usize = 128;
 pub const MAX_MEMBERS_PER_CHANNEL: usize = 2048;
@@ -386,12 +417,30 @@ pub struct NetworkState {
     /// Durable operator intent, preserved across generations by the supervisor and
     /// never removed by a join failure.
     pub desired_channels: Vec<String>,
+    /// Casemapped identities of desired channels whose live presentation is suppressed.
+    ///
+    /// This is the bouncer-owned decision, not a server-observed fact: the channel is
+    /// still joined and still in `self_channels`, so history, presence, and upstream
+    /// membership are unaffected. Only what a local session is shown changes.
+    detached: BTreeSet<Vec<u8>>,
+    /// Channels whose membership was confirmed while detached and which must therefore
+    /// be projected to attached sessions the moment they are reattached.
+    ///
+    /// Without this, reattaching a channel the server had quietly parted upstream would
+    /// show a live channel with no topic, modes, or names, because the synthetic JOIN
+    /// alone would claim a membership the client never saw established.
+    pending_reveal: BTreeSet<Vec<u8>>,
     /// Bounded generation-local record of written desired JOINs, keyed by casemapped
     /// channel identity. Discarded when the generation is replaced.
     join_attempts: BTreeMap<Vec<u8>, (String, JoinAttempt)>,
 }
 impl NetworkState {
-    pub fn new(nick: &str, desired_channels: &[String]) -> Self {
+    /// Builds generation-local state from durable channel intent.
+    ///
+    /// `desired` is read from storage at each generation, not from whatever the record
+    /// said when the owner started: a JOIN or a detach performed mid-generation is part
+    /// of durable intent and a reconnect must restore it, not the owner's birth record.
+    pub fn new(nick: &str, desired: &[DesiredChannelPolicy]) -> Self {
         Self {
             nick: nick.to_owned(),
             casemapping: Casemapping::Rfc1459,
@@ -401,9 +450,89 @@ impl NetworkState {
             isupport: BTreeSet::new(),
             channels: BTreeMap::new(),
             self_channels: BTreeSet::new(),
-            desired_channels: desired_channels.to_vec(),
+            desired_channels: desired.iter().map(|entry| entry.target.clone()).collect(),
+            detached: desired
+                .iter()
+                .filter(|entry| entry.detached)
+                .map(|entry| Casemapping::Rfc1459.fold(entry.target.as_bytes()))
+                .collect(),
+            pending_reveal: BTreeSet::new(),
             join_attempts: BTreeMap::new(),
         }
+    }
+    /// Suppresses downstream presentation of `channel` without touching membership.
+    ///
+    /// Returns false when the channel was already detached, so a caller can avoid
+    /// emitting a synthetic transition that would claim something did not change.
+    pub fn detach(&mut self, channel: &str) -> bool {
+        let key = self.casemapping.fold(channel.as_bytes());
+        let fresh = self.detached.insert(key.clone());
+        self.pending_reveal.remove(&key);
+        fresh
+    }
+    /// Restores downstream presentation of `channel`.
+    ///
+    /// Returns false when the channel was not detached, for the same reason as
+    /// [`NetworkState::detach`]. Membership is untouched: if the server has not
+    /// confirmed this bouncer holds the channel, the reveal waits for that event.
+    pub fn reattach(&mut self, channel: &str) -> bool {
+        let key = self.casemapping.fold(channel.as_bytes());
+        if !self.detached.remove(&key) {
+            return false;
+        }
+        if self
+            .self_channels
+            .iter()
+            .any(|held| self.casemapping.fold(held.as_bytes()) == key)
+        {
+            self.pending_reveal.remove(&key);
+        } else {
+            self.pending_reveal.insert(key);
+        }
+        true
+    }
+    /// Casemapped identities of every detached channel, whether or not it is currently
+    /// joined. A detached channel the server has parted is still detached: the policy is
+    /// durable and does not lapse because membership ended.
+    pub fn detached_channels(&self) -> Vec<String> {
+        self.detached
+            .iter()
+            .map(|folded| String::from_utf8_lossy(folded).into_owned())
+            .collect()
+    }
+    pub fn is_detached(&self, channel: &str) -> bool {
+        self.detached
+            .contains(&self.casemapping.fold(channel.as_bytes()))
+    }
+    /// True when `channel`'s membership was confirmed while it was detached.
+    pub fn is_reveal_pending(&self, channel: &str) -> bool {
+        self.pending_reveal
+            .contains(&self.casemapping.fold(channel.as_bytes()))
+    }
+    /// Clears a pending reveal, called once the channel has been projected.
+    pub fn clear_reveal(&mut self, channel: &str) {
+        self.pending_reveal
+            .remove(&self.casemapping.fold(channel.as_bytes()));
+    }
+    /// Observed membership that may be presented downstream right now.
+    ///
+    /// This is the single accessor every projection and fanout decision reads. Detached
+    /// channels are excluded here rather than filtered at each call site, so a new
+    /// downstream-facing path cannot accidentally bypass the policy.
+    pub fn visible_channels(&self) -> Vec<String> {
+        self.self_channels
+            .iter()
+            .filter(|channel| !self.is_detached(channel))
+            .cloned()
+            .collect()
+    }
+    /// True when a casemapped channel identity from a buffer table is detached.
+    ///
+    /// Buffer tables are keyed by casemapped identity, so this is how a history buffer
+    /// for a detached channel is kept out of a downstream replay.
+    pub fn is_detached_key(&self, folded: &str) -> bool {
+        self.detached
+            .contains(&self.casemapping.fold(folded.as_bytes()))
     }
     pub fn same_nick(&self, left: &str, right: &str) -> bool {
         self.casemapping.fold(left.as_bytes()) == self.casemapping.fold(right.as_bytes())
@@ -1138,7 +1267,7 @@ mod tests {
 
     #[test]
     fn nick_part_quit_topic_and_desired_state_are_tracked() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         assert!(state.begin_desired_join("#room"));
         state.apply_line(&line(b":bot!u@h JOIN #room\r\n"));
         state.apply_line(&line(b":alice!u@h JOIN #room\r\n"));
@@ -1157,7 +1286,7 @@ mod tests {
 
     #[test]
     fn a_written_desired_join_is_not_observed_membership() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         assert!(state.begin_desired_join("#room"));
         // Writing the command is not evidence: nothing is joined yet.
         assert!(state.self_channels.is_empty());
@@ -1175,7 +1304,7 @@ mod tests {
 
     #[test]
     fn self_kick_removes_observed_membership() {
-        let mut state = NetworkState::new("bot", &["#room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
         state.begin_desired_join("#room");
         state.apply_line(&line(b":bot!u@h JOIN #room\r\n"));
         assert_eq!(state.joined_channels(), ["#room"]);
@@ -1186,7 +1315,7 @@ mod tests {
     #[test]
     fn every_standard_join_failure_leaves_membership_absent() {
         for numeric in JOIN_FAILURE_NUMERICS {
-            let mut state = NetworkState::new("bot", &["#room".into()]);
+            let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#room")]);
             assert!(state.begin_desired_join("#room"));
             let reply = format!(":srv {numeric} bot #room :No such channel\r\n");
             state.apply_line(&line(reply.as_bytes()));
@@ -1240,7 +1369,7 @@ mod tests {
 
     #[test]
     fn a_confirmed_join_clears_a_previous_rejection_and_casemaps_the_key() {
-        let mut state = NetworkState::new("bot", &["#Room".into()]);
+        let mut state = NetworkState::new("bot", &[DesiredChannelPolicy::attached("#Room")]);
         // rfc1459 casemapping folds `[]\^` to lowercase, so a differently cased
         // confirmation addresses the same attempt.
         assert!(state.begin_desired_join("#Room"));

@@ -20,7 +20,7 @@ use i2pr_irc_runtime::{
 };
 use i2pr_irc_store::{
     BufferKind, NetworkRecord, STORE_BUSY_TIMEOUT_MS, Store, StoreErrorKind, StoreHandle,
-    StorePath, fallback_display_name,
+    StorePath, attached_channels, fallback_display_name,
 };
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -53,7 +53,12 @@ fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
         username: "user".into(),
         realname: "bouncer".into(),
         sasl: None,
-        desired_channels: channels.iter().map(|value| (*value).to_owned()).collect(),
+        desired_channels: i2pr_irc_store::attached_channels(
+            &channels
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 
@@ -915,7 +920,7 @@ async fn a_clean_restart_rebuilds_durable_intent_and_no_live_state() {
     let handle = second.handle_clone();
     let catalog = NetworkCatalog::new(handle.clone());
     let desired = catalog.load_desired_state().await.expect("catalog loads");
-    assert_eq!(desired[0].desired_channels, vec!["#alpha".to_owned()]);
+    assert_eq!(desired[0].desired_channels, attached_channels(&["#alpha"]));
     assert!(
         catalog.is_empty(),
         "a restart restores no live supervisor, and therefore no session"
@@ -1883,7 +1888,7 @@ async fn a_committed_join_converges_after_its_first_enqueue_is_refused() {
                 record
                     .desired_channels
                     .iter()
-                    .any(|channel| channel == "#late")
+                    .any(|channel| channel.target == "#late")
             })
         {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1963,7 +1968,7 @@ async fn a_committed_part_converges_after_its_first_enqueue_is_refused() {
                 record
                     .desired_channels
                     .iter()
-                    .any(|channel| channel == "#room")
+                    .any(|channel| channel.target == "#room")
             })
         {
             tokio::time::sleep(Duration::from_millis(5)).await;

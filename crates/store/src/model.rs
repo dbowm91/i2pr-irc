@@ -93,6 +93,88 @@ pub enum EventDirection {
     Local,
 }
 
+/// One durable desired channel: what the Operator wants this Network to hold, and
+/// whether that membership is presented downstream.
+///
+/// Desired membership and detached presentation are deliberately separate facts. A
+/// detached channel is still joined upstream and still collects history; it is only
+/// hidden from ordinary downstream live state. Storing the presentation decision here
+/// rather than deriving it means it survives a restart and applies identically to
+/// every attached session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesiredChannelRecord {
+    pub target: String,
+    /// Durable ordering of this channel among the Network's desired channels.
+    ///
+    /// Positions are strictly increasing across a Network's records, so order is
+    /// total and a reloaded list means exactly what the saved one meant. Gaps are
+    /// allowed: removing one channel must not renumber the others.
+    pub position: usize,
+    /// Hidden from ordinary downstream live state. Upstream membership is unaffected.
+    pub detached: bool,
+}
+impl DesiredChannelRecord {
+    /// A record at an explicit durable position.
+    pub fn at(target: &str, position: usize, detached: bool) -> Self {
+        Self {
+            target: target.to_owned(),
+            position,
+            detached,
+        }
+    }
+
+    /// An attached record placed after every channel already on the Network.
+    ///
+    /// This is the position the store itself would assign, so an in-memory record and
+    /// a freshly reloaded one agree.
+    pub fn after(existing: &[Self], target: &str) -> Self {
+        let position = existing
+            .iter()
+            .map(|record| record.position + 1)
+            .max()
+            .unwrap_or(0);
+        Self::at(target, position, false)
+    }
+
+    /// The same channel with its presentation decision replaced.
+    pub fn with_detached(&self, detached: bool) -> Self {
+        Self {
+            target: self.target.clone(),
+            position: self.position,
+            detached,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.target.len() < 2
+            || self.target.len() > MAX_TARGET_BYTES
+            || !self.target.starts_with(['#', '&'])
+            || self
+                .target
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || matches!(b, b',' | b':' | 0 | b'\r' | b'\n'))
+        {
+            return Err("desired channel shape");
+        }
+        if self.position >= MAX_DESIRED_CHANNELS {
+            return Err("desired channel position");
+        }
+        Ok(())
+    }
+}
+
+/// Builds an attached desired-channel list with sequential positions.
+///
+/// This exists so configuration and test fixtures state an ordinary channel list
+/// rather than each inventing its own position numbering.
+pub fn attached_channels<S: AsRef<str>>(targets: &[S]) -> Vec<DesiredChannelRecord> {
+    targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| DesiredChannelRecord::at(target.as_ref(), index, false))
+        .collect()
+}
+
 /// A durable Network's complete configuration: everything needed to rebuild an
 /// upstream owner after restart, and nothing that describes live observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,7 +190,8 @@ pub struct NetworkRecord {
     pub username: String,
     pub realname: String,
     pub sasl: Option<(String, StoredSecret)>,
-    pub desired_channels: Vec<String>,
+    /// Durable channel intent, in durable order.
+    pub desired_channels: Vec<DesiredChannelRecord>,
 }
 
 /// Longest accepted `display_name`. A name is a single protocol token, so it is
@@ -182,15 +265,19 @@ impl NetworkRecord {
         if self.desired_channels.len() > MAX_DESIRED_CHANNELS {
             return Err("desired channel count");
         }
+        // Order is total and casemap-unique: a duplicate would collide on the durable
+        // primary key, and a non-increasing position would make the saved order depend
+        // on how a list happened to be built rather than on what it meant.
+        let mut previous: Option<usize> = None;
+        let mut seen = std::collections::BTreeSet::new();
         for channel in &self.desired_channels {
-            if channel.len() < 2
-                || channel.len() > MAX_TARGET_BYTES
-                || !channel.starts_with(['#', '&'])
-                || channel.bytes().any(|b| {
-                    b.is_ascii_whitespace() || matches!(b, b',' | b':' | 0 | b'\r' | b'\n')
-                })
-            {
-                return Err("desired channel shape");
+            channel.validate()?;
+            if previous.is_some_and(|value| channel.position <= value) {
+                return Err("desired channel order");
+            }
+            previous = Some(channel.position);
+            if !seen.insert(Casemapping::Rfc1459.fold(channel.target.as_bytes())) {
+                return Err("desired channel duplicate");
             }
         }
         if let Some((user, password)) = &self.sasl {
@@ -446,7 +533,7 @@ mod tests {
             username: "user".into(),
             realname: "bouncer".into(),
             sasl: None,
-            desired_channels: vec!["#room".into()],
+            desired_channels: attached_channels(&["#room"]),
         }
     }
 
@@ -466,8 +553,12 @@ mod tests {
             |r: &mut NetworkRecord| r.username = "user name".to_owned(),
             |r: &mut NetworkRecord| r.realname = "bad\rname".to_owned(),
             |r: &mut NetworkRecord| r.realname = String::new(),
-            |r: &mut NetworkRecord| r.desired_channels = vec!["room".to_owned()],
-            |r: &mut NetworkRecord| r.desired_channels = vec!["#a,#b".to_owned()],
+            |r: &mut NetworkRecord| {
+                r.desired_channels = vec![DesiredChannelRecord::at("room", 0, false)]
+            },
+            |r: &mut NetworkRecord| {
+                r.desired_channels = vec![DesiredChannelRecord::at("#a,#b", 0, false)]
+            },
             |r: &mut NetworkRecord| r.nick = "b".repeat(65),
         ] {
             let mut subject = record();
@@ -477,12 +568,57 @@ mod tests {
     }
 
     #[test]
+    fn desired_channel_order_and_identity_are_total() {
+        let mut subject = record();
+        // Two positions that do not strictly increase would make the stored order
+        // depend on how a list happened to be built.
+        subject.desired_channels = vec![
+            DesiredChannelRecord::at("#a", 3, false),
+            DesiredChannelRecord::at("#b", 3, false),
+        ];
+        assert_eq!(subject.validate(), Err("desired channel order"));
+        subject.desired_channels = vec![
+            DesiredChannelRecord::at("#a", 3, false),
+            DesiredChannelRecord::at("#b", 1, false),
+        ];
+        assert_eq!(subject.validate(), Err("desired channel order"));
+        // Rfc1459 folds `[` and `]`, so these two are the same channel twice.
+        subject.desired_channels = vec![
+            DesiredChannelRecord::at("#a[b]", 0, false),
+            DesiredChannelRecord::at("#a{b}", 1, false),
+        ];
+        assert_eq!(subject.validate(), Err("desired channel duplicate"));
+        subject.desired_channels = vec![
+            DesiredChannelRecord::at("#a", 0, false),
+            DesiredChannelRecord::at("#b", 7, true),
+        ];
+        assert_eq!(subject.validate(), Ok(()), "gaps in position are allowed");
+    }
+
+    #[test]
+    fn a_new_record_is_placed_after_every_existing_one() {
+        let existing = vec![DesiredChannelRecord::at("#a", 7, true)];
+        assert_eq!(
+            DesiredChannelRecord::after(&existing, "#b"),
+            DesiredChannelRecord::at("#b", 8, false),
+            "a new channel sorts after the last, whatever gaps exist below it"
+        );
+        assert_eq!(
+            DesiredChannelRecord::after(&[], "#b"),
+            DesiredChannelRecord::at("#b", 0, false)
+        );
+        // Detaching is a presentation change only: the durable order never moves.
+        let attached = DesiredChannelRecord::at("#a", 7, false);
+        assert_eq!(attached.with_detached(true).position, 7);
+    }
+
+    #[test]
     fn desired_channel_and_identity_counts_are_bounded() {
         let mut subject = record();
         subject.desired_channels = (0..=MAX_DESIRED_CHANNELS)
-            .map(|index| format!("#room{index}"))
+            .map(|index| DesiredChannelRecord::at(&format!("#room{index}"), index, false))
             .collect();
-        assert!(subject.validate().is_err());
+        assert_eq!(subject.validate(), Err("desired channel count"));
     }
 
     #[test]

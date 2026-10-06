@@ -116,27 +116,60 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
     Ok(records)
 }
 
+/// Loads one Network's durable channel intent, in durable order.
+///
+/// `detached` is stored as a constrained 0/1 integer, so any other value means the row
+/// was written by something that does not honour this build's schema. It is reported
+/// as corrupt rather than being coerced, because guessing which policy an unrecognized
+/// value meant would silently show or hide a channel on the Operator's behalf.
 fn load_desired_channels(
     connection: &Connection,
     network: NetworkId,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<Vec<DesiredChannelRecord>, StoreError> {
     let mut statement = connection
         .prepare(
-            "SELECT target FROM desired_channels WHERE network_id=?1 ORDER BY position, target",
+            "SELECT target, position, detached FROM desired_channels
+             WHERE network_id=?1 ORDER BY position, target",
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let rows = statement
-        .query_map([to_sql_id(network.0)?], |row| row.get::<_, String>(0))
+        .query_map([to_sql_id(network.0)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let mut channels = Vec::new();
     for row in rows {
-        let target = row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        let (target, position, detached) =
+            row.map_err(|error| sql(error, CommitState::RolledBack))?;
         if channels.len() >= MAX_DESIRED_CHANNELS {
             return Err(StoreError::new(StoreErrorKind::Corrupt(
                 "desired channel count exceeds ceiling",
             )));
         }
-        channels.push(target);
+        let detached = match detached {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(StoreError::new(StoreErrorKind::Corrupt(
+                    "desired channel detached flag",
+                )));
+            }
+        };
+        let position = usize::try_from(position)
+            .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("desired channel position")))?;
+        let channel = DesiredChannelRecord {
+            target,
+            position,
+            detached,
+        };
+        channel
+            .validate()
+            .map_err(|reason| StoreError::new(StoreErrorKind::Corrupt(reason)))?;
+        channels.push(channel);
     }
     Ok(channels)
 }
@@ -213,13 +246,20 @@ pub(crate) fn save_network(
             [network],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
-    for (position, channel) in record.desired_channels.iter().enumerate() {
-        let key = BufferRecord::lookup_key(BufferKind::Channel, Casemapping::Rfc1459, channel);
+    for channel in &record.desired_channels {
+        let key =
+            BufferRecord::lookup_key(BufferKind::Channel, Casemapping::Rfc1459, &channel.target);
         transaction
             .execute(
-                "INSERT INTO desired_channels (network_id, casemap_key, target, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![network, key, channel, position as i64],
+                "INSERT INTO desired_channels (network_id, casemap_key, target, position, detached)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    network,
+                    key,
+                    channel.target,
+                    channel.position as i64,
+                    i64::from(channel.detached),
+                ],
             )
             .map_err(|error| sql(error, CommitState::RolledBack))?;
     }
@@ -320,6 +360,40 @@ pub(crate) fn remove_desired_channel(
         .execute(
             "DELETE FROM desired_channels WHERE network_id=?1 AND casemap_key=?2",
             params![to_sql_id(network.0)?, key],
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    transaction
+        .commit()
+        .map_err(|error| sql(error, CommitState::Unknown))?;
+    Ok(changed > 0)
+}
+
+/// Records or clears a channel's detached presentation for one Network.
+///
+/// This changes only the presentation flag: the channel stays desired and stays joined
+/// upstream, because detaching is a statement about what a local session is shown, not
+/// about whether the bouncer belongs in the room. Returns false when the channel is not
+/// one of this Network's desired channels, so the caller can distinguish "the policy is
+/// now this" from "there was nothing to change" without reading the record back.
+///
+/// A single `UPDATE` is used rather than delete-then-insert so the durable position is
+/// untouched: detaching and reattaching must never reorder a Network's channels.
+pub(crate) fn set_desired_channel_detached(
+    connection: &mut Connection,
+    network: NetworkId,
+    channel: &str,
+    detached: bool,
+) -> Result<bool, StoreError> {
+    validate_channel(channel)?;
+    let key = BufferRecord::lookup_key(BufferKind::Channel, Casemapping::Rfc1459, channel);
+    let transaction = connection
+        .transaction()
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let changed = transaction
+        .execute(
+            "UPDATE desired_channels SET detached=?3
+             WHERE network_id=?1 AND casemap_key=?2",
+            params![to_sql_id(network.0)?, key, i64::from(detached)],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     transaction

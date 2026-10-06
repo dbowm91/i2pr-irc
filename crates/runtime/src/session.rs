@@ -31,6 +31,16 @@ const MAX_LINES_PER_READ: usize = 64;
 /// also bounds how much a single client can make the owner do.
 pub const SESSION_EVENT_QUEUE_CAPACITY: usize = 64;
 
+/// Trailing parameter that turns `PART` into a detach request.
+///
+/// Exact match only. A shorter or longer token, or any third parameter, is an ordinary
+/// part: guessing at near-misses would let a client that meant to leave a channel with a
+/// message instead silently change the bouncer's whole presentation policy.
+pub const DETACH_SHORTHAND: &str = "detach";
+/// Trailing parameter that turns `PART` into a reattach request. See
+/// [`DETACH_SHORTHAND`] for why the match is exact.
+pub const ATTACH_SHORTHAND: &str = "attach";
+
 /// What one session asks the network owner to do.
 ///
 /// The variant set is closed on purpose: a session submits typed intents rather than
@@ -45,6 +55,14 @@ pub enum SessionIntent {
     Join { channel: String },
     /// The client asked to leave a channel durably.
     Part { channel: String },
+    /// The client asked to stop presenting a channel it still holds.
+    ///
+    /// Detaching is not leaving: membership upstream and durable history are untouched,
+    /// and only the local presentation changes. It is a Network-wide policy, so one
+    /// client's request applies to every attached session.
+    Detach { channel: String },
+    /// The client asked to resume presenting a detached channel.
+    Reattach { channel: String },
     /// The client completed registration and wants the current projection.
     RequestProjection,
     /// The client asked the bouncer itself for retained history.
@@ -814,11 +832,28 @@ impl<D: ByteStream> SessionReader<D> {
                     return Err(RuntimeError::Protocol);
                 };
                 let channel = String::from_utf8_lossy(target).into_owned();
-                return Ok(Some(if command == "JOIN" {
-                    SessionIntent::Join { channel }
-                } else {
-                    SessionIntent::Part { channel }
-                }));
+                if command == "JOIN" {
+                    return Ok(Some(SessionIntent::Join { channel }));
+                }
+                // `PART <channel> :detach` and `PART <channel> :attach` are the
+                // compatibility shorthand for the two presentation decisions. Both
+                // require exactly two parameters, so a real `PART` with a trailing part
+                // message, and any longer form, stay ordinary parts. Nothing else about
+                // the command is borrowed for this: an unmatched second parameter is
+                // simply not a policy request.
+                if message.params.len() == 2 {
+                    let second = String::from_utf8_lossy(&message.params[1]).into_owned();
+                    match second.as_str() {
+                        DETACH_SHORTHAND => {
+                            return Ok(Some(SessionIntent::Detach { channel }));
+                        }
+                        ATTACH_SHORTHAND => {
+                            return Ok(Some(SessionIntent::Reattach { channel }));
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(Some(SessionIntent::Part { channel }));
             }
             "PRIVMSG" | "NOTICE" | "NICK" | "TOPIC" | "MODE" => {
                 return Ok(Some(SessionIntent::Forward {

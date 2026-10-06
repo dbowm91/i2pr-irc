@@ -45,6 +45,17 @@ enum Request {
         channel: String,
         reply: Reply<Result<bool, StoreError>>,
     },
+    /// The bouncer-owned presentation flag on one desired channel.
+    ///
+    /// It is its own request rather than a `SaveNetwork` because this is a presentation
+    /// decision about membership the bouncer already holds: rewriting the whole record
+    /// would race with a concurrent configuration edit and could resurrect stale fields.
+    SetDesiredChannelDetached {
+        network: NetworkId,
+        channel: String,
+        detached: bool,
+        reply: Reply<Result<bool, StoreError>>,
+    },
     RemoveDesiredChannel {
         network: NetworkId,
         channel: String,
@@ -184,6 +195,25 @@ impl StoreHandle {
         self.submit(|reply| Request::AddDesiredChannel {
             network,
             channel: channel.to_owned(),
+            reply,
+        })
+        .await
+    }
+    /// Records or clears one desired channel's detached presentation flag.
+    ///
+    /// Returns false when the channel is not desired on this Network. An ambiguous
+    /// commit is reported as [`CommitState::Unknown`], never as success: the caller must
+    /// re-read durable state to learn whether the flag landed.
+    pub async fn set_desired_channel_detached(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        detached: bool,
+    ) -> Result<bool, StoreError> {
+        self.submit(|reply| Request::SetDesiredChannelDetached {
+            network,
+            channel: channel.to_owned(),
+            detached,
             reply,
         })
         .await
@@ -523,6 +553,15 @@ fn execute(connection: &mut Connection, request: Request) {
         } => answer!(
             reply,
             ops::add_desired_channel(connection, network, &channel)
+        ),
+        Request::SetDesiredChannelDetached {
+            network,
+            channel,
+            detached,
+            reply,
+        } => answer!(
+            reply,
+            ops::set_desired_channel_detached(connection, network, &channel, detached)
         ),
         Request::RemoveDesiredChannel {
             network,

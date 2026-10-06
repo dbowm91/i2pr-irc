@@ -100,3 +100,15 @@ Ending a client's socket without saying why is indistinguishable from a fault. A
 registration writes its reason on the socket the client opened and then drains the writer
 before closing, so the explanation reaches the client rather than dying with the
 connection.
+
+## A detached channel is not a client UI state
+
+Attached sessions may be shown fewer channels than the bouncer holds. `NetworkState::visible_channels()` is the single accessor that decides this, and projection, initial read markers, and legacy backlog all read it rather than reaching for observed membership directly. A future downstream-facing path that used `joined_channels()` would bypass the policy; there is one door and it is the right one.
+
+When a channel becomes detached, every attached session receives a synthetic `:bouncer PART <channel>`. The prefix is the bouncer's reserved name, never the requesting client's nickname and never a participant upstream: the bouncer is still in the room, and a frame attributed to a real person would say otherwise. The transition is written to the session's control queue and is never a durable `HistoryEvent` — it records a local presentation decision, not something that happened on the network.
+
+When a channel is reattached, each attached session receives `:bouncer JOIN <channel>` and then the same bounded topic/mode/NAMES block a newly registered client would receive. A session whose capabilities include the read-marker draft also receives that channel's marker, because the draft requires it to follow the `JOIN`.
+
+Legacy backlog still runs only after the projection, and still only for a client that wants it. A client that negotiated `draft/chathistory` receives no automatic replay, so a reattach cannot duplicate history it is about to ask for. Reattaching does not create a second cursor system: the per-client playback cursor remains the delivery boundary, and it advances only after the session writer confirms the bytes reached the socket.
+
+The compatibility shorthand is `PART <channel> :detach` and `PART <channel> :attach`, and it requires exactly two parameters. Anything else — a real `PART` with a part message, or a longer form — is an ordinary part, because guessing at near-misses would let a client that meant to leave a channel instead silently change the bouncer's whole presentation policy. `BouncerServ`, landed in Plan 023, is the primary explicit administration path; the shorthand exists so the policy is reachable before it.

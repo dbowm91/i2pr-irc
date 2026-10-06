@@ -7,8 +7,8 @@
 use i2pr_irc_core::{I2pEndpoint, WallTime};
 use i2pr_irc_store::{
     BufferKind, EventDirection, HistoryEventId, MAX_DISPLAY_NAME_BYTES, NetworkId, NetworkRecord,
-    NewHistoryEvent, RetentionRequest, STORE_QUEUE_CAPACITY, Store, StoreErrorKind, StoreHealth,
-    StorePath, StoredSecret, fallback_display_name,
+    NewHistoryEvent, RetentionRequest, SCHEMA_VERSION, STORE_QUEUE_CAPACITY, Store, StoreErrorKind,
+    StoreHealth, StorePath, StoredSecret, attached_channels, fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
 
@@ -25,7 +25,12 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
         username: "user".into(),
         realname: "bouncer".into(),
         sasl: None,
-        desired_channels: channels.iter().map(|value| (*value).to_owned()).collect(),
+        desired_channels: attached_channels(
+            &channels
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 
@@ -192,7 +197,11 @@ fn a_schema_one_database_is_migrated_to_two_on_open() {
     assert_eq!(testing::identity(&path).1, 1, "fixture is at schema 1");
 
     let store = store_at(&path);
-    assert_eq!(testing::identity(&path).1, 3, "open migrates forward");
+    assert_eq!(
+        testing::identity(&path).1,
+        SCHEMA_VERSION,
+        "open migrates forward to the current schema"
+    );
 
     assert_eq!(
         testing::optional_text(
@@ -452,7 +461,7 @@ fn a_migration_that_fails_leaves_the_version_one_database_intact() {
     // failure rolled back rather than leaving a permanently poisoned database.
     testing::execute(&path, "DROP TABLE history_events_v2");
     let store = store_at(&path);
-    assert_eq!(testing::identity(&path).1, 3);
+    assert_eq!(testing::identity(&path).1, SCHEMA_VERSION);
     assert_eq!(
         testing::optional_text(
             &path,
@@ -539,7 +548,11 @@ fn a_schema_two_database_is_migrated_to_three_on_open() {
     assert_eq!(testing::identity(&path).1, 2, "fixture is at schema 2");
 
     let store = store_at(&path);
-    assert_eq!(testing::identity(&path).1, 3, "open migrates forward");
+    assert_eq!(
+        testing::identity(&path).1,
+        SCHEMA_VERSION,
+        "open migrates forward to the current schema"
+    );
 
     let names = testing::texts(
         &path,
@@ -881,7 +894,7 @@ async fn desired_state_survives_restart_and_no_observed_state_does() {
         .expect("catalog loads");
     assert_eq!(
         networks[0].desired_channels,
-        vec!["#alpha".to_owned(), "#beta".to_owned(), "#gamma".to_owned()],
+        attached_channels(&["#alpha", "#beta", "#gamma"]),
         "durable intent survives restart in insertion order"
     );
     // The structural proof that nothing live is stored: schema 1 contains no table,
@@ -940,7 +953,7 @@ async fn removing_desired_state_is_durable() {
         .load_networks()
         .await
         .expect("catalog loads");
-    assert_eq!(networks[0].desired_channels, vec!["#alpha".to_owned()]);
+    assert_eq!(networks[0].desired_channels, attached_channels(&["#alpha"]));
     reopened.shutdown().expect("reopened store shuts down");
 }
 
@@ -1390,4 +1403,328 @@ async fn unbounded_retention_and_query_requests_are_refused() {
     );
     store.shutdown().expect("store shuts down");
     let _ = path;
+}
+
+// ------------------------------------------------- schema 3 -> 4 and detached policy
+
+/// Builds a v3 database holding one Network with attached desired channels.
+///
+/// The channels exist at every position so the migration has to leave ordering alone,
+/// not merely add a column to a single row.
+fn v3_fixture(path: &std::path::Path, network: i64, channels: &[(&str, i64)]) {
+    let connection = testing::create_v3_database(path);
+    connection
+        .execute(
+            "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+             VALUES (?1, 'irc.example.i2p', 0, 'bot', 'user', 'bouncer', 'network-' || ?1)",
+            [network],
+        )
+        .expect("network fixture applies");
+    for (target, position) in channels {
+        connection
+            .execute(
+                "INSERT INTO desired_channels (network_id, casemap_key, target, position)
+                 VALUES (?1, CAST(lower(?2) AS BLOB), ?2, ?3)",
+                rusqlite::params![network, target, position],
+            )
+            .expect("desired channel fixture applies");
+    }
+}
+
+#[test]
+fn a_schema_three_database_is_migrated_to_four_on_open() {
+    let dir = testing::temp_dir("m34");
+    let path = dir.db("m34.sqlite3");
+    v3_fixture(&path, 1, &[("#alpha", 0), ("#beta", 2), ("#gamma", 7)]);
+    assert_eq!(testing::identity(&path).1, 3, "fixture is at schema 3");
+
+    let store = store_at(&path);
+    assert_eq!(
+        testing::identity(&path).1,
+        SCHEMA_VERSION,
+        "open migrates forward to the current schema"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_migrated_desired_channel_is_attached_rather_than_hidden() {
+    let dir = testing::temp_dir("m34attached");
+    let path = dir.db("m34attached.sqlite3");
+    v3_fixture(&path, 1, &[("#alpha", 0), ("#beta", 2)]);
+
+    let store = store_at(&path);
+    let records = store.handle().load_networks().await.expect("networks load");
+    assert_eq!(
+        records[0].desired_channels,
+        vec![
+            i2pr_irc_store::DesiredChannelRecord::at("#alpha", 0, false),
+            i2pr_irc_store::DesiredChannelRecord::at("#beta", 2, false),
+        ],
+        "every channel that predates this build is attached, because it has been \
+         presented to clients this whole time and hiding it would remove a channel \
+         nobody asked to remove"
+    );
+    assert_eq!(
+        testing::texts(
+            &path,
+            "SELECT target FROM desired_channels WHERE network_id = 1 ORDER BY position"
+        ),
+        vec!["#alpha".to_owned(), "#beta".to_owned()],
+        "durable order and position survive the migration unchanged"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn the_detached_flag_is_constrained_at_the_storage_layer() {
+    let dir = testing::temp_dir("m34check");
+    let path = dir.db("m34check.sqlite3");
+    store_at(&path).shutdown().expect("store shuts down");
+
+    let (not_null, default) = testing::column_constraints(&path, "desired_channels", "detached");
+    assert!(
+        not_null,
+        "the flag may never be NULL: no policy is not a third policy"
+    );
+    assert_eq!(
+        default,
+        Some(0),
+        "a row inserted without the flag is attached"
+    );
+
+    testing::execute(
+        &path,
+        "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+         VALUES (1, 'irc.example.i2p', 0, 'bot', 'user', 'bouncer', 'one')",
+    );
+    let error = testing::expect_rejected(
+        &path,
+        "INSERT INTO desired_channels (network_id, casemap_key, target, position, detached)
+         VALUES (1, CAST('#room' AS BLOB), '#room', 0, 2)",
+    );
+    assert!(
+        error.to_string().contains("CHECK"),
+        "a value outside 0/1 must be refused by the database itself, not only in Rust: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_database_missing_the_promised_column_is_refused_rather_than_served() {
+    let dir = testing::temp_dir("m34missing");
+    let path = dir.db("m34missing.sqlite3");
+    store_at(&path).shutdown().expect("store shuts down");
+    // Rebuild the table without the column this build promises, then stamp it as
+    // current. This is the exact shape of a database that claims a version it does not
+    // have, and it must not be served with the flag silently read as absent.
+    testing::execute(
+        &path,
+        "DROP TABLE desired_channels;
+         CREATE TABLE desired_channels (
+             network_id  INTEGER NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+             casemap_key BLOB NOT NULL,
+             target      TEXT NOT NULL,
+             position    INTEGER NOT NULL,
+             PRIMARY KEY (network_id, casemap_key)
+         ) STRICT;
+         PRAGMA user_version = 4;",
+    );
+    assert!(
+        Store::open(&StorePath::File(path.clone())).is_err(),
+        "a current-version database without the promised column is corrupt, not usable"
+    );
+    assert_eq!(
+        testing::identity(&path).1,
+        4,
+        "refusing to serve must not rewrite the file"
+    );
+}
+
+#[tokio::test]
+async fn an_unrecognizable_detached_value_is_reported_as_corrupt() {
+    let dir = testing::temp_dir("m34corrupt");
+    let path = dir.db("m34corrupt.sqlite3");
+    store_at(&path).shutdown().expect("store shuts down");
+    testing::execute(
+        &path,
+        "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+         VALUES (1, 'irc.example.i2p', 0, 'bot', 'user', 'bouncer', 'one')",
+    );
+    // The CHECK constraint stops this build's own writer. `ignore_check_constraints` is
+    // how a value gets in anyway -- a future writer, a repaired dump, a hand-edited file.
+    // Coercing it would mean showing or hiding a channel the Operator never chose, so the
+    // read path refuses the database instead.
+    testing::execute(
+        &path,
+        "PRAGMA ignore_check_constraints = ON;
+         INSERT INTO desired_channels (network_id, casemap_key, target, position, detached)
+         VALUES (1, CAST('#room' AS BLOB), '#room', 0, 2);
+         PRAGMA ignore_check_constraints = OFF;",
+    );
+    assert_eq!(
+        store_at(&path)
+            .handle()
+            .load_networks()
+            .await
+            .err()
+            .map(|error| *error.kind()),
+        Some(StoreErrorKind::Corrupt("desired channel detached flag")),
+        "an unrecognizable policy is refused, never guessed at"
+    );
+    assert!(
+        store_at(&path).handle().load_networks().await.is_err(),
+        "a write that touched this row did not make it readable again, so nothing about \
+         the damaged policy was silently adopted as a result of ordinary traffic"
+    );
+}
+
+#[tokio::test]
+async fn detaching_is_durable_survives_reopen_and_does_not_reorder_channels() {
+    let dir = testing::temp_dir("detach");
+    let path = dir.db("detach.sqlite3");
+    let mut subject = record(1, &["#alpha", "#beta", "#gamma"]);
+    store_at(&path)
+        .handle()
+        .save_network(&subject)
+        .await
+        .expect("record saves");
+
+    assert!(
+        store_at(&path)
+            .handle()
+            .set_desired_channel_detached(NetworkId(1), "#beta", true)
+            .await
+            .expect("detach commits"),
+        "the channel was desired, so the flag is recorded"
+    );
+    subject = store_at(&path)
+        .handle()
+        .load_networks()
+        .await
+        .expect("networks load")
+        .remove(0);
+    assert_eq!(
+        subject.desired_channels,
+        vec![
+            i2pr_irc_store::DesiredChannelRecord::at("#alpha", 0, false),
+            i2pr_irc_store::DesiredChannelRecord::at("#beta", 1, true),
+            i2pr_irc_store::DesiredChannelRecord::at("#gamma", 2, false),
+        ],
+        "detaching changes only the flag: the channel is still desired and still in \
+         place, which is what makes it a presentation decision"
+    );
+
+    store_at(&path)
+        .handle()
+        .set_desired_channel_detached(NetworkId(1), "#beta", false)
+        .await
+        .expect("reattach commits");
+    assert_eq!(
+        store_at(&path)
+            .handle()
+            .load_networks()
+            .await
+            .expect("networks load")[0]
+            .desired_channels,
+        subject
+            .desired_channels
+            .iter()
+            .map(|entry| entry.with_detached(false))
+            .collect::<Vec<_>>(),
+        "clearing the flag restores exactly the original list"
+    );
+}
+
+#[tokio::test]
+async fn detaching_an_unknown_channel_is_reported_rather_than_invented() {
+    let dir = testing::temp_dir("detachmiss");
+    let path = dir.db("detachmiss.sqlite3");
+    store_at(&path)
+        .handle()
+        .save_network(&record(1, &["#alpha"]))
+        .await
+        .expect("record saves");
+
+    assert!(
+        !store_at(&path)
+            .handle()
+            .set_desired_channel_detached(NetworkId(1), "#ghost", true)
+            .await
+            .expect("the request itself is well formed"),
+        "nothing was changed, so the caller can say so instead of assuming success"
+    );
+    assert_eq!(
+        store_at(&path)
+            .handle()
+            .load_networks()
+            .await
+            .expect("networks load")[0]
+            .desired_channels,
+        attached_channels(&["#alpha"]),
+        "a request for a channel this Network does not hold creates no row"
+    );
+}
+
+#[tokio::test]
+async fn a_detach_matching_uses_the_rfc1459_fold() {
+    let dir = testing::temp_dir("detachfold");
+    let path = dir.db("detachfold.sqlite3");
+    store_at(&path)
+        .handle()
+        .save_network(&record(1, &["#Brackets[ok]"]))
+        .await
+        .expect("record saves");
+
+    assert!(
+        store_at(&path)
+            .handle()
+            .set_desired_channel_detached(NetworkId(1), "#BRACKETS{Ok}", true)
+            .await
+            .expect("detach commits"),
+        "Rfc1459 folds square brackets to braces and uppercases, so this names the same channel"
+    );
+    assert_eq!(
+        store_at(&path)
+            .handle()
+            .load_networks()
+            .await
+            .expect("networks load")[0]
+            .desired_channels[0]
+            .target,
+        "#Brackets[ok]",
+        "the stored spelling is the Operator's, not the request's"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_detach_target_is_refused_before_anything_is_written() {
+    let dir = testing::temp_dir("detachbad");
+    let path = dir.db("detachbad.sqlite3");
+    store_at(&path)
+        .handle()
+        .save_network(&record(1, &["#alpha"]))
+        .await
+        .expect("record saves");
+
+    for target in ["", "room", "#a,b", "#a:b", "#a b"] {
+        assert_eq!(
+            store_at(&path)
+                .handle()
+                .set_desired_channel_detached(NetworkId(1), target, true)
+                .await
+                .err()
+                .map(|error| *error.kind()),
+            Some(StoreErrorKind::InvalidRequest("desired channel shape")),
+            "{target:?} is not a channel name"
+        );
+    }
+    assert_eq!(
+        store_at(&path)
+            .handle()
+            .load_networks()
+            .await
+            .expect("networks load")[0]
+            .desired_channels,
+        attached_channels(&["#alpha"])
+    );
 }

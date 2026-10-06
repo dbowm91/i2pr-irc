@@ -40,7 +40,12 @@ fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
         username: "user".into(),
         realname: "bouncer".into(),
         sasl: None,
-        desired_channels: channels.iter().map(|value| (*value).to_owned()).collect(),
+        desired_channels: i2pr_irc_store::attached_channels(
+            &channels
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 

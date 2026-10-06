@@ -128,3 +128,37 @@ A client must never be shown something untrue. The post-registration projection 
 Desired but not yet joined channels are deliberately absent, so a projection can never claim a channel the bouncer is not actually in.
 
 A client that negotiated `draft/read-marker` additionally receives each channel's current marker, emitted from the `JOIN` so it arrives even when membership is incomplete. An unknown marker renders as the draft's own `*` sentinel rather than a fabricated instant, and a channel whose retained marker can no longer be read back is reported as unknown. A client that did not negotiate the draft is never sent a `MARKREAD` at all — an unnegotiated command is a protocol violation for a strict client.
+## Detached channels: hiding is not leaving
+
+A desired channel carries two independent durable facts: that the bouncer wants it, and whether attached sessions may see it. `DesiredChannelRecord` stores both — `target`, a strictly increasing `position`, and `detached` — so the decision is durable, ordered, and explicit rather than derived from anything the process happens to be doing right now.
+
+The two directions are not symmetric in what they touch.
+
+**Detaching** persists the flag first, and only a commit that certainly landed changes what clients are shown. It then emits a synthetic `:bouncer PART <channel>` to **every** attached session and stops ordinary fanout and projection for that channel. It writes no upstream `PART` at all: membership, history ingestion, and durable buffering are untouched, which is the whole point of the distinction. The synthetic frame is prefixed with the bouncer's own reserved name rather than the Operator's nickname or any participant upstream, because nothing happened to anybody in the room and a frame attributed to a real person would be a false statement about an event that did not occur.
+
+**Reattaching** persists the cleared flag first, then either projects immediately or joins first:
+
+- With observed membership present, the channel gets `:bouncer JOIN` followed by the same bounded topic/mode/NAMES projection a newly registered client would receive. Showing a channel as joined without the topic, modes, and names that make the claim coherent is not a truthful projection.
+- With membership absent, a `JOIN` is written and the reveal is deferred to the authoritative self `JOIN`. Projecting at request time would tell a client it had joined a channel the bouncer had not; projecting never would leave it told that it had joined a channel it never saw.
+
+A reconnect restores the policy from storage rather than from the record the owner was born with. `NetworkState` is built per generation from `durable_desired_policy()`, because a detach or join performed mid-generation is durable intent just like any other, and taking the birth record would silently drop it.
+
+### Visibility has exactly one accessor
+
+`NetworkState::visible_channels()` is the single source of downstream-visible membership. Projection, read markers, and legacy backlog all read it, so a new downstream-facing path cannot accidentally bypass the policy by reaching for `joined_channels()` instead. History buffers are keyed by casemapped identity and *do* include detached channels, so replay paths filter explicitly: a client must not be handed messages from a channel it has just been told the bouncer does not show.
+
+### Withholding and redacting are different
+
+A line *about* a detached channel is withheld. A line that merely *mentions* one alongside visible channels is redacted rather than dropped, because suppressing it whole would desynchronize the visible channels it also concerns. A `QUIT` listing `:alice!a@h QUIT :#secret,#open` is delivered as `:alice!a@h QUIT :#open`; a `QUIT` listing only detached channels is withheld, since nothing is left to say. A frame naming both detached and visible channels at once is withheld whole — over-suppressing is the safe direction, because a client must never be shown a frame whose meaning depends on a channel it may not see.
+
+Redaction drops the frame's tags. A tag is optional in every direction, and a server-chosen tag value may itself name a channel.
+
+### Detached state is Network policy, not per-session UI
+
+One client's detach changes what every attached session sees. A client that stayed silent would otherwise keep a channel it can no longer see, with no explanation for it disappearing. Per-client read and playback cursors stay private throughout: a client that was disconnected for the entire detached interval can still query retained history normally when it returns, because the history was never withheld — only the live view was.
+
+### Failure semantics
+
+A store refusal applies no live transition: nothing is presented, because presenting a detach that did not happen would show every client a channel that is still going to be there on reconnect. A commit whose outcome is `CommitState::Unknown` is resolved by re-reading the durable flag and letting *that* decide, with a notice to the requesting client either way. Guessing would make what a client sees depend on which of two outcomes this process happened to observe first — and the other outcome is what a reconnect sees.
+
+`ChannelPolicy` is a trait so that branch is reachable from a test. A bare `StoreHandle` cannot be made to answer ambiguously without corrupting a real database; production passes `StoreChannelPolicy`, which is one hop from the owner to the bounded worker.

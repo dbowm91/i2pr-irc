@@ -23,7 +23,8 @@ use std::{
 /// Every table the schema contains, in SQLite's name order.
 ///
 /// The table *set* has been identical across every schema version so far; only the
-/// representation of `history_events.server_time` changed.
+/// representation of `history_events.server_time` and `networks.display_name` changed,
+/// and only `desired_channels` gained a column.
 pub const EXPECTED_TABLES: [&str; 8] = [
     "buffers",
     "client_cursors",
@@ -69,6 +70,23 @@ pub fn create_v2_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 2)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 3 and returns a raw connection to it.
+///
+/// Used to build the fixture the v3 -> v4 migration must handle.
+pub fn create_v3_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v3())
+        .expect("schema 3 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 3)
         .expect("user_version is writable");
     connection
 }
@@ -214,6 +232,32 @@ pub fn foreign_keys_enabled(path: &Path) -> bool {
         .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
         .unwrap_or(0)
         != 0
+}
+
+/// The declared constraints SQLite reports for one column.
+///
+/// Used to prove the `detached` flag is constrained at the storage layer rather than
+/// only in Rust, so a value outside 0/1 cannot be smuggled in by another writer.
+pub fn column_constraints(path: &Path, table: &str, column: &str) -> (bool, Option<i64>) {
+    let connection = raw(path);
+    let mut statement = connection
+        .prepare("SELECT \"notnull\", dflt_value FROM pragma_table_info(?1) WHERE name = ?2")
+        .expect("query is valid");
+    let mut rows = statement
+        .query(rusqlite::params![table, column])
+        .expect("query executes");
+    rows.next()
+        .expect("the column exists")
+        .map(|row| {
+            (
+                row.get::<_, i64>(0).unwrap_or(0) != 0,
+                row.get::<_, Option<String>>(1)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.parse::<i64>().ok()),
+            )
+        })
+        .unwrap_or((false, None))
 }
 
 /// Reads one optional text column.

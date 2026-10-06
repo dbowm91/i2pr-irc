@@ -35,6 +35,7 @@ pub use controller::{
     CONTROL_REQUEST_CAPACITY, ControlNetwork, ControlRequest, ControlSnapshot, DurableNetworks,
     RuntimeControlHandle, RuntimeController,
 };
+pub use owner::{ChannelPolicy, StoreChannelPolicy};
 pub use reconnect::ReconnectScheduler;
 
 use i2pr_irc_core::{ConnectionGeneration, ProviderError};
@@ -399,7 +400,13 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
         A::Stream: 'static,
     {
         let (mut ur, mut uw) = tokio::io::split(upstream);
-        let mut state = NetworkState::new(&self.config.nick, &self.config.desired_channels);
+        let desired: Vec<crate::state::DesiredChannelPolicy> = self
+            .config
+            .desired_channels
+            .iter()
+            .map(|target| crate::state::DesiredChannelPolicy::attached(target.clone()))
+            .collect();
+        let mut state = NetworkState::new(&self.config.nick, &desired);
         // One decoder spans registration and the online phase so a line that
         // arrives in the same read as `001` is not lost.
         let mut udec = LineDecoder::default();

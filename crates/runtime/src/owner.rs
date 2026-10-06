@@ -35,9 +35,9 @@ use crate::{
 use i2pr_irc_core::{
     ByteStream, ClientId, ConnectionGeneration, I2pStreamProvider, NetworkId, SessionId,
 };
-use i2pr_irc_store::{BufferId, BufferKind, StoreError, StoreHandle};
+use i2pr_irc_store::{BufferId, BufferKind, CommitState, NetworkRecord, StoreError, StoreHandle};
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncReadExt,
     sync::{mpsc, watch},
@@ -373,10 +373,23 @@ async fn deliver_legacy_backlog(
     session: SessionId,
     buffers: &BTreeMap<String, BufferId>,
     snapshot: &watch::Sender<NetworkSnapshot>,
+    state: &NetworkState,
 ) -> PlaybackOutcome {
     let cap = crate::journal::BacklogCap::DEFAULT;
     let mut total = PlaybackOutcome::default();
-    for buffer in buffers.values().copied().take(MAX_BACKLOG_BUFFERS) {
+    // Buffer tables are keyed by casemapped channel identity and include detached
+    // channels, because a detached channel keeps collecting history exactly as an
+    // attached one does. Replaying one here would hand a client messages from a channel
+    // it has just been told the bouncer no longer shows, which is both a privacy failure
+    // and a stream the client cannot make sense of. Reattaching is what makes the backlog
+    // available again, through the client's own cursor.
+    for (channel, buffer) in buffers
+        .iter()
+        .filter(|(channel, _)| !state.is_detached_key(channel))
+        .map(|(channel, buffer)| (channel.clone(), *buffer))
+        .take(MAX_BACKLOG_BUFFERS)
+    {
+        let _ = &channel;
         if total.delivered >= cap.events || total.bytes >= cap.bytes {
             total.more_pending = true;
             break;
@@ -545,7 +558,17 @@ pub struct NetworkSnapshot {
     pub nick: Option<String>,
     /// Observed membership only.
     pub channels: Vec<String>,
+    /// Observed membership the bouncer holds but does not present downstream.
+    ///
+    /// This is a policy, not a fault: these channels are joined and still collect
+    /// history. It is reported separately from `channels` so an operator reading
+    /// diagnostics can tell "the bouncer is not in this room" apart from "the Operator
+    /// asked for this room to be hidden".
+    pub detached_channels: Vec<String>,
     pub reconnect_attempt: u32,
+    /// Durable detach and reattach decisions this owner has applied.
+    pub channels_detached: u64,
+    pub channels_reattached: u64,
     /// Sessions currently attached.
     pub attached_sessions: usize,
     pub sessions_accepted: u64,
@@ -652,12 +675,56 @@ impl Phase {
     }
 }
 
+/// Durable channel policy for one Network: what to hold, and what to show.
+///
+/// This is a trait for the same reason Plan 020's `DurableNetworks` is one. The decision
+/// that has to be qualified here is what an owner does when a detach commit's outcome
+/// cannot be determined, and a bare store handle cannot be made to answer ambiguously
+/// without corrupting a real database. Production passes the store handle; a test passes
+/// a double that answers one commit ambiguously and delegates everything else.
+#[async_trait::async_trait]
+pub trait ChannelPolicy: Send + Sync {
+    /// Records or clears one desired channel's detached flag. Returns false when the
+    /// channel is not one of this Network's desired channels.
+    async fn set_detached(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        detached: bool,
+    ) -> Result<bool, StoreError>;
+    /// Re-reads this Network's durable desired channels.
+    async fn load(&self) -> Result<Vec<NetworkRecord>, StoreError>;
+}
+
+/// The production policy: the store worker.
+#[derive(Clone)]
+pub struct StoreChannelPolicy(StoreHandle);
+#[async_trait::async_trait]
+impl ChannelPolicy for StoreChannelPolicy {
+    async fn set_detached(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        detached: bool,
+    ) -> Result<bool, StoreError> {
+        self.0
+            .set_desired_channel_detached(network, channel, detached)
+            .await
+    }
+    async fn load(&self) -> Result<Vec<NetworkRecord>, StoreError> {
+        self.0.load_networks().await
+    }
+}
+
 /// Owns one Network across connection generations and any number of local sessions.
 pub struct NetworkOwner<P> {
     provider: P,
     network: NetworkId,
     context: crate::catalog::SupervisorContext,
     store: StoreHandle,
+    /// Durable channel policy, held behind its own trait so the ambiguous-commit
+    /// branch is reachable from a test without a corrupt database.
+    policy: Arc<dyn ChannelPolicy>,
     snapshot: watch::Sender<NetworkSnapshot>,
     /// Process-wide connect admission.
     ///
@@ -683,6 +750,24 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         Self::with_snapshot_channel(provider, context, store, reconnect, snapshot)
     }
 
+    /// Builds an owner whose durable channel policy is a caller-supplied double.
+    ///
+    /// Everything else is identical to [`NetworkOwner::new`], including the store the
+    /// owner uses for history. This exists for the ambiguous-commit qualification and
+    /// changes no production path.
+    pub fn with_channel_policy(
+        provider: P,
+        context: crate::catalog::SupervisorContext,
+        store: StoreHandle,
+        reconnect: ReconnectScheduler,
+        policy: Arc<dyn ChannelPolicy>,
+    ) -> Result<Self, RuntimeError> {
+        let (snapshot, _) = watch::channel(NetworkSnapshot::default());
+        Self::with_snapshot_channel_and_policy(
+            provider, context, store, reconnect, snapshot, policy,
+        )
+    }
+
     /// Builds an owner over a snapshot channel the caller created.
     ///
     /// The controller owns the receiver so it can report per-Network gauges without
@@ -694,6 +779,27 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         store: StoreHandle,
         reconnect: ReconnectScheduler,
         snapshot: watch::Sender<NetworkSnapshot>,
+    ) -> Result<Self, RuntimeError> {
+        // Production policy is the store worker itself; nothing else is wrapped around
+        // it, so the ordinary path is one hop from the owner to the bounded worker.
+        let policy = Arc::new(StoreChannelPolicy(store.clone())) as Arc<dyn ChannelPolicy>;
+        Self::with_snapshot_channel_and_policy(
+            provider, context, store, reconnect, snapshot, policy,
+        )
+    }
+
+    /// [`NetworkOwner::with_snapshot_channel`] with the durable channel policy supplied
+    /// by the caller.
+    ///
+    /// There is deliberately no third way to build an owner: the policy is the only
+    /// injectable seam, and it is the only one whose ambiguous-commit branch matters.
+    pub fn with_snapshot_channel_and_policy(
+        provider: P,
+        context: crate::catalog::SupervisorContext,
+        store: StoreHandle,
+        reconnect: ReconnectScheduler,
+        snapshot: watch::Sender<NetworkSnapshot>,
+        policy: Arc<dyn ChannelPolicy>,
     ) -> Result<Self, RuntimeError> {
         snapshot.send_modify(|state| {
             state.network = Some(context.network);
@@ -709,6 +815,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             network: context.network,
             context,
             store,
+            policy,
             snapshot,
             reconnect,
             resources,
@@ -765,6 +872,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // Observed membership only, so a reader cannot mistake an outstanding or
             // rejected attempt for a live channel.
             snapshot.channels = state.joined_channels();
+            snapshot.detached_channels = state.detached_channels();
             snapshot.pending_joins = state.pending_joins();
             snapshot.rejected_joins = state.rejected_joins();
         });
@@ -974,10 +1082,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     ) -> Result<(), RuntimeError> {
         let (mut ur, mut uw) = tokio::io::split(upstream);
         // Desired intent is durable and restored here; observed state is always fresh.
-        let mut state = NetworkState::new(
-            &self.context.record.nick,
-            &self.context.record.desired_channels,
-        );
+        //
+        // It is re-read from storage at each generation rather than reused from the
+        // record this owner was built with. A channel joined or detached while an
+        // earlier generation was live is durable intent just like any other, and taking
+        // the birth record instead would silently drop it on the next reconnect.
+        let desired = self.durable_desired_policy().await;
+        let mut state = NetworkState::new(&self.context.record.nick, &desired);
         let mut decoder = LineDecoder::default();
         let mut ubuf = [0u8; 2048];
         let mut welcomed = false;
@@ -1132,7 +1243,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             LineOutcome::ReplyPong(token) => {
                                 send(&mut uw, &format!("PONG :{token}\r\n")).await?;
                             }
-                            LineOutcome::Malformed => return Err(RuntimeError::Protocol),
+                            LineOutcome::Malformed => {
+                                return Err(RuntimeError::Protocol);
+                            }
                         },
                     }
                 }
@@ -1141,14 +1254,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // across a generation boundary. Writing a JOIN proves nothing about
             // membership: each attempt is recorded as outstanding and only an
             // authoritative self JOIN closes it as confirmed.
-            for channel in self
-                .context
-                .record
-                .desired_channels
+            //
+            // A detached channel is joined here exactly like an attached one. Detaching
+            // is a statement about downstream presentation, so upstream membership and
+            // history collection continue unchanged.
+            for channel in desired
                 .iter()
                 .take(crate::state::MAX_CHANNELS)
+                .map(|entry| entry.target.clone())
             {
-                state.begin_desired_join(channel);
+                state.begin_desired_join(&channel);
                 send(&mut uw, &format!("JOIN {channel}\r\n")).await?;
             }
             Ok::<(), RuntimeError>(())
@@ -1440,7 +1555,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         // line that confirms the channel never resolves its buffer, and
                         // the channel would record no history until a server sent a
                         // second, redundant JOIN.
-                        if confirmed_self_channel(&state, &message).is_some_and(|channel| {
+            if confirmed_self_channel(&state, &message).is_some_and(|channel| {
                             !buffers.contains_key(&casemapped(&channel))
                         }) && let Some(channel) = confirmed_self_channel(&state, &message) {
                             match journal.resolve_buffer(BufferKind::Channel, &channel).await {
@@ -1454,6 +1569,29 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                         });
                                 }
                             }
+                        }
+                        // A reattach whose membership was still absent is projected here,
+                        // when the authoritative self JOIN finally confirms it, and not
+                        // when it was requested. Projecting at request time would tell a
+                        // client it had joined a channel the bouncer had not; projecting
+                        // never would leave it told that it had joined a channel it never
+                        // saw. Exactly once: the flag is cleared as it is consumed.
+                        if let Some(channel) = confirmed_self_channel(&state, &message)
+                            && state.is_reveal_pending(&channel)
+                        {
+                            state.clear_reveal(&channel);
+                            self.reveal_channel(
+                                &sessions,
+                                &state,
+                                &channel,
+                                &mut journal,
+                                &buffers,
+                            )
+                            .await;
+                            self.snapshot.send_modify(|snapshot| {
+                                snapshot.channels_reattached =
+                                    snapshot.channels_reattached.saturating_add(1)
+                            });
                         }
                     }
                     self.publish_state(&state);
@@ -1634,7 +1772,19 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // removed. No other client ever sees either.
             rebuild_reply(message, route.downstream_label.as_deref())
         });
-        let fans_out = matches!(outcome, RouteOutcome::Fanout);
+        let mut fans_out = matches!(outcome, RouteOutcome::Fanout);
+        // A detached channel's live traffic is withheld from attached sessions while
+        // still being applied to state and still ingested into durable history below.
+        // The two are deliberately different decisions: hiding a channel from a local
+        // client's view must not silently destroy what the bouncer recorded.
+        let detached = if fans_out {
+            detached_fanout(state, message)
+        } else {
+            DetachedFanout::Deliver
+        };
+        if matches!(detached, DetachedFanout::Suppress) {
+            fans_out = false;
+        }
         // Only used to address a CTCP reply when the sender carried no usable prefix.
         let nick_hint = self.snapshot.borrow().nick.clone().unwrap_or_default();
         match outcome {
@@ -1694,12 +1844,22 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             } else {
                 Some(message.encode().map_err(|_| RuntimeError::Protocol)?)
             };
+            // A rewritten frame already has every detached channel removed from it, so it
+            // replaces both forms. Dropping its tags is sound: a tag is optional in every
+            // direction, and the alternative would reintroduce a detached channel name
+            // carried by a server-chosen tag value.
+            let rewritten = match &detached {
+                DetachedFanout::Rewritten(line) => Some(line.clone()),
+                _ => None,
+            };
             for (id, task) in sessions {
                 let wants_tags = task.handle().capabilities().negotiated_tags();
-                let line = match (&tagged, &untagged) {
-                    (Some(tagged), _) if wants_tags => tagged.clone(),
-                    (_, Some(untagged)) => untagged.clone(),
-                    _ => raw.to_vec(),
+                let line = match (&rewritten, &tagged, &untagged) {
+                    (Some(line), _, _) => line.clone(),
+                    (None, Some(tagged), _) if wants_tags => tagged.clone(),
+                    (None, _, Some(untagged)) => untagged.clone(),
+                    (None, None, None) => raw.to_vec(),
+                    (None, Some(_), None) => raw.to_vec(),
                 };
                 if task.handle().fanout(line).is_err() {
                     // Bounded fanout: the owner never awaits the session, so a stalled
@@ -1840,6 +2000,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 session,
                                 buffers,
                                 &self.snapshot,
+                                state,
                             )
                             .await;
                         }
@@ -1978,11 +2139,275 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             Err(error) => self.report_local_error(sessions, session, &error),
                         }
                     }
+                    SessionIntent::Detach { channel } => {
+                        self.apply_detach(sessions, state, session, &channel).await;
+                    }
+                    SessionIntent::Reattach { channel } => {
+                        self.apply_reattach(
+                            sessions, state, session, &channel, journal, buffers, normal_tx,
+                            generation, reconcile,
+                        )
+                        .await;
+                    }
                 }
                 let _ = control_tx;
             }
         }
         Ok(())
+    }
+
+    /// Hides one desired channel from every attached session, durably.
+    ///
+    /// Order is not negotiable: the durable policy is committed first, and only a commit
+    /// that certainly landed changes what clients are shown. That is what makes the
+    /// policy survive a restart -- a restart reads the flag, not the live view.
+    ///
+    /// The membership itself is untouched. No upstream `PART` is written and no
+    /// authoritative self event can be fabricated, so the bouncer stays in the room and
+    /// keeps collecting history exactly as before.
+    async fn apply_detach(
+        &self,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        state: &mut NetworkState,
+        session: SessionId,
+        channel: &str,
+    ) {
+        let outcome = self.policy.set_detached(self.network, channel, true).await;
+        match outcome {
+            Ok(true) => {
+                if state.detach(channel) {
+                    // One client detaching changes the Network's policy, so every
+                    // attached session is told -- not just the one that asked. A client
+                    // that stayed silent would otherwise keep a channel it can no longer
+                    // see and no explanation for it disappearing.
+                    self.announce_detach(sessions, channel);
+                }
+            }
+            Ok(false) => {
+                self.notice_session(sessions, session, BOUNCER_PREFIX, DETACH_NOT_DURABLE);
+            }
+            Err(error) if error.commit_state() == CommitState::Unknown => {
+                // The durable effect is unknown. The flag is re-read rather than assumed
+                // either way, and presentation follows durable state. Guessing here would
+                // make what a client sees depend on which of two outcomes this process
+                // happened to see first, and the other outcome is what a reconnect sees.
+                if self.durable_detached(channel).await == Some(true) && state.detach(channel) {
+                    self.announce_detach(sessions, channel);
+                    self.notice_session(sessions, session, BOUNCER_PREFIX, DETACH_RECONCILED);
+                } else {
+                    self.notice_session(sessions, session, BOUNCER_PREFIX, DETACH_UNKNOWN);
+                }
+            }
+            // A store that definitely refused has no new policy, so there is nothing to
+            // present. Reporting it as a transition would show every client a channel
+            // that is still going to be there on reconnect.
+            Err(error) => self.report_local_error(sessions, session, &error),
+        }
+    }
+
+    /// Restores downstream presentation of one desired channel, durably.
+    ///
+    /// When membership is already observed the session is given the full bounded
+    /// projection, because a client cannot be shown a channel as joined without the
+    /// topic, modes, and names that make that claim coherent. When membership is absent,
+    /// the channel is joined upstream instead and projected once the server confirms it,
+    /// so nothing is projected for a channel this bouncer does not actually hold.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_reattach(
+        &self,
+        sessions: &mut BTreeMap<SessionId, SessionTask>,
+        state: &mut NetworkState,
+        session: SessionId,
+        channel: &str,
+        journal: &mut crate::journal::HistoryJournal,
+        buffers: &BTreeMap<String, BufferId>,
+        normal_tx: &mpsc::Sender<OutboundIntent>,
+        generation: ConnectionGeneration,
+        reconcile: &mut DesiredReconcile,
+    ) {
+        let outcome = self.policy.set_detached(self.network, channel, false).await;
+        // `true` means a row changed, which for this mutation means the flag was
+        // cleared. Reading that as "still detached" would leave a successfully
+        // reattached channel invisible, which is the opposite of what was asked for.
+        let still_detached = match outcome {
+            Ok(true) => false,
+            Ok(false) => {
+                self.notice_session(sessions, session, BOUNCER_PREFIX, REATTACH_NOT_DURABLE);
+                return;
+            }
+            // Presentation follows the durable flag, not the outcome this process saw.
+            // An unknown commit that landed means the channel is visible; one that did
+            // not means it stays hidden.
+            Err(error) if error.commit_state() == CommitState::Unknown => {
+                let Some(detached) = self.durable_detached(channel).await else {
+                    self.notice_session(sessions, session, BOUNCER_PREFIX, REATTACH_UNKNOWN);
+                    return;
+                };
+                detached
+            }
+
+            Err(error) => {
+                self.report_local_error(sessions, session, &error);
+                return;
+            }
+        };
+        if still_detached {
+            // Durable state still says detached: nothing changed and nothing is shown.
+            self.notice_session(sessions, session, BOUNCER_PREFIX, REATTACH_RECONCILED);
+            return;
+        }
+        if !state.reattach(channel) {
+            return;
+        }
+        if !Self::is_observed_member(state, channel) {
+            // The server does not currently hold this channel for the bouncer. A JOIN is
+            // written and the reveal is deferred to the authoritative self JOIN, so a
+            // client is never told it is in a channel the bouncer has not joined.
+            state.begin_desired_join(channel);
+            if queue_upstream(normal_tx, generation, &format!("JOIN {channel}\r\n")).is_err()
+                && !self.defer_desired(reconcile, channel.to_owned(), DesiredIntent::Join)
+            {
+                return;
+            }
+            return;
+        }
+        // Membership is already observed, so the reveal can be projected immediately.
+        self.reveal_channel(sessions, state, channel, journal, buffers)
+            .await;
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.channels_reattached = snapshot.channels_reattached.saturating_add(1)
+        });
+    }
+
+    /// Projects a newly reattached channel to every attached session.
+    async fn reveal_channel(
+        &self,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        state: &NetworkState,
+        channel: &str,
+        journal: &mut crate::journal::HistoryJournal,
+        buffers: &BTreeMap<String, BufferId>,
+    ) {
+        for task in sessions.values() {
+            let handle = task.handle();
+            // A synthetic JOIN precedes the projection so a client sees the same ordered
+            // shape it saw when the channel was attached originally.
+            if handle
+                .queue_control(&projection::reattach_join_line(channel))
+                .is_err()
+            {
+                continue;
+            }
+            let read_markers = if handle.capabilities().manages_read_markers() {
+                Some(initial_read_markers(journal, buffers, state).await)
+            } else {
+                None
+            };
+            let _ = projection::project_channel(
+                handle,
+                state,
+                &state.nick,
+                channel,
+                read_markers.as_ref(),
+            );
+        }
+    }
+
+    /// True when the server currently holds `channel` for this bouncer.
+    fn is_observed_member(state: &NetworkState, channel: &str) -> bool {
+        state
+            .joined_channels()
+            .iter()
+            .any(|held| state.same_nick(held, channel))
+    }
+
+    /// Emits the bouncer-owned `PART` that tells every session a channel was detached.
+    ///
+    /// The prefix is the bouncer's own reserved name, never the client's nick and never a
+    /// person who is still in the room: nothing happened to anybody upstream, and a frame
+    /// attributed to a real participant would say otherwise.
+    fn announce_detach(&self, sessions: &BTreeMap<SessionId, SessionTask>, channel: &str) {
+        let line = projection::detach_line(channel);
+        for task in sessions.values() {
+            let _ = task.handle().queue_control(&line);
+        }
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.channels_detached = snapshot.channels_detached.saturating_add(1)
+        });
+    }
+
+    /// Re-reads one channel's durable presentation flag.
+    ///
+    /// Used only after a commit whose outcome the store could not determine. It reports
+    /// `None` when the read itself failed, which the caller must treat as "still unknown"
+    /// rather than as a policy.
+    async fn durable_detached(&self, channel: &str) -> Option<bool> {
+        let records = self.policy.load().await.ok()?;
+        let record = records
+            .iter()
+            .find(|record| record.network == self.network)?;
+        record
+            .desired_channels
+            .iter()
+            .find(|entry| {
+                i2pr_irc_core::Casemapping::Rfc1459.fold(entry.target.as_bytes())
+                    == i2pr_irc_core::Casemapping::Rfc1459.fold(channel.as_bytes())
+            })
+            .map(|entry| entry.detached)
+    }
+
+    /// Reads this Network's durable channel policy for a fresh generation.
+    ///
+    /// A store that cannot answer falls back to the record this owner was built from.
+    /// That is the last known durable intent, which is strictly better than joining
+    /// nothing at all, and the generation still reports its own failure through the
+    /// snapshot rather than silently pretending the read succeeded.
+    async fn durable_desired_policy(&self) -> Vec<crate::state::DesiredChannelPolicy> {
+        match self.policy.load().await {
+            Ok(records) => records
+                .iter()
+                .find(|record| record.network == self.network)
+                .map(|record| {
+                    record
+                        .desired_channels
+                        .iter()
+                        .map(|entry| crate::state::DesiredChannelPolicy {
+                            target: entry.target.clone(),
+                            detached: entry.detached,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => {
+                self.snapshot
+                    .send_modify(|snapshot| snapshot.last_error = Some(UNREADABLE_POLICY));
+                self.context
+                    .record
+                    .desired_channels
+                    .iter()
+                    .map(|entry| crate::state::DesiredChannelPolicy {
+                        target: entry.target.clone(),
+                        detached: entry.detached,
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Writes one operator-notice line to a single session, when it is still attached.
+    fn notice_session(
+        &self,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+        session: SessionId,
+        prefix: &str,
+        text: &str,
+    ) {
+        if let Some(task) = sessions.get(&session) {
+            let nick = self.snapshot.borrow().nick.clone().unwrap_or_default();
+            let _ = task
+                .handle()
+                .queue_control(&format!(":{prefix} NOTICE {nick} :{text}\r\n"));
+        }
     }
 
     /// Routes one client query upstream, translating its label, then admits the frame.
@@ -2301,7 +2726,7 @@ async fn initial_read_markers(
     state: &NetworkState,
 ) -> BTreeMap<String, i2pr_irc_wire::IrcTimestamp> {
     let mut markers = BTreeMap::new();
-    for channel in state.joined_channels() {
+    for channel in state.visible_channels() {
         let Some(buffer) = buffers.get(&casemapped(&channel)).copied() else {
             continue;
         };
@@ -2316,6 +2741,32 @@ async fn initial_read_markers(
     }
     markers
 }
+
+/// The bouncer's own reserved prefix for lines that describe bouncer policy rather than
+/// an event that happened on the network.
+const BOUNCER_PREFIX: &str = "bouncer";
+
+/// Recorded when a generation could not re-read durable channel policy.
+///
+/// The generation falls back to the intent this owner was built from, so the marker says
+/// which record was used rather than implying a channel was lost.
+const UNREADABLE_POLICY: &str = "durable-channel-policy-unreadable";
+
+/// Reported when a detach or reattach names a channel this Network does not hold.
+///
+/// The alternative is silence, and silence would leave a client believing its request had
+/// been applied when nothing was stored at all.
+const DETACH_NOT_DURABLE: &str =
+    "Bouncer does not hold that channel as a desired channel on this network";
+const REATTACH_NOT_DURABLE: &str =
+    "Bouncer does not hold that channel as a desired channel on this network";
+/// Reported when a commit's outcome is unknown and durable state could not be re-read.
+const DETACH_UNKNOWN: &str = "Bouncer could not confirm the detach; channel state may follow";
+const REATTACH_UNKNOWN: &str = "Bouncer could not confirm the reattach; channel state may follow";
+/// Reported when an ambiguous commit was resolved by re-reading durable state and the
+/// request had in fact taken effect.
+const DETACH_RECONCILED: &str = "Bouncer re-read durable state; the channel is detached";
+const REATTACH_RECONCILED: &str = "Bouncer re-read durable state; the channel was still detached";
 
 /// What this generation's upstream write path accepts right now.
 ///
@@ -2416,6 +2867,117 @@ fn history_target(message: &Message) -> Option<&str> {
     } else {
         prefix
     })
+}
+
+/// What to do with one upstream line under the current detached-channel policy.
+#[derive(Debug, Eq, PartialEq)]
+enum DetachedFanout {
+    /// Deliver the line unchanged.
+    Deliver,
+    /// Deliver a frame from which every detached channel has been removed.
+    Rewritten(Vec<u8>),
+    /// Deliver nothing.
+    Suppress,
+}
+
+/// Decides whether one upstream line may be presented to attached sessions.
+///
+/// The rule is that a line *about* a detached channel is withheld, and a line that
+/// merely mentions one alongside visible channels is redacted rather than dropped. That
+/// asymmetry matters: a `QUIT` listing several channels still concerns the visible ones,
+/// so suppressing it whole would silently desynchronize them, while delivering it
+/// unchanged would leak the detached channel's name. Redaction is the only answer that
+/// keeps both promises.
+///
+/// A line about several detached and visible channels at once is withheld whole.
+/// Over-suppressing is the safe direction: a client must never be shown a frame whose
+/// meaning depends on a channel it is not allowed to see.
+fn detached_fanout(state: &NetworkState, message: &Message) -> DetachedFanout {
+    let command = &message.command;
+    if command.eq_ignore_ascii_case(b"JOIN")
+        || command.eq_ignore_ascii_case(b"PART")
+        || command.eq_ignore_ascii_case(b"KICK")
+        || command.eq_ignore_ascii_case(b"MODE")
+        || command.eq_ignore_ascii_case(b"TOPIC")
+        || command.eq_ignore_ascii_case(b"INVITE")
+    {
+        let Some(first) = message.params.first() else {
+            return DetachedFanout::Deliver;
+        };
+        let Ok(first) = std::str::from_utf8(first) else {
+            return DetachedFanout::Deliver;
+        };
+        // A target that is not a channel at all cannot be detached.
+        if !is_channel_target(first) {
+            return DetachedFanout::Deliver;
+        }
+        // Several channels at once: withhold the frame rather than part-rewrite a JOIN.
+        let named: Vec<&str> = first.split(',').collect();
+        let detached_any = named.iter().any(|name| state.is_detached(name));
+        if detached_any {
+            return DetachedFanout::Suppress;
+        }
+        if command.eq_ignore_ascii_case(b"JOIN") {
+            // `JOIN` names channels in one comma-separated parameter; every name has to
+            // be visible or the frame is withheld, which the check above already decided.
+            return DetachedFanout::Deliver;
+        }
+        return DetachedFanout::Deliver;
+    }
+    if command.eq_ignore_ascii_case(b"PRIVMSG") || command.eq_ignore_ascii_case(b"NOTICE") {
+        return match history_target(message) {
+            Some(target) if is_channel_target(target) && state.is_detached(target) => {
+                DetachedFanout::Suppress
+            }
+            _ => DetachedFanout::Deliver,
+        };
+    }
+    if command.eq_ignore_ascii_case(b"QUIT") {
+        return redact_quit_channels(state, message);
+    }
+    DetachedFanout::Deliver
+}
+
+/// Rebuilds a `QUIT` without naming any detached channel.
+///
+/// A `QUIT` whose trailing parameter listed only detached channels carries nothing left
+/// to say to a client, so it is withheld. Tags are dropped because a server-chosen tag
+/// value may itself name a channel; a client that negotiated `message-tags` treats tags
+/// as optional and a frame without them is still well formed.
+fn redact_quit_channels(state: &NetworkState, message: &Message) -> DetachedFanout {
+    let Some(list) = message.params.last() else {
+        return DetachedFanout::Deliver;
+    };
+    let Ok(list) = std::str::from_utf8(list) else {
+        return DetachedFanout::Deliver;
+    };
+    let named: Vec<&str> = list.split(',').collect();
+    let mut visible = Vec::with_capacity(named.len());
+    let mut withheld = 0usize;
+    for name in named {
+        if is_channel_target(name) && state.is_detached(name) {
+            withheld += 1;
+            continue;
+        }
+        visible.push(name);
+    }
+    if withheld == 0 {
+        return DetachedFanout::Deliver;
+    }
+    if visible.is_empty() {
+        return DetachedFanout::Suppress;
+    }
+    let mut rebuilt = message.clone();
+    rebuilt.tags.clear();
+    if let Some(last) = rebuilt.params.last_mut() {
+        *last = visible.join(",").into_bytes();
+    }
+    match rebuilt.encode() {
+        Ok(line) => DetachedFanout::Rewritten(line),
+        // A frame that cannot be re-encoded is not delivered in some other shape: the
+        // original would leak the channel and a partial rewrite would lie about it.
+        Err(_) => DetachedFanout::Suppress,
+    }
 }
 
 /// True when this line names a channel rather than a direct-message peer.
