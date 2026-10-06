@@ -1,6 +1,6 @@
 # Bouncer Core Corrective 013 — Post-M003 IRCv3 Time/History and Queue-Integrity Conformance
 
-Status: ready for handoff
+Status: closed — see `plans/closure/bouncer-core/013-status.md`
 
 Repository baseline: `bdc9048d306068ae2427ebddd82513982b94e2d3`
 

@@ -19,7 +19,7 @@ Requesting everything a server offers would be the same error in the other direc
 
 Downstream advertisement covers `message-tags`, `server-time`, `batch`, and `labeled-response`, plus `echo-message` **only** when upstream negotiated it.
 
-`chathistory` and `read-marker` are declared as an explicit constant that is deliberately not advertised yet. Deferring a capability is a reviewable decision; omitting it by accident is not.
+`chathistory` and `read-marker` are advertised only to the extent they are actually served, and the advertised surface is enumerated in [chathistory.md](chathistory.md). Deferring a capability is a reviewable decision; omitting it by accident is not, and neither is advertising an extension that is only half implemented.
 
 `CAP REQ` is all-or-nothing. A request naming one unavailable capability is NAKed as a whole, so a client is never left guessing which half of its request took effect.
 
@@ -81,7 +81,11 @@ Server-originated tags the bouncer understands are preserved. Client-only tags a
 
 A bouncer that echoed arbitrary client tags upstream would let one client forge another client's `msgid`. Widening this is M004's decision, under explicit review.
 
-`server-time` may be preserved from upstream or synthesized from bouncer receive time, but it is metadata only: canonical order remains `HistoryEventId` and tag mediation cannot influence it.
+`server-time` is preserved from upstream exactly, in the canonical `YYYY-MM-DDThh:mm:ss.sssZ` form the extension defines, or synthesized from bouncer receive time when an event had none. It is metadata only: canonical order remains `HistoryEventId` and tag mediation cannot influence it.
+
+Preservation is literal. The wire grammar is a UTC calendar timestamp, not an epoch instant, and a leap second is legal on the wire — most calendar libraries silently normalise `:60` to `:59`, which would make replayed history disagree with the server. The bouncer therefore uses its own bounded `IrcTimestamp`, which accepts a leap second only at the sole position UTC allows one (`23:59:60`) and orders it correctly between `23:59:59.999` and the following `00:00:00.000`.
+
+No integer epoch value is ever emitted as a `time` tag, and an integer epoch arriving *in* a `time` tag is not valid server-time at all.
 
 ## BATCH identifiers are ephemeral
 

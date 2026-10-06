@@ -35,6 +35,8 @@ A full queue drops the event and increments a counter rather than buffering. An 
 
 A refused append is never reported as recorded. History loss shows up in bounded counters (`appended`, `append_refused`, `store_unavailable`, `history_dropped`), so it is visible rather than silent. History degradation never affects network delivery semantics.
 
+That last point is a deliberate policy split. Best-effort durable history may be dropped, because losing it cannot desynchronize anything the client is currently receiving. A live IRC frame may not be dropped, because a downstream stream is ordered — see [network-ownership.md](network-ownership.md).
+
 The owner drains at most a batch per turn and never spins to catch up, so under sustained load the bounded queue drains at whatever rate the loop is already taking turns. Every line handed to ingestion is accounted for exactly once — recorded, skipped, or dropped and counted — because a line that simply vanished would leave no trace anywhere.
 
 ## A buffer is resolved after the line that creates it

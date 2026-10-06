@@ -122,7 +122,7 @@ A post-closure source/specification review against the current IRCv3 documents f
 - several downstream-to-upstream bounded queue failures are ignored, permitting silent command loss and possible DesiredState/live divergence;
 - a saturated live downstream fanout queue currently drops one arbitrary frame while leaving the session attached, which can leave an IRC client desynchronized.
 
-Corrective 013 owns these findings. Historical M003 evidence remains useful and is not rewritten, but M004 is blocked until `plans/closure/bouncer-core/013-status.md` closes the corrective.
+Corrective 013 owned these findings and has now closed them; see `plans/closure/bouncer-core/013-status.md`. Historical M003 evidence remains useful and was not rewritten. M004 is unblocked for decomposition, subject to the unresolved non-blocking finding recorded in that closure.
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
@@ -369,7 +369,7 @@ Prove the bouncer behaves safely under anonymity-sensitive protocol inputs, high
 Dependencies:
 
 - historical M003 closure accepted;
-- Corrective 013 closed with no unresolved M004-blocking finding.
+- Corrective 013 closed with no unresolved M004-blocking finding. (Satisfied; see `plans/closure/bouncer-core/013-status.md`.)
 
 Deliverable boundary:
 
@@ -550,13 +550,13 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | C002 / Corrective 005 | closed | plans/implementation/bouncer-core/005-pre-m003-observed-membership-and-downstream-cap-corrective.md | plans/closure/bouncer-core/005-status.md | none |
 | Research 002 | closed | plans/research/002-rust-irc-crate-conformance-plan.md | plans/research/003-rust-irc-crate-conformance-results.md | none |
 | C003 / Corrective 006 | closed | plans/implementation/bouncer-core/006-framing-recovery-corrective.md | plans/closure/bouncer-core/006-status.md | none |
-| M003 | historical closure; corrective active | plans 007-012 | plans/closure/bouncer-core/012-status.md | Strict current readiness authority is Corrective 013 |
+| M003 | historical closure retained | plans 007-012 | plans/closure/bouncer-core/012-status.md | Strict current readiness authority is Corrective 013 |
 | M003-A / Plan 007 | closed | plans/implementation/bouncer-core/007-m003a-durable-storage-and-identity-foundation.md | plans/closure/bouncer-core/007-status.md | none |
 | M003-B / Plan 008 | closed | plans/implementation/bouncer-core/008-m003b-multinetwork-multiclient-ownership.md | plans/closure/bouncer-core/008-status.md | none |
 | M003-C / Plan 009 | closed | plans/implementation/bouncer-core/009-m003c-history-journal-cursors-and-legacy-playback.md | plans/closure/bouncer-core/009-status.md | none |
 | M003-D / Plan 010 | closed | plans/implementation/bouncer-core/010-m003d-response-routing-and-ircv3-foundation.md | plans/closure/bouncer-core/010-status.md | none |
 | M003-E / Plan 011 | closed | plans/implementation/bouncer-core/011-m003e-chathistory-and-read-marker-adapters.md | plans/closure/bouncer-core/011-status.md | none |
 | M003-F / Plan 012 | closed | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | none |
-| C004 / Corrective 013 | ready | plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md | future plans/closure/bouncer-core/013-status.md | none |
-| M004 | blocked | future | future | Corrective 013 closure |
+| C004 / Corrective 013 | closed | plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md | plans/closure/bouncer-core/013-status.md | Live response routing is not wired; tracked as a non-blocking finding |
+| M004 | ready to decompose | future | future | Corrective 013 closed |
 | M005 | not started | future | future | M004 |

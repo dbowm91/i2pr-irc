@@ -1763,8 +1763,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         };
         let nick = self.snapshot.borrow().nick.clone().unwrap_or_default();
         let _ = task.handle().queue_control(&format!(
-            ":bouncer NOTICE {nick} :Bouncer could not accept that command for upstream delivery ({} refused)\r\n",
-            class
+            ":bouncer NOTICE {nick} :Bouncer could not accept that command for upstream delivery ({class} refused)\r\n"
         ));
     }
 }
