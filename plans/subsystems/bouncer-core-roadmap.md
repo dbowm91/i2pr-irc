@@ -132,7 +132,7 @@ Research 005 decomposed M004 and promoted the unresolved response-routing findin
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
-Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. Plan 020 is closed and Plan 021 is the only dependency-ready step.
+Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. Plans 020 and 021 are closed and Plan 022 is the only dependency-ready step.
 
 ## 5. Target architecture
 
@@ -234,11 +234,11 @@ Corrective 019      M005-A / 020
 (closed, non-gating) control + admission
                         |
                         v
-                   M005-B / 021
+                   M005-B / 021 (closed)
                   detached channels
                         |
                         v
-                   M005-C / 022
+                   M005-C / 022 (ready)
                  presence + keep-nick
                         |
                         v
@@ -525,8 +525,8 @@ Accepted deliverables:
 Implementation decomposition:
 
 1. M005-A / Plan 020 — runtime control and downstream admission foundation. **Closed**, no open findings.
-2. M005-B / Plan 021 — durable detached-channel policy. **Ready**.
-3. M005-C / Plan 022 — presence and preferred-nick policy. **Blocked on Plan 021 closure**.
+2. M005-B / Plan 021 — durable detached-channel policy. **Closed**, no open findings.
+3. M005-C / Plan 022 — presence and preferred-nick policy. **Ready**.
 4. M005-D / Plan 023 — bouncer-networks and local IRC administration. **Blocked on Plan 022 closure**.
 5. M005-E / Plan 024 — indexed history search and CHATHISTORY completion. **Blocked on Plan 023 closure**.
 6. M005-F / Plan 025 — downstream IRCv3 protocol polish. **Blocked on Plan 024 closure**.
@@ -678,10 +678,10 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M004-C / Plan 017 | closed | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closed |
 | M004-D / Plan 018 | closed | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | plans/closure/bouncer-core/018-status.md | Plan 017 closure |
 | C019 / Corrective 019 | closed | plans/implementation/bouncer-core/019-m004-findings-corrective.md | plans/closure/bouncer-core/019-status.md | Closed UF-015-1, UF-017-1, UF-018-1; never gated M005 |
-| M005 | active — decomposed; M005-A closed, M005-B ready | plans 020-028 | future plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
+| M005 | active — decomposed; M005-A and M005-B closed, M005-C ready | plans 020-028 | future plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
 | M005-A / Plan 020 | closed | plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md | plans/closure/bouncer-core/020-status.md | M004 + ADR-0003 |
-| M005-B / Plan 021 | ready | plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md | future plans/closure/bouncer-core/021-status.md | Plan 020 closure |
-| M005-C / Plan 022 | blocked | plans/implementation/bouncer-core/022-m005c-presence-and-preferred-nick-policy.md | future plans/closure/bouncer-core/022-status.md | Plan 021 closure |
+| M005-B / Plan 021 | closed | plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md | plans/closure/bouncer-core/021-status.md | Plan 020 closure |
+| M005-C / Plan 022 | ready | plans/implementation/bouncer-core/022-m005c-presence-and-preferred-nick-policy.md | future plans/closure/bouncer-core/022-status.md | Plan 021 closure |
 | M005-D / Plan 023 | blocked | plans/implementation/bouncer-core/023-m005d-bouncer-networks-and-local-irc-administration.md | future plans/closure/bouncer-core/023-status.md | Plan 022 closure |
 | M005-E / Plan 024 | blocked | plans/implementation/bouncer-core/024-m005e-indexed-history-search-and-chathistory-completion.md | future plans/closure/bouncer-core/024-status.md | Plan 023 closure |
 | M005-F / Plan 025 | blocked | plans/implementation/bouncer-core/025-m005f-downstream-ircv3-protocol-polish.md | future plans/closure/bouncer-core/025-status.md | Plan 024 closure |
