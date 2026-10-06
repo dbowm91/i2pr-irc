@@ -746,6 +746,13 @@ pub struct NetworkOwner<P> {
     /// that. The generation-scoped half — what upstream currently believes — is derived
     /// from this on every registration and dies with the generation.
     presence: std::sync::Mutex<PresenceState>,
+    /// The process control plane, for bound sessions' administration requests.
+    ///
+    /// Held by handle and only by handle. It is a bounded request sender, so a session
+    /// asking to create or delete a Network submits a typed request to the one task that
+    /// owns every live owner -- the owner cannot mutate the catalog from under the
+    /// controller, and a client task still cannot reach a store or a supervisor.
+    control: Option<crate::controller::RuntimeControlHandle>,
     snapshot: watch::Sender<NetworkSnapshot>,
     /// Process-wide connect admission.
     ///
@@ -809,6 +816,19 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         )
     }
 
+    /// Gives this owner the process control plane.
+    ///
+    /// This is what lets a session *bound* to this Network administrate the bouncer,
+    /// rather than making administration a privilege of being unbound. The owner does not
+    /// gain authority: it holds a bounded request sender, so every change still lands in
+    /// the controller's one serialized queue. A supervisor built without a controller --
+    /// a test harness, or the pre-M005 legacy path -- simply has none, and a bound
+    /// session there gets an explicit refusal instead of a silent one.
+    pub fn with_control(mut self, control: crate::controller::RuntimeControlHandle) -> Self {
+        self.control = Some(control);
+        self
+    }
+
     /// [`NetworkOwner::with_snapshot_channel`] with the durable channel policy supplied
     /// by the caller.
     ///
@@ -841,6 +861,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             store,
             policy,
             presence: std::sync::Mutex::new(presence),
+            control: None,
             snapshot,
             reconnect,
             resources,
@@ -1486,12 +1507,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         self.handle_command(
                             command,
                             generation,
-                            &state,
                             &control_tx,
                             &normal_tx,
                             &session_tx,
                             &mut sessions,
                             &mut presence_of,
+                            &mut state,
+                            &mut journal,
+                            &buffers,
+                            &mut reconcile,
                         ).await;
                     }
                 }
@@ -1816,12 +1840,22 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         &self,
         command: SupervisorCommand,
         generation: ConnectionGeneration,
-        state: &NetworkState,
         control_tx: &mpsc::Sender<Vec<u8>>,
         normal_tx: &mpsc::Sender<OutboundIntent>,
         session_tx: &mpsc::Sender<SessionEvent>,
         sessions: &mut BTreeMap<SessionId, SessionTask>,
         presence_of: &mut BTreeMap<SessionId, SessionPresence>,
+        // A channel presentation change mutates observed presentation, so the state is
+        // borrowed mutably for this command rather than being the read-only view the
+        // rest of the command surface gets.
+        state: &mut NetworkState,
+        // The reattach projection needs the journal and the buffer map, and a refused
+        // upstream enqueue needs the reconciliation set. An administrative command that
+        // could not reach them would have to reimplement the client's own path, and two
+        // implementations of "reattach a channel" is how they start disagreeing.
+        journal: &mut crate::journal::HistoryJournal,
+        buffers: &BTreeMap<String, BufferId>,
+        reconcile: &mut DesiredReconcile,
     ) {
         match command {
             SupervisorCommand::Attach {
@@ -1883,6 +1917,29 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 if sessions.contains_key(&session) {
                     let _ = session_tx.try_send(event);
                 }
+            }
+            SupervisorCommand::ChannelPolicy {
+                channel,
+                detached,
+                reply,
+            } => {
+                // No requesting session: the change came from the administration
+                // surface, which reports the outcome through its own reply rather than
+                // through a NOTICE. The ordering — commit first, present second — is
+                // the same code either way, so an administrative change cannot drift
+                // from a client's own `PART :detach`.
+                let outcome = if detached {
+                    self.apply_detach(sessions, state, None, &channel).await;
+                    Ok(())
+                } else {
+                    self.apply_reattach(
+                        sessions, state, None, &channel, journal, buffers, normal_tx, generation,
+                        reconcile,
+                    )
+                    .await;
+                    Ok(())
+                };
+                let _ = reply.send(outcome);
             }
             SupervisorCommand::Reconcile { reply } => {
                 let _ = reply.send(self.reconcile(state).await);
@@ -2163,6 +2220,33 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     return Ok(());
                 }
                 match intent {
+                    // A bound session is still a local Operator's connection, so it can
+                    // administrate the bouncer exactly as an unbound one can. The request
+                    // goes to the controller's bounded queue; the owner performs it
+                    // nowhere and owns nothing of it.
+                    SessionIntent::Control { wire } => {
+                        let Some(control) = self.control.clone() else {
+                            self.notice_session(
+                                sessions,
+                                Some(session),
+                                BOUNCER_PREFIX,
+                                "this bouncer has no process control plane",
+                            );
+                            return Ok(());
+                        };
+                        let handle = match sessions.get(&session) {
+                            Some(task) => task.handle().clone(),
+                            // The session ended between the intent and here. Dropping the
+                            // request is correct: there is nobody left to answer.
+                            None => return Ok(()),
+                        };
+                        let nick = state.nick.clone();
+                        let mut surface =
+                            crate::control_session::ControlSurface::new(control, handle, nick);
+                        surface.send_initial_batch().await;
+                        surface.dispatch(&wire).await;
+                        surface.publish_changes().await;
+                    }
                     SessionIntent::RequestProjection => {
                         if let Some(task) = sessions.get(&session) {
                             let handle = task.handle();
@@ -2305,7 +2389,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             Err(error) => {
                                 // Durable intent is unchanged and no upstream JOIN is
                                 // written; the client is told the operation failed.
-                                self.report_local_error(sessions, session, &error);
+                                self.report_local_error(sessions, Some(session), &error);
                             }
                         }
                     }
@@ -2333,11 +2417,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                     return Err(RuntimeError::QueueOverloaded);
                                 }
                             }
-                            Err(error) => self.report_local_error(sessions, session, &error),
+                            Err(error) => self.report_local_error(sessions, Some(session), &error),
                         }
                     }
                     SessionIntent::Detach { channel } => {
-                        self.apply_detach(sessions, state, session, &channel).await;
+                        self.apply_detach(sessions, state, Some(session), &channel)
+                            .await;
                     }
                     SessionIntent::Passive => {
                         presence_of.insert(session, SessionPresence::Passive);
@@ -2350,8 +2435,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     SessionIntent::Reattach { channel } => {
                         self.apply_reattach(
-                            sessions, state, session, &channel, journal, buffers, normal_tx,
-                            generation, reconcile,
+                            sessions,
+                            state,
+                            Some(session),
+                            &channel,
+                            journal,
+                            buffers,
+                            normal_tx,
+                            generation,
+                            reconcile,
                         )
                         .await;
                     }
@@ -2375,7 +2467,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         &self,
         sessions: &BTreeMap<SessionId, SessionTask>,
         state: &mut NetworkState,
-        session: SessionId,
+        session: Option<SessionId>,
         channel: &str,
     ) {
         let outcome = self.policy.set_detached(self.network, channel, true).await;
@@ -2423,7 +2515,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         &self,
         sessions: &mut BTreeMap<SessionId, SessionTask>,
         state: &mut NetworkState,
-        session: SessionId,
+        session: Option<SessionId>,
         channel: &str,
         journal: &mut crate::journal::HistoryJournal,
         buffers: &BTreeMap<String, BufferId>,
@@ -2781,11 +2873,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     fn notice_session(
         &self,
         sessions: &BTreeMap<SessionId, SessionTask>,
-        session: SessionId,
+        session: Option<SessionId>,
         prefix: &str,
         text: &str,
     ) {
-        if let Some(task) = sessions.get(&session) {
+        if let Some(task) = session.and_then(|id| sessions.get(&id)) {
             let nick = self.snapshot.borrow().nick.clone().unwrap_or_default();
             let _ = task
                 .handle()
@@ -3010,7 +3102,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     fn report_local_error(
         &self,
         sessions: &BTreeMap<SessionId, SessionTask>,
-        session: SessionId,
+        session: Option<SessionId>,
         error: &StoreError,
     ) {
         let nick = self.snapshot.borrow().nick.clone().unwrap_or_default();
@@ -3018,7 +3110,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             ":bouncer NOTICE {nick} :Bouncer could not persist that request ({})\r\n",
             error.commit_state().as_str()
         );
-        if let Some(task) = sessions.get(&session) {
+        if let Some(task) = session.and_then(|id| sessions.get(&id)) {
             let _ = task.handle().queue_normal(&line);
         }
         self.snapshot

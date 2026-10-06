@@ -13,9 +13,12 @@
 //! `crates/runtime/tests/corrective_019.rs`, so the legacy suite is redundant rather
 //! than load-bearing and the legacy owner and its helpers can be deleted outright.
 pub mod admission;
+pub mod bouncer_networks;
+pub mod bouncerserv;
 pub mod capability;
 pub mod catalog;
 pub mod chathistory;
+pub mod control_session;
 pub mod controller;
 pub mod ctcp;
 pub mod downstream;
@@ -151,10 +154,36 @@ impl Secret {
     pub fn new(v: String) -> Self {
         Self(v)
     }
+
+    /// Hands the value to the durable secret type.
+    ///
+    /// The only way out of this type, and deliberately not `expose`-shaped: the value
+    /// leaves as a `StoredSecret`, which already redacts and zeroes, so no caller ends
+    /// up holding the credential in an ordinary `String` it might format later.
+    pub fn into_stored(mut self) -> i2pr_irc_store::StoredSecret {
+        // `Secret` has a `Drop`, so the field cannot simply be moved out. Taking it
+        // leaves this instance empty -- its `Drop` then zeroes an empty string -- and
+        // hands ownership to `StoredSecret`, which zeroes on its own drop. Exactly one
+        // live copy exists at a time, and both owners zero what they hold.
+        let value = std::mem::take(&mut self.0);
+        i2pr_irc_store::StoredSecret::new(value)
+    }
 }
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret([redacted])")
+    }
+}
+impl Eq for Secret {}
+impl PartialEq for Secret {
+    /// Compares values, not renderings.
+    ///
+    /// This exists so a type holding a credential can still derive `PartialEq`, which
+    /// keeps test assertions and structural comparisons possible. Equality reveals
+    /// *whether* two secrets match and nothing about either of them, and the derived
+    /// `Debug` above is what guarantees no diagnostic can do better than that.
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 impl Drop for Secret {

@@ -14,7 +14,7 @@ use crate::{
     CONTROL_QUEUE_CAPACITY, IntentClass, NORMAL_QUEUE_CAPACITY, RuntimeError,
     downstream::DownstreamDisposition,
 };
-use i2pr_irc_core::{ByteStream, ClientId, SessionId};
+use i2pr_irc_core::{ByteStream, ClientId, NetworkId, SessionId};
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
 use std::{collections::VecDeque, io};
 use tokio::{
@@ -109,6 +109,17 @@ pub enum SessionIntent {
     /// and outlives the session that set it, so an unrelated client attaching later cannot
     /// silently drop it.
     Away { text: Option<String> },
+    /// The client asked the bouncer's own control surface to do something.
+    ///
+    /// The original framed command, re-parsed by the adapter that owns it. A session
+    /// cannot answer this itself: it submits the command and whoever holds the runtime's
+    /// control handle executes it against the controller. The session never holds a
+    /// store handle, a supervisor handle, or the controller itself.
+    Control {
+        /// The original framed command, re-parsed by the bouncer-networks or
+        /// BouncerServ adapter.
+        wire: Vec<u8>,
+    },
     /// The client completed registration and wants the current projection.
     RequestProjection,
     /// The client asked the bouncer itself for retained history.
@@ -127,6 +138,40 @@ pub enum SessionIntent {
     },
     /// The client asked to end its own session.
     Quit,
+}
+
+/// Why a `BOUNCER` request was refused.
+///
+/// A fixed enum rather than a formatted string, so nothing a client sent can become
+/// the reason text of its own refusal.
+pub(crate) enum BouncerRefusal {
+    NoSuchNetwork(NetworkId),
+    AlreadyBound,
+    AfterRegistration,
+    /// A registered session asked to bind. See the plan: an unbound session stays
+    /// unbound for the rest of its life.
+    BindTooLate,
+}
+
+impl BouncerRefusal {
+    fn subcommand(&self) -> &'static str {
+        match self {
+            Self::NoSuchNetwork(_) | Self::AlreadyBound | Self::BindTooLate => "BIND",
+            Self::AfterRegistration => "",
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::NoSuchNetwork(network) => format!(
+                "no network with id {}",
+                crate::bouncer_networks::render_netid(*network)
+            ),
+            Self::AlreadyBound => "already bound to a network".to_owned(),
+            Self::AfterRegistration => "not valid during registration".to_owned(),
+            Self::BindTooLate => "a registered session cannot bind to a network".to_owned(),
+        }
+    }
 }
 
 /// What a session reports upward.
@@ -176,6 +221,17 @@ pub struct SessionCapabilities {
     /// connection, and one client knowing the capability must not let another client's
     /// `PASSIVE` be accepted on its behalf.
     pub pre_away: bool,
+    /// This session negotiated the bouncer control plane, so it may send `BOUNCER`.
+    ///
+    /// Per session for the same reason as every other flag: whether a client is allowed
+    /// to change process state is a fact about that client, not a property of the bouncer.
+    pub bouncer_networks: bool,
+    /// This session negotiated change notifications for the control plane.
+    ///
+    /// Both halves of the notification capability must be live before a client is told it
+    /// exists; a client that negotiated the initial batch but never receives an update
+    /// has no way to distinguish an idle bouncer from a broken one.
+    pub bouncer_networks_notify: bool,
 }
 impl Default for SessionCapabilities {
     fn default() -> Self {
@@ -185,6 +241,8 @@ impl Default for SessionCapabilities {
             read_markers: false,
             message_tags: false,
             pre_away: false,
+            bouncer_networks: false,
+            bouncer_networks_notify: false,
         }
     }
 }
@@ -221,6 +279,16 @@ impl SessionCapabilities {
         self.pre_away
     }
 
+    /// True when this session may send `BOUNCER` control commands.
+    pub fn negotiated_bouncer_networks(&self) -> bool {
+        self.bouncer_networks
+    }
+
+    /// True when this session asked for control-plane change notifications.
+    pub fn negotiated_bouncer_networks_notify(&self) -> bool {
+        self.bouncer_networks_notify
+    }
+
     /// Applies a client's successful `CAP REQ`, recording that it manages history.
     pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
         Self {
@@ -236,6 +304,14 @@ impl SessionCapabilities {
                 || enabled
                     .iter()
                     .any(|name| name == crate::presence::PRE_AWAY_CAPABILITY),
+            bouncer_networks: self.bouncer_networks
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::bouncer_networks::BOUNCER_NETWORKS),
+            bouncer_networks_notify: self.bouncer_networks_notify
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::bouncer_networks::BOUNCER_NETWORKS_NOTIFY),
         }
     }
 }
@@ -349,7 +425,17 @@ impl SessionTask {
         stream: D,
         events_tx: mpsc::Sender<SessionEvent>,
     ) -> Self {
-        let wiring = ClientWiring::new(session, client, Some(expected_nick), stream);
+        // A session attached to a Network it was already selected for has nothing to
+        // bind: the decision was made before this socket existed, and accepting a
+        // second one here would let a client re-home itself onto a different Network
+        // mid-conversation.
+        let wiring = ClientWiring::new(
+            session,
+            client,
+            Some(expected_nick),
+            std::collections::BTreeSet::new(),
+            stream,
+        );
         Self::resume(wiring, events_tx)
     }
 
@@ -428,6 +514,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         session: SessionId,
         client: ClientId,
         expected_nick: Option<String>,
+        bindable: std::collections::BTreeSet<NetworkId>,
         stream: D,
     ) -> Self {
         let (read, write) = tokio::io::split(stream);
@@ -442,7 +529,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
             ),
         };
         Self {
-            reader: SessionReader::new(session, read, handle.clone(), expected_nick),
+            reader: SessionReader::new(session, read, handle.clone(), expected_nick, bindable),
             handle,
             writer,
         }
@@ -516,6 +603,11 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         self.reader.negotiated()
     }
 
+    /// The Network a pre-registration `BOUNCER BIND` claimed, if one was accepted.
+    pub fn bind_request(&self) -> Option<NetworkId> {
+        self.reader.bind_request()
+    }
+
     /// Whether registration completed.
     pub fn is_registered(&self) -> bool {
         self.reader.registered_nick().is_some()
@@ -528,10 +620,18 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
     /// the writer is owned for the whole call, so the socket is closed on every exit --
     /// there is no way to return while a task is still writing to a client nobody is
     /// answering.
-    pub async fn serve_locally(
+    ///
+    /// The handler is asynchronous because answering a control request means submitting a
+    /// typed request to the process controller and waiting for it. Awaiting here is safe:
+    /// the reader is already on its own task, so a slow controller cannot stop this loop
+    /// from noticing that the client has gone.
+    pub async fn serve_locally<Fut>(
         self,
-        mut answer: impl FnMut(SessionIntent),
-    ) -> DownstreamDisposition {
+        mut answer: impl FnMut(SessionIntent) -> Fut,
+    ) -> DownstreamDisposition
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
         let Self {
             mut reader,
             handle,
@@ -557,7 +657,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
                         disposition = DownstreamDisposition::LocalDetach;
                         break;
                     }
-                    answer(intent);
+                    answer(intent).await;
                 }
                 SessionEvent::Ended {
                     disposition: ended, ..
@@ -667,6 +767,17 @@ struct SessionReader<D: ByteStream> {
     pre_away_reported: bool,
     /// Whether the registration projection has been requested.
     projection_reported: bool,
+    /// Networks this client may still claim through a pre-registration `BOUNCER BIND`.
+    ///
+    /// A bounded set copied from the controller's own snapshot when the socket was
+    /// accepted. Membership is decided here rather than by a round trip to the controller
+    /// because a `FAIL BOUNCER BIND` must reach the client *before* registration
+    /// completes; a client that binds late gets a different answer entirely, so deciding
+    /// it later would make the same request mean two different things depending on
+    /// timing.
+    bindable: std::collections::BTreeSet<NetworkId>,
+    /// The Network a pre-registration `BOUNCER BIND` claimed, once one was accepted.
+    bind_request: Option<NetworkId>,
 }
 
 impl<D: ByteStream> SessionReader<D> {
@@ -675,6 +786,7 @@ impl<D: ByteStream> SessionReader<D> {
         read: ReadHalf<D>,
         handle: SessionHandle,
         expected_nick: Option<String>,
+        bindable: std::collections::BTreeSet<NetworkId>,
     ) -> Self {
         Self {
             session,
@@ -691,6 +803,8 @@ impl<D: ByteStream> SessionReader<D> {
             pre_away_declaration: None,
             pre_away_reported: false,
             projection_reported: false,
+            bindable,
+            bind_request: None,
         }
     }
 
@@ -834,6 +948,11 @@ impl<D: ByteStream> SessionReader<D> {
         &self.negotiated
     }
 
+    /// The Network a pre-registration `BOUNCER BIND` claimed, if one was accepted.
+    pub(crate) fn bind_request(&self) -> Option<NetworkId> {
+        self.bind_request
+    }
+
     fn translate(&mut self, raw: &[u8]) -> Result<Option<SessionIntent>, RuntimeError> {
         let message = Message::parse(raw).map_err(|_| RuntimeError::Protocol)?;
         // A client may not send a prefix, and its tag budget is enforced before any
@@ -847,7 +966,7 @@ impl<D: ByteStream> SessionReader<D> {
         }
         let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
         if self.ready {
-            self.translate_registered(&message, &command)
+            self.translate_registered(&message, &command, raw)
         } else if matches!(command.as_str(), "PASSIVE" | "ACTIVE") {
             // Accepted before registration completes, which is what the draft means by
             // pre-away: a background client declares itself while it is still arriving.
@@ -874,6 +993,9 @@ impl<D: ByteStream> SessionReader<D> {
     ) -> Result<Option<SessionIntent>, RuntimeError> {
         match command {
             "CAP" => self.mediate_cap(message)?,
+            // The one control verb the draft allows during registration. Everything else
+            // in the `BOUNCER` namespace needs a Network, and a Network is not chosen yet.
+            "BOUNCER" => self.mediate_bouncer_registration(message)?,
             "NICK" => {
                 if let Some(value) = message.params.first() {
                     let requested = String::from_utf8_lossy(value).into_owned();
@@ -912,6 +1034,131 @@ impl<D: ByteStream> SessionReader<D> {
                 .queue_normal(":bouncer 451 * :Register first\r\n")?,
         }
         Ok(None)
+    }
+
+    /// Mediates the draft's one registration-time `BOUNCER` verb.
+    ///
+    /// `BOUNCER BIND` claims this connection for a Network. It is accepted only here, while
+    /// registration is still open, and only for a Network that existed when this socket was
+    /// accepted. A second `BIND` is refused rather than silently replacing the first: two
+    /// claims for one connection would leave the client believing it is on a Network the
+    /// bouncer never put it on.
+    ///
+    /// A refusal is written immediately, on the socket the client opened, and the session
+    /// stays unbound. Killing the registration would be a harsher answer than the draft
+    /// asks for, and an unbound session remains a useful control connection: the client can
+    /// correct the netid and bind again before registration completes.
+    ///
+    /// Sending `BOUNCER` at all without having negotiated the capability *is* a protocol
+    /// violation, and ends the session. A client must not be able to reach the control plane
+    /// with a capability it never asked for.
+    fn mediate_bouncer_registration(&mut self, message: &Message) -> Result<(), RuntimeError> {
+        let params: Vec<&str> = message
+            .params
+            .iter()
+            .map(|param| std::str::from_utf8(param).unwrap_or(""))
+            .collect();
+        let subcommand = params.first().copied().unwrap_or("");
+        let rest = if params.is_empty() {
+            &[][..]
+        } else {
+            &params[1..]
+        };
+        match crate::bouncer_networks::decode_command(subcommand, rest) {
+            // A decode failure is reported as itself. Reporting it as "not valid during
+            // registration" would tell a client that a malformed netid was a timing
+            // problem, which sends it looking in entirely the wrong place.
+            Err(error) => {
+                let line = crate::bouncer_networks::render_failure(subcommand, &error);
+                let _ = self.handle.queue_control(&line);
+                Ok(())
+            }
+            Ok(crate::bouncer_networks::BouncerCommand::Bind { network }) => {
+                if !self.handle.capabilities().negotiated_bouncer_networks() {
+                    return Err(RuntimeError::Protocol);
+                }
+                if self.bind_request.is_some() {
+                    self.refuse_bouncer("BIND", &BouncerRefusal::AlreadyBound);
+                } else if !self.bindable.contains(&network) {
+                    self.refuse_bouncer("BIND", &BouncerRefusal::NoSuchNetwork(network));
+                } else {
+                    self.bind_request = Some(network);
+                }
+                Ok(())
+            }
+            // `LISTNETWORKS` and friends are answered by the control session this
+            // connection becomes, not during registration. Answering them here would mean
+            // answering from a session that does not exist yet.
+            _ => {
+                self.refuse_bouncer(subcommand, &BouncerRefusal::AfterRegistration);
+                Ok(())
+            }
+        }
+    }
+
+    /// Routes a registered client's control request to whichever surface owns it.
+    ///
+    /// Two shapes reach the bouncer's own administration, and they are deliberately
+    /// different in what they may do:
+    ///
+    /// * `BOUNCER …` is the bouncer-networks draft's command vocabulary, gated on that
+    ///   capability.
+    /// * `PRIVMSG BouncerServ :…` is the local administration service. It needs no
+    ///   capability, because it is ordinary IRC: any client can type it, and every client
+    ///   that connects here is a local Operator who was admitted by the access boundary
+    ///   with a trusted `ClientId`. Advertising it would be a claim about interoperability
+    ///   that no other client understands.
+    ///
+    /// Everything else — a `PRIVMSG` to a person, a `PRIVMSG` to a channel — is left alone so
+    /// the owner forwards it upstream. This method returns `None` for anything that is not a
+    /// control request, which is what keeps an ordinary message from being mistaken for one.
+    fn mediate_control(
+        &mut self,
+        message: &Message,
+        command: &str,
+        raw: &[u8],
+    ) -> Result<Option<SessionIntent>, RuntimeError> {
+        if command == "BOUNCER" {
+            if !self.handle.capabilities().negotiated_bouncer_networks() {
+                return Err(RuntimeError::Protocol);
+            }
+            // `BIND` is the one verb the draft allows only during registration. A client
+            // that sends it here has not read the rule, and quietly doing nothing would
+            // leave it believing it had joined a Network.
+            let subcommand = message
+                .params
+                .first()
+                .map(|param| String::from_utf8_lossy(param).to_ascii_uppercase())
+                .unwrap_or_default();
+            if subcommand == "BIND" {
+                self.refuse_bouncer("BIND", &BouncerRefusal::BindTooLate);
+                return Ok(None);
+            }
+            return Ok(Some(SessionIntent::Control { wire: raw.to_vec() }));
+        }
+        // The target must fold-match the service identity, because IRC casemapping
+        // applies to a target name and a client may legitimately type `bouncerserv`.
+        let target = message
+            .params
+            .first()
+            .map(|param| String::from_utf8_lossy(param).into_owned())
+            .unwrap_or_default();
+        if i2pr_irc_core::Casemapping::Rfc1459.fold(target.as_bytes())
+            != i2pr_irc_core::Casemapping::Rfc1459
+                .fold(crate::bouncer_networks::SERVICE_NICK.as_bytes())
+        {
+            return Ok(None);
+        }
+        Ok(Some(SessionIntent::Control { wire: raw.to_vec() }))
+    }
+
+    fn refuse_bouncer(&self, _subcommand: &str, refusal: &BouncerRefusal) {
+        let _ = self.handle.queue_control(&format!(
+            ":{} FAIL BOUNCER {} :{}\r\n",
+            crate::bouncer_networks::SERVICE_NICK,
+            refusal.subcommand(),
+            refusal.reason(),
+        ));
     }
 
     /// The intent registration completing produces, once every line has been consumed.
@@ -953,9 +1200,33 @@ impl<D: ByteStream> SessionReader<D> {
         &mut self,
         message: &Message,
         command: &str,
+        raw: &[u8],
     ) -> Result<Option<SessionIntent>, RuntimeError> {
         match command {
             "CAP" => self.mediate_cap(message)?,
+            // The bouncer-networks control plane.
+            //
+            // Submitted rather than answered here: this session has no store and no
+            // controller, only whoever owns it does.
+            "BOUNCER" => {
+                if let Some(intent) = self.mediate_control(message, command, raw)? {
+                    return Ok(Some(intent));
+                }
+            }
+            // A message to the local administration service is a control request; a
+            // message to anybody else is ordinary traffic and belongs on its ordinary
+            // path. Falling through to the forward arm below is not an optimisation: a
+            // `PRIVMSG` silently dropped here is a client's message that never reaches
+            // the channel it was addressed to.
+            "PRIVMSG" => {
+                if let Some(intent) = self.mediate_control(message, command, raw)? {
+                    return Ok(Some(intent));
+                }
+                return Ok(Some(SessionIntent::Forward {
+                    wire: message.encode().map_err(|_| RuntimeError::Protocol)?,
+                    class: IntentClass::NonReplayable,
+                }));
+            }
             "PING" => {
                 let token = message.params.last().ok_or(RuntimeError::Protocol)?;
                 let line = format!(
@@ -1031,7 +1302,7 @@ impl<D: ByteStream> SessionReader<D> {
                 }
                 return Ok(Some(SessionIntent::Part { channel }));
             }
-            "PRIVMSG" | "NOTICE" | "NICK" | "TOPIC" | "MODE" => {
+            "NOTICE" | "NICK" | "TOPIC" | "MODE" => {
                 return Ok(Some(SessionIntent::Forward {
                     wire: message.encode().map_err(|_| RuntimeError::Protocol)?,
                     class: IntentClass::NonReplayable,

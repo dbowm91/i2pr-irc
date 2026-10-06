@@ -244,6 +244,21 @@ async fn read_client_until(stream: &mut tokio::io::DuplexStream, needle: &[u8]) 
             assert!(count > 0, "client stream ended");
             all.extend_from_slice(&buf[..count]);
         }
+        // Everything already buffered is taken too. Stopping the instant the needle
+        // appears discards whatever the owner wrote in the same burst -- the `005` line
+        // that follows `001`, for instance -- and turns a framing detail into a
+        // spurious assertion failure that only shows up when a capability makes the
+        // negotiation slightly longer.
+        // A zero-duration timeout polls the read once and gives up, which is exactly
+        // "take what is already here". `try_read` is not available on this stream type
+        // and a positive timeout would add real latency to every registration.
+        while let Ok(Ok(count)) = tokio::time::timeout(Duration::ZERO, stream.read(&mut buf)).await
+        {
+            if count == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..count]);
+        }
     };
     tokio::time::timeout(Duration::from_secs(5), read)
         .await

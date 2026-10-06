@@ -240,6 +240,8 @@ mod tests {
             explicit_history: true,
             read_markers: false,
             pre_away: false,
+            bouncer_networks: false,
+            bouncer_networks_notify: false,
         };
         assert!(
             !wants_backlog(explicit),
@@ -254,6 +256,8 @@ mod tests {
             explicit_history: false,
             read_markers: true,
             pre_away: false,
+            bouncer_networks: false,
+            bouncer_networks_notify: false,
         };
         assert!(
             wants_backlog(markers_only),

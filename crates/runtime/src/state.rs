@@ -1074,7 +1074,7 @@ struct ModeDelta {
 
 /// A channel name that may safely key attempt bookkeeping: bounded and free of the
 /// characters that separate parameters in a server reply.
-fn valid_channel_token(value: &str) -> bool {
+pub fn valid_channel_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_CHANNEL_NAME_BYTES
         && !value

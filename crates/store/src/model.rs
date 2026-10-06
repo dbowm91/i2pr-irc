@@ -225,7 +225,7 @@ pub fn fallback_display_name(network: NetworkId) -> String {
 /// The name is interpolated into operator-facing numeric replies, so it must not be
 /// able to carry a space, a parameter separator, or a prefix character that would
 /// change how the surrounding reply parses.
-fn valid_display_name(name: &str) -> bool {
+pub fn valid_display_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_DISPLAY_NAME_BYTES
         && name

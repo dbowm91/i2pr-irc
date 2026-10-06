@@ -70,6 +70,15 @@ pub enum SupervisorCommand {
     Reconcile {
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    /// Change whether one desired channel is presented to attached sessions.
+    ///
+    /// Routed through the owner rather than committed by the caller, because the owner
+    /// owns the ordering for that decision: durable commit first, presentation second.
+    ChannelPolicy {
+        channel: String,
+        detached: bool,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     /// End this Network's upstream session and every attached session.
     Stop { reply: oneshot::Sender<()> },
 }
@@ -131,6 +140,28 @@ impl SupervisorHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .try_send(SupervisorCommand::Reconcile { reply })
+            .map_err(|_| RuntimeError::QueueOverloaded)?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    /// Changes one channel's durable presentation flag.
+    ///
+    /// The owner performs the commit and only then changes what sessions see, so a
+    /// refusal here means no client was told anything.
+    pub async fn set_channel_detached(
+        &self,
+        network: NetworkId,
+        channel: String,
+        detached: bool,
+    ) -> Result<(), RuntimeError> {
+        debug_assert_eq!(network, self.network);
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .try_send(SupervisorCommand::ChannelPolicy {
+                channel,
+                detached,
+                reply,
+            })
             .map_err(|_| RuntimeError::QueueOverloaded)?;
         response.await.unwrap_or(Err(RuntimeError::Stopped))
     }
@@ -398,6 +429,7 @@ pub fn intent_class(intent: &SessionIntent) -> &'static str {
         SessionIntent::Passive => "passive",
         SessionIntent::Active => "active",
         SessionIntent::Away { .. } => "away",
+        SessionIntent::Control { .. } => "control",
         SessionIntent::RequestProjection => "projection",
         SessionIntent::HistoryQuery { .. } => "history-query",
         SessionIntent::MarkerUpdate { .. } => "marker-update",

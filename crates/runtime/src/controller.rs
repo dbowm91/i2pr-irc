@@ -149,6 +149,46 @@ pub enum ControlRequest {
         network: NetworkId,
         reply: oneshot::Sender<Result<bool, RuntimeError>>,
     },
+    /// Change whether one desired channel is presented to sessions.
+    ///
+    /// Routed to the live owner rather than committed here, because the owner owns the
+    /// durable/live ordering for that decision: it commits first and only then changes
+    /// presentation. A controller that committed directly would have two writers for one
+    /// fact.
+    ChannelPolicy {
+        network: NetworkId,
+        channel: String,
+        detached: bool,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    /// Create one Network, with the identity allocated by the controller.
+    CreateNext {
+        candidate: NetworkRecord,
+        reply: oneshot::Sender<Result<NetworkId, RuntimeError>>,
+    },
+    /// Read one Network's complete durable record.
+    ///
+    /// Administration needs a *complete* record to build an update from, because an
+    /// update that resubmitted only the fields it understood would silently reset
+    /// everything else. Routing the read through the controller keeps that read and the
+    /// subsequent write in one serialized place: two concurrent updates cannot both
+    /// read the same record and each write back a version that undid the other.
+    Record {
+        network: NetworkId,
+        reply: oneshot::Sender<Result<Option<NetworkRecord>, RuntimeError>>,
+    },
+    /// Change one Network's presence/nick policy.
+    ///
+    /// Partial by design: `None` leaves a field as it is. A caller that had to read,
+    /// modify, and resubmit a whole `NetworkRecord` could clobber a change made in
+    /// between, and an administration command that silently resets what it did not
+    /// mention is worse than one that refuses.
+    PresencePolicy {
+        network: NetworkId,
+        auto_away: Option<bool>,
+        keep_nick: Option<bool>,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     /// Hand one already-registered local session to a live owner.
     ///
     /// The session arrives with its read half, writer task, line decoder, and buffered
@@ -237,6 +277,57 @@ impl RuntimeControlHandle {
         response.await.unwrap_or(Err(RuntimeError::Stopped))
     }
 
+    /// Creates one Network, with its identity allocated here rather than by the caller.
+    pub async fn create_next(&self, candidate: NetworkRecord) -> Result<NetworkId, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::CreateNext { candidate, reply })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    /// Reads one Network's complete durable record.
+    pub async fn network_record(
+        &self,
+        network: NetworkId,
+    ) -> Result<Option<NetworkRecord>, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::Record { network, reply })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    /// Sets one desired channel's presentation flag.
+    pub async fn set_channel_detached(
+        &self,
+        network: NetworkId,
+        channel: String,
+        detached: bool,
+    ) -> Result<(), RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ChannelPolicy {
+            network,
+            channel,
+            detached,
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    /// Changes one Network's presence/nick policy.
+    pub async fn set_presence_policy(
+        &self,
+        network: NetworkId,
+        auto_away: Option<bool>,
+        keep_nick: Option<bool>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::PresencePolicy {
+            network,
+            auto_away,
+            keep_nick,
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
     /// Requests that the controller stop every Network and end.
     ///
     /// Delivered on a dedicated watch channel rather than as a queued request, so a
@@ -301,6 +392,14 @@ pub struct RuntimeController<P: I2pStreamProvider + Send + Sync + 'static> {
     stop: watch::Receiver<bool>,
     /// Set once shutdown is observed, so the loop reports it instead of draining.
     stopping: bool,
+    /// The controller's own handle onto itself.
+    ///
+    /// Owners are handed a clone so a session bound to a Network can administrate
+    /// through the same bounded queue every other caller uses. The controller keeps one
+    /// because it is the only thing that can build a handle in the first place, and the
+    /// alternative -- reconstructing one from receivers it does not hold -- would be a
+    /// second, unowned way to reach the control plane.
+    handle: RuntimeControlHandle,
 }
 
 impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
@@ -358,6 +457,11 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
         let (requests, request_rx) = mpsc::channel(CONTROL_REQUEST_CAPACITY);
         let (status, status_rx) = watch::channel(ControlSnapshot::default());
         let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = RuntimeControlHandle {
+            requests,
+            status: status_rx,
+            stop: stop_tx,
+        };
         (
             Self {
                 provider: Arc::new(provider),
@@ -370,12 +474,9 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 requests: request_rx,
                 stop: stop_rx,
                 stopping: false,
+                handle: handle.clone(),
             },
-            RuntimeControlHandle {
-                requests,
-                status: status_rx,
-                stop: stop_tx,
-            },
+            handle,
         )
     }
 
@@ -454,7 +555,13 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             self.catalog.store().clone(),
             self.catalog.reconnect().clone(),
             owner_snapshot,
-        ) {
+        )
+        // A session bound to this Network is still the local Operator's own connection,
+        // so the owner answers its administrative requests through the same controller
+        // that owns every live owner. The owner holds a bounded sender and gains no
+        // authority it did not already route here.
+        .map(|owner| owner.with_control(self.handle.clone()))
+        {
             Ok(owner) => owner,
             // Registration with process-wide accounting failed. The Network stays durable
             // and is reported as not live; it is never silently forgotten.
@@ -540,11 +647,112 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 };
                 let _ = reply.send(outcome);
             }
+            ControlRequest::ChannelPolicy {
+                network,
+                channel,
+                detached,
+                reply,
+            } => {
+                let outcome = match self.live.get(&network) {
+                    Some(owner) => {
+                        owner
+                            .handle
+                            .set_channel_detached(network, channel, detached)
+                            .await
+                    }
+                    // A Network with no live owner has no presentation to change, and
+                    // pretending otherwise would tell the Operator a policy is in force
+                    // when nothing is enforcing it.
+                    None => Err(RuntimeError::InvalidConfig),
+                };
+                // The owner wrote the flag, so this cache is now behind durable state.
+                // Re-reading is what keeps `channel status` from answering a question
+                // about the world as it was before the command that was just answered.
+                if outcome.is_ok() {
+                    self.reread().await;
+                    self.commit();
+                }
+                let _ = reply.send(outcome);
+            }
+            ControlRequest::CreateNext { candidate, reply } => {
+                let _ = reply.send(self.create_next(candidate).await);
+            }
+            ControlRequest::Record { network, reply } => {
+                let _ = reply.send(Ok(self.records.get(&network).cloned()));
+            }
+            ControlRequest::PresencePolicy {
+                network,
+                auto_away,
+                keep_nick,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.set_presence_policy(network, auto_away, keep_nick)
+                        .await,
+                );
+            }
             ControlRequest::Stop { reply } => {
                 self.stopping = true;
                 let _ = reply.send(());
             }
         }
+    }
+
+    /// Applies a partial presence/nick policy change to one Network.
+    ///
+    /// The read-modify-write happens here rather than in the caller, so two
+    /// administration requests cannot both read the same record and each write back a
+    /// value that silently undid the other. Only the fields the caller named are
+    /// touched; everything else in the record — endpoint, nick, channels, secret — is
+    /// carried through untouched.
+    async fn set_presence_policy(
+        &mut self,
+        network: NetworkId,
+        auto_away: Option<bool>,
+        keep_nick: Option<bool>,
+    ) -> Result<(), RuntimeError> {
+        let Some(mut candidate) = self.records.get(&network).cloned() else {
+            return Err(RuntimeError::InvalidConfig);
+        };
+        if let Some(auto_away) = auto_away {
+            candidate.auto_away = auto_away;
+        }
+        if let Some(keep_nick) = keep_nick {
+            candidate.keep_nick = keep_nick;
+        }
+        self.change(candidate).await
+    }
+
+    /// Creates one Network, allocating its identity here.
+    ///
+    /// The candidate's own `network` field is ignored and overwritten. Netids are
+    /// allocated in exactly one place because a caller-chosen identity turns `ADDNETWORK`
+    /// into a race: two clients creating a Network would both pick the same free id, and
+    /// the loser would be refused for a reason that has nothing to do with what it asked
+    /// for. Plan 023 is the first caller that needs this; everything else still chooses
+    /// its own identity explicitly, which is fine for a caller that is the sole author of
+    /// its catalog.
+    async fn create_next(
+        &mut self,
+        mut candidate: NetworkRecord,
+    ) -> Result<NetworkId, RuntimeError> {
+        candidate.network = self.next_netid();
+        self.create(candidate).await
+    }
+
+    /// The lowest free Network identity.
+    ///
+    /// Bounded by the catalog ceiling, so this is at most `MAX_SUPERVISED_NETWORKS`
+    /// probes rather than an open-ended search over the `u64` space.
+    fn next_netid(&self) -> NetworkId {
+        (1..=crate::catalog::MAX_SUPERVISED_NETWORKS as u64)
+            .map(NetworkId)
+            .find(|candidate| !self.records.contains_key(candidate))
+            // Unreachable: `create` refuses to exceed the ceiling, so a full catalog
+            // fails the length check before this runs. Naming the ceiling rather than
+            // panicking keeps the "refuse, never guess" property intact if that order is
+            // ever changed.
+            .unwrap_or(NetworkId(0))
     }
 
     /// Creates one Network from a complete candidate record.

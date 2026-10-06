@@ -209,7 +209,17 @@ impl DownstreamAdmission {
             .selected
             .as_ref()
             .map(|selection| selection.expected_nick.clone());
-        let wiring = ClientWiring::new(self.session, self.client, expected_nick, stream);
+        // The bindable set is the controller's own bounded snapshot of which Networks
+        // exist. It is read once, at accept time, so a `BOUNCER BIND` can be answered
+        // with a `FAIL` *during* registration rather than only after it.
+        let snapshot = self.control.subscribe_status().borrow().clone();
+        let bindable: std::collections::BTreeSet<NetworkId> = snapshot
+            .networks
+            .iter()
+            .map(|entry| entry.network)
+            .take(crate::bouncer_networks::MAX_BOUNCER_BATCH)
+            .collect();
+        let wiring = ClientWiring::new(self.session, self.client, expected_nick, bindable, stream);
         // Registration reports no intents upward: nothing has claimed this client yet,
         // and forwarding a pre-registration intent to an owner that does not exist is
         // exactly the coupling admission exists to remove. The ceiling is applied inside
@@ -226,7 +236,15 @@ impl DownstreamAdmission {
             }
         };
 
-        match self.selected.as_ref().map(|selection| selection.network) {
+        // A pre-registration `BOUNCER BIND` is resolved here, after registration
+        // completed and before anything is handed anywhere. The netid was already
+        // checked against the snapshot taken at accept time; the binding is now real.
+        let selection = self
+            .selected
+            .as_ref()
+            .map(|selection| selection.network)
+            .or_else(|| registered.bind_request());
+        match selection {
             Some(network) => {
                 let prepared = PreparedSession::new(registered, Some(network));
                 match self.control.bind(network, prepared).await {
@@ -242,7 +260,8 @@ impl DownstreamAdmission {
                 // protocol, but it is told plainly that it has no channel list, so it
                 // cannot mistake a control-only session for a bouncer session.
                 let prepared = PreparedSession::new(registered, None);
-                serve_unbound(prepared).await;
+                let control = self.control.clone();
+                serve_unbound(prepared, control).await;
                 AdmissionOutcome::Unbound {
                     session: self.session,
                 }
@@ -296,36 +315,87 @@ impl AdmissionOutcome {
 /// upstream forwarding -- is refused by name, and the refusal says why. The client can
 /// still negotiate capabilities, so a later release can hand it a view without the
 /// protocol having to change shape.
-async fn serve_unbound(prepared: PreparedSession) {
+async fn serve_unbound(
+    prepared: PreparedSession,
+    control: crate::controller::RuntimeControlHandle,
+) {
     let handle = prepared.handle().clone();
     let nick = prepared
         .registered_nick()
         .map_or_else(|| UNBOUND_NICK_PLACEHOLDER.to_owned(), str::to_owned);
+
+    // Two surfaces over one controller, because two tasks need it. The command handler
+    // answers from fresh controller state; the notification task keeps the one revision
+    // this client was last told about, which is the only thing that needs to persist
+    // between turns. Sharing one mutable surface between two tasks would need a lock
+    // around every reply, and there is nothing to protect: the two never disagree,
+    // because one is the definition of what to say and the other is a record of what was
+    // said.
+    let commands = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::control_session::ControlSurface::new(control.clone(), handle.clone(), nick.clone()),
+    ));
+    commands.lock().await.send_initial_batch().await;
+
+    let mut notify =
+        crate::control_session::ControlSurface::new(control.clone(), handle.clone(), nick.clone());
+    let mut status = control.subscribe_status();
+    // The notification task ends with the connection. It is aborted below rather than
+    // left to notice a closed socket on its own: a task that outlives the session it was
+    // announcing to is a task writing to a client nobody is reading.
+    let notifier = tokio::spawn(async move {
+        loop {
+            if status.changed().await.is_err() {
+                return;
+            }
+            notify.publish_changes().await;
+        }
+    });
+
     // A bounded, fixed welcome burst. It names no channel, no endpoint, and nothing
     // about the bouncer's upstream identity.
     for line in [
         format!(":bouncer 001 {nick} :Welcome to the bouncer control session\r\n"),
         format!(":bouncer 002 {nick} :This session is not attached to a network\r\n"),
-        format!(":bouncer 003 {nick} :Select a network with BOUNCER NETWORK\r\n"),
+        format!(":bouncer 003 {nick} :Select a network with BOUNCER BIND\r\n"),
         format!(":bouncer 376 {nick} :End of MOTD\r\n"),
     ] {
         if handle.queue_control(&line).is_err() {
-            break;
+            notifier.abort();
+            return;
         }
     }
+
+    let reply_handle = handle.clone();
     prepared
         .into_wiring()
-        .serve_locally(|intent| {
-            // Every intent that needs a Network is refused by name, and the refusal says
-            // why. Silence would leave a client believing the bouncer had understood it.
-            if let SessionIntent::Quit = intent {
-                return;
+        .serve_locally(move |intent| {
+            let commands = commands.clone();
+            let handle = reply_handle.clone();
+            let nick = nick.clone();
+            async move {
+                match intent {
+                    SessionIntent::Quit => {}
+                    SessionIntent::Control { wire } => {
+                        // `serve_locally` runs one intent at a time, so this lock is
+                        // uncontended in practice. It exists only so the handler closure
+                        // can be `FnMut` over a stateful surface; there is no concurrent
+                        // caller to reason about and none is introduced.
+                        commands.lock().await.dispatch(&wire).await;
+                    }
+                    // Every intent that needs a Network is refused by name, and the
+                    // refusal says why. Silence would leave a client believing the bouncer
+                    // had understood it.
+                    other => {
+                        let _ = other;
+                        let _ = handle.queue_control(&format!(
+                            ":bouncer 421 {nick} * :No network selected for this session\r\n"
+                        ));
+                    }
+                }
             }
-            let _ = handle.queue_control(&format!(
-                ":bouncer 421 {nick} * :No network selected for this session\r\n"
-            ));
         })
         .await;
+    notifier.abort();
 }
 
 /// The error a caller reports when admission itself could not run.

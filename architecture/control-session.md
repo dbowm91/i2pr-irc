@@ -203,3 +203,46 @@ no upstream authority of any kind.
 The direct pre-bound attachment path is unchanged and still supported. M005-A adds an
 admission path alongside it; both are covered by tests asserting they project the same
 welcome burst, so the two cannot drift apart unnoticed.
+
+## The bouncer control plane
+
+Two wire dialects reach the same typed controller, and neither may decide anything on its
+own.
+
+`soju.im/bouncer-networks` is the interop draft, gated on the capability, with a
+deliberately small vocabulary: `BIND`, `LISTNETWORKS`, `ADDNETWORK`, `CHANGENETWORK`,
+`DELNETWORK`. `BouncerServ` is the local administration service, reached the ordinary IRC
+way — `PRIVMSG BouncerServ :…` — so that an existing client needs no new verb to
+administer the bouncer.
+
+A `ControlSurface` holds a `RuntimeControlHandle` and nothing else. It cannot reach a
+`StoreHandle`, a `SupervisorHandle`, or an owner directly; every mutation it performs is a
+typed request through the one bounded queue the controller owns. That is what makes "all
+process mutation flows through the typed controller" a property of the type rather than a
+review convention. See [bouncer networks and administration](bouncer-networks.md).
+
+### Authorization
+
+There is one local Operator, and a control surface is only ever built for a session the
+local access boundary admitted with a trusted `ClientId`. There is no second role, no
+per-command authority, and no remote path to either surface. `BouncerServ` is not
+advertised in `005` and is not joined anywhere: it exists only on this bouncer's own
+downstream connections.
+
+Administration is not a privilege of being unbound. A session bound to a Network is still
+the Operator's own connection, so the owner answers its administrative requests by
+submitting them to the same controller that owns every live owner. The owner holds a
+bounded sender and gains no authority it did not already route there.
+
+### The service is not a shell
+
+The `BouncerServ` parser has no variant that can express command execution, file access,
+HTTP, plugin loading, router administration, or raw IRC quotation. Naming the absences is
+weaker than the type: there is nothing to reach, so there is nothing to review each time a
+command is added.
+
+`SASL SET` accepts a password, because that is the only way to set one. The value is taken
+into a `Secret` that redacts its own `Debug` and zeroes on drop, and it leaves that type
+only as a `StoredSecret`, which does both as well. `ServCommand`'s `Debug` is written out
+by hand for the same reason: a derived one is a line away from printing a credential. A
+refused `SASL SET` names the command; it never echoes the argument that caused the refusal.

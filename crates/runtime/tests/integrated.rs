@@ -1731,8 +1731,22 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
         advertised.contains(&i2pr_irc_runtime::presence::PRE_AWAY_CAPABILITY.to_owned()),
         "draft/pre-away is served because SessionPresence is implemented end to end"
     );
+    // M005-D adds the control plane. Both halves are advertised because both are live:
+    // the draft's commands and its change notifications. Advertising only the first
+    // would leave a client unable to distinguish an idle bouncer from a broken one.
+    for capability in [
+        i2pr_irc_runtime::bouncer_networks::BOUNCER_NETWORKS,
+        i2pr_irc_runtime::bouncer_networks::BOUNCER_NETWORKS_NOTIFY,
+    ] {
+        assert!(
+            advertised.contains(&capability.to_owned()),
+            "{capability} is served end to end and must be advertised"
+        );
+    }
     // The advertisement is the union of the history adapter's capabilities, the
-    // foundational tag surface, and the pre-away draft, and nothing else.
+    // foundational tag surface, the pre-away draft, and the control plane -- and nothing
+    // else. An unadvertised capability a client can still negotiate would be a promise
+    // the bouncer makes and does not keep.
     let mut expected = history.clone();
     expected.extend(
         ["message-tags", "batch", "labeled-response"]
@@ -1740,6 +1754,14 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
             .map(|name| (*name).to_owned()),
     );
     expected.push(i2pr_irc_runtime::presence::PRE_AWAY_CAPABILITY.to_owned());
+    expected.extend(
+        [
+            i2pr_irc_runtime::bouncer_networks::BOUNCER_NETWORKS,
+            i2pr_irc_runtime::bouncer_networks::BOUNCER_NETWORKS_NOTIFY,
+        ]
+        .iter()
+        .map(|name| (*name).to_owned()),
+    );
     expected.sort();
     let mut actual = advertised.clone();
     actual.sort();

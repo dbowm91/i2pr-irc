@@ -32,6 +32,12 @@ pub const DOWNSTREAM_ADVERTISED: &[&str] = &[
     crate::capability::BATCH,
     crate::capability::LABELED_RESPONSE,
     crate::presence::PRE_AWAY_CAPABILITY,
+    // The control plane is advertised because both halves are live: the initial
+    // `LISTNETWORKS` batch and the revision-derived change notifications. Advertising
+    // only the first would leave a client unable to tell an idle bouncer from a broken
+    // one, so both are gated on the same complete implementation.
+    crate::bouncer_networks::BOUNCER_NETWORKS,
+    crate::bouncer_networks::BOUNCER_NETWORKS_NOTIFY,
 ];
 
 /// The exact `CAP LS` and `CAP REQ` support set for this generation.
