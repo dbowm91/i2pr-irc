@@ -98,6 +98,11 @@ pub enum EventDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkRecord {
     pub network: NetworkId,
+    /// Operator-chosen label this Network is listed under.
+    ///
+    /// Display only: it never participates in lookup, routing, or identity, and it is
+    /// never derived from the endpoint or from any local path.
+    pub display_name: String,
     pub endpoint: I2pEndpoint,
     pub nick: String,
     pub username: String,
@@ -106,10 +111,40 @@ pub struct NetworkRecord {
     pub desired_channels: Vec<String>,
 }
 
+/// Longest accepted `display_name`. A name is a single protocol token, so it is
+/// bounded like one.
+pub const MAX_DISPLAY_NAME_BYTES: usize = 64;
+
+/// The name a Network is listed under when none was ever chosen.
+///
+/// Derived only from the durable `NetworkId`, so it is stable across restarts and
+/// carries no endpoint, nick, path, or machine detail. It is deliberately not the
+/// endpoint or the nick: a display name is operator-facing text and must not leak the
+/// bouncer's upstream identity into list output.
+pub fn fallback_display_name(network: NetworkId) -> String {
+    format!("network-{}", network.0)
+}
+
+/// Whether a `display_name` is a single bounded IRC token.
+///
+/// The name is interpolated into operator-facing numeric replies, so it must not be
+/// able to carry a space, a parameter separator, or a prefix character that would
+/// change how the surrounding reply parses.
+fn valid_display_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_DISPLAY_NAME_BYTES
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b':' | b',' | 0 | b'\r' | b'\n'))
+}
+
 impl NetworkRecord {
     /// Applies the same domain constraints as fresh configuration. Corrupt durable
     /// state is rejected rather than repaired into a plausible-looking default.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_display_name(&self.display_name) {
+            return Err("display name");
+        }
         if self.nick.is_empty() || self.nick.len() > 64 {
             return Err("nick length");
         }
@@ -405,6 +440,7 @@ mod tests {
     fn record() -> NetworkRecord {
         NetworkRecord {
             network: NetworkId(1),
+            display_name: fallback_display_name(NetworkId(1)),
             endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
             nick: "bot".into(),
             username: "user".into(),

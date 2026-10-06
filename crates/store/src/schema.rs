@@ -1,4 +1,4 @@
-//! Schema versions 1 and 2 and their transactional migration harness.
+//! Schema versions 1 through 3 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -10,8 +10,9 @@ use rusqlite::Connection;
 /// The newest schema version this build creates and understands.
 ///
 /// Version 2 changes only how a history event's protocol timestamp is stored; see
-/// [`HISTORY_EVENTS_V2`] for why.
-pub const SCHEMA_VERSION: i64 = 2;
+/// [`HISTORY_EVENTS_V2`] for why. Version 3 adds the operator-chosen `display_name`
+/// a Network is listed under; see [`NETWORKS_V2`] and [`migrate_2_to_3`].
+pub const SCHEMA_VERSION: i64 = 3;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -39,8 +40,28 @@ pub enum OpenDisposition {
     Current,
 }
 
-/// Tables that are identical in every schema version, before `history_events`.
-const SCHEMA_HEAD: &str = r#"
+/// The `networks` table as schema 3 creates it.
+///
+/// `display_name` is the operator-chosen label a Network is listed under in
+/// operator-facing output. It is a display value only: it never participates in
+/// lookup, identity, or routing, and it is not derived from the endpoint.
+const NETWORKS_V3: &str = r#"
+CREATE TABLE networks (
+    network_id      INTEGER PRIMARY KEY,
+    endpoint        TEXT NOT NULL,
+    endpoint_kind   INTEGER NOT NULL,
+    nick            TEXT NOT NULL,
+    username        TEXT NOT NULL,
+    realname        TEXT NOT NULL,
+    display_name    TEXT NOT NULL
+) STRICT;
+"#;
+
+/// The `networks` table as schema 1 and 2 created it.
+///
+/// Retained verbatim so the v2 -> v3 migration rebuilds exactly the representation it
+/// is replacing, rather than one reconstructed from a newer declaration.
+const NETWORKS_V2: &str = r#"
 CREATE TABLE networks (
     network_id      INTEGER PRIMARY KEY,
     endpoint        TEXT NOT NULL,
@@ -49,7 +70,11 @@ CREATE TABLE networks (
     username        TEXT NOT NULL,
     realname        TEXT NOT NULL
 ) STRICT;
+"#;
 
+/// Tables that are identical in every schema version, after `networks` and before
+/// `history_events`.
+const SCHEMA_TABLES: &str = r#"
 CREATE TABLE network_secrets (
     network_id      INTEGER PRIMARY KEY
                     REFERENCES networks(network_id) ON DELETE CASCADE,
@@ -164,9 +189,12 @@ CREATE TABLE history_events (
 /// `concat!` cannot reference a const, so the pieces are joined at runtime instead.
 /// That keeps one definition of every unchanged table rather than duplicating all
 /// eight tables per version.
-fn compose(head: &str, history: &str, tail: &str) -> String {
-    let mut sql = String::with_capacity(head.len() + history.len() + tail.len());
-    sql.push_str(head);
+fn compose(networks: &str, history: &str, tail: &str) -> String {
+    let mut sql = String::with_capacity(
+        networks.len() + history.len() + tail.len() + HISTORY_EVENTS_INDEX.len(),
+    );
+    sql.push_str(networks);
+    sql.push_str(SCHEMA_TABLES);
     sql.push_str(history);
     sql.push_str(HISTORY_EVENTS_INDEX);
     sql.push_str(tail);
@@ -176,12 +204,20 @@ fn compose(head: &str, history: &str, tail: &str) -> String {
 /// Schema 1, used to build migration fixtures. A v1 database is exactly what the
 /// schema 2 migration must handle.
 pub(crate) fn schema_v1() -> String {
-    compose(SCHEMA_HEAD, HISTORY_EVENTS_V1, SCHEMA_TAIL)
+    compose(NETWORKS_V2, HISTORY_EVENTS_V1, SCHEMA_TAIL)
+}
+
+/// Schema 2, used to build the fixture the schema 3 migration must handle.
+///
+/// It is a real declaration rather than "v3 minus a column" so the fixture cannot
+/// silently drift into describing a shape this build never actually wrote.
+pub(crate) fn schema_v2() -> String {
+    compose(NETWORKS_V2, HISTORY_EVENTS_V2, SCHEMA_TAIL)
 }
 
 /// The current schema, created directly when no database exists yet.
-pub(crate) fn schema_v2() -> String {
-    compose(SCHEMA_HEAD, HISTORY_EVENTS_V2, SCHEMA_TAIL)
+pub(crate) fn schema_v3() -> String {
+    compose(NETWORKS_V3, HISTORY_EVENTS_V2, SCHEMA_TAIL)
 }
 
 /// Refuses a database this build must not serve before any migration runs.
@@ -326,7 +362,7 @@ pub(crate) fn open_and_migrate(
                 .unchecked_transaction()
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
-                .execute_batch(&schema_v2())
+                .execute_batch(&schema_v3())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -383,14 +419,22 @@ const REQUIRED_TABLES: &[&str] = &[
 
 /// Migrates an already-open transaction forward to [`SCHEMA_VERSION`].
 ///
-/// Only the v1 -> v2 step exists. Each step rebuilds just the table whose
-/// representation changed; nothing else is touched, so event ids, cursors, and read
-/// markers keep pointing at the same rows.
+/// Steps are applied in order, one version at a time, so a database several versions
+/// behind walks the same path it would have taken on each intervening release rather
+/// than jumping. Each step rebuilds just the table whose representation changed;
+/// nothing else is touched, so event ids, cursors, and read markers keep pointing at
+/// the same rows.
 fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result<(), StoreError> {
-    match from {
-        1 => migrate_1_to_2(transaction),
-        _ => Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
+    let mut version = from;
+    while version < SCHEMA_VERSION {
+        match version {
+            1 => migrate_1_to_2(transaction)?,
+            2 => migrate_2_to_3(transaction)?,
+            _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
+        }
+        version += 1;
     }
+    Ok(())
 }
 
 /// One v1 history row, as read by the batched migration scan.
@@ -475,6 +519,31 @@ fn migrate_1_to_2(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreEr
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     transaction
         .execute_batch(HISTORY_EVENTS_INDEX)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// Adds the operator-facing `networks.display_name` column.
+///
+/// Existing rows receive `network-<id>`: a deterministic label derived only from the
+/// `NetworkId` the row already carries. It is deliberately *not* derived from the
+/// endpoint, the nick, or any local path, because those are either identifying or
+/// machine-specific and a display name is operator-facing text. An operator who wants
+/// something else sets it explicitly.
+///
+/// The column is added with an empty default because SQLite forbids a non-constant
+/// column default, then every row is filled in the same transaction. A reader can
+/// therefore never observe a mixture of migrated and unmigrated names: either the
+/// whole migration commits or the database stays at version 2 with no column at all.
+fn migrate_2_to_3(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction
+        .execute_batch(
+            "ALTER TABLE networks ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
+             UPDATE networks SET display_name = 'network-' || network_id;",
+        )
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)

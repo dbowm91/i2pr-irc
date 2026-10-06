@@ -89,6 +89,12 @@ pub enum DownstreamDisposition {
     ReadFailure,
     /// The owned client writer task ended.
     WriterFailure,
+    /// The client did not complete registration inside the admission ceiling.
+    ///
+    /// Distinct from [`DownstreamDisposition::Eof`] because the two call for different
+    /// operator responses: a client that disconnected is normal, and a client that
+    /// connected and then said nothing is a client the ceiling had to end.
+    RegistrationTimeout,
     /// Explicit supervisor stop; upstream shutdown is owned by the network owner.
     SupervisorStop,
     /// The upstream generation ended and the client was terminated with it.
@@ -104,6 +110,7 @@ impl DownstreamDisposition {
             Self::QueueOverload => "downstream-overload",
             Self::ReadFailure => "downstream-read",
             Self::WriterFailure => "downstream-writer",
+            Self::RegistrationTimeout => "downstream-registration-timeout",
             Self::SupervisorStop => "supervisor-stop",
             Self::UpstreamGenerationLost => "upstream-generation-lost",
         }
@@ -154,6 +161,9 @@ impl QueuedFrame {
 }
 
 /// Ownership handle for one client's writer task. It is never detached.
+/// How long a closing writer is given to write what it already holds.
+const WRITER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct SessionWriter {
     exit: mpsc::Receiver<io::Result<()>>,
     handle: JoinHandle<()>,
@@ -167,6 +177,27 @@ impl SessionWriter {
     pub async fn shutdown(self) {
         self.handle.abort();
         let _ = self.handle.await;
+    }
+
+    /// Lets queued frames reach the socket, then closes.
+    ///
+    /// Aborting is the right way to stop a writer and the wrong way to end a
+    /// conversation: a refusal queued microseconds earlier would be discarded along
+    /// with the task, and the client that was owed an explanation would get a closed
+    /// connection instead. So the writer is given a bounded window to write what it
+    /// already holds, and only a writer that overruns that window is aborted.
+    ///
+    /// The caller must have released the session handle first: the writer only finishes
+    /// once both bounded queues are closed, and the handle is what holds their senders.
+    pub async fn close_after_drain(self) {
+        let Self { mut exit, handle } = self;
+        if crate::timeout_bounded(WRITER_DRAIN_DEADLINE, exit.recv())
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 

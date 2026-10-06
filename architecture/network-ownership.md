@@ -5,18 +5,46 @@
 Each upstream Network has exactly one live owner. `NetworkOwner` holds that Network's `NetworkState` as a plain local value — never behind a shared lock — and is the only thing that may mutate it.
 
 ```text
-NetworkCatalog                  process-level: which Networks exist
+RuntimeController                process-level: which Networks exist and are live
    |
-   |-- SupervisorHandle -> NetworkOwner (network 1)
-   |      NetworkState (local to this owner)
-   |      upstream read/write for one ConnectionGeneration
-   |      SessionTask(a), SessionTask(b), ...
+   |-- DurableNetworks (the only durable Network mutator)
+   |-- bounded control queue (CONTROL_REQUEST_CAPACITY)
    |
-   `-- SupervisorHandle -> NetworkOwner (network 2)
-          completely independent
+   |-- LiveOwner { SupervisorHandle, watch stop, owner snapshot, JoinHandle }
+   |      |
+   |      `-- NetworkOwner (network 1)
+   |             NetworkState (local to this owner)
+   |             upstream read/write for one ConnectionGeneration
+   |             SessionTask(a), SessionTask(b), ...
+   |
+   `-- LiveOwner { ... }
+          `-- NetworkOwner (network 2)
+                 completely independent
 ```
 
 There is deliberately no process-wide `Arc<Mutex<NetworkState>>`. A shared mutable state object would make one Network's slow or failing work stall every other, and would make "one live owner per Network" false at the type level.
+
+### Why the owner is held with its task, not just by a handle
+
+`NetworkOwner` is spawned as a task, so a bare `SupervisorHandle` proves nothing about whether the owner has finished. A controller holding only handles could replace a Network and briefly have two live owners for one `NetworkId` — exactly the state this document exists to forbid.
+
+`LiveOwner` therefore holds the bounded handle, a dedicated stop signal, a read-only view of the owner's gauges, **and** the `JoinHandle`, in one value. Every mutation that replaces or ends a Network awaits the join before starting or returning, so "the Network is gone" and "the Network's task finished" are the same event rather than two that can disagree.
+
+The stop signal is separate from the bounded command queue on purpose. Shutdown that queues behind work the owner has not reached is a deadlock: the queue is full precisely because the owner is busy, so it will not drain until it stops, and it will not stop until the queue drains.
+
+`NetworkOwner::with_snapshot_channel` exists so the controller can publish a Network's own gauges without owning the owner. The controller holds a `watch::Receiver` — it can read them and can never drive them.
+
+### Durable mutation happens before activation
+
+`RuntimeController` is the only component that mutates durable Networks, through the narrow `DurableNetworks` trait. `StoreHandle` is never handed to a client task, a session, or an owner by the controller.
+
+Create, change, and delete each commit durable state first and activate second:
+
+- **Create** validates, commits, then starts. If activation fails the record stays durable and is reported as not live — the Operator's intent survives a failed start, and the reverse order would leave a live Network the Operator can neither see nor delete.
+- **Change** stops the old owner and awaits its task *before* committing, so a replacement cannot race the owner it replaces.
+- **Delete** stops the owner and awaits it *before* forgetting the row. The reverse order would leave a durable row whose owner is gone and whose sessions have silently ended.
+
+A mutation whose commit state is unknown is never retried and never assumed. Durable state is re-read, and whatever is actually on disk is what gets started. Asking storage again is cheap; writing a candidate over a row another actor may have changed is not recoverable.
 
 ## Sessions are tasks, not branches of one loop
 

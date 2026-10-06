@@ -12,9 +12,11 @@
 //! `QUIT` fence. Both are now covered against `owner::NetworkOwner` in
 //! `crates/runtime/tests/corrective_019.rs`, so the legacy suite is redundant rather
 //! than load-bearing and the legacy owner and its helpers can be deleted outright.
+pub mod admission;
 pub mod capability;
 pub mod catalog;
 pub mod chathistory;
+pub mod controller;
 pub mod ctcp;
 pub mod downstream;
 pub mod ircv3;
@@ -27,6 +29,13 @@ pub mod resource;
 pub mod routing;
 pub mod session;
 pub mod state;
+
+pub use admission::{AdmissionOutcome, DownstreamAdmission, PreparedSession};
+pub use controller::{
+    CONTROL_REQUEST_CAPACITY, ControlNetwork, ControlRequest, ControlSnapshot, DurableNetworks,
+    RuntimeControlHandle, RuntimeController,
+};
+pub use reconnect::ReconnectScheduler;
 
 use i2pr_irc_core::{ConnectionGeneration, ProviderError};
 use std::{fmt, io, time::Duration};
@@ -1018,7 +1027,28 @@ pub(crate) async fn next_queued_frame(
     control: &mut mpsc::Receiver<downstream::QueuedFrame>,
     normal: &mut mpsc::Receiver<downstream::QueuedFrame>,
 ) -> Option<downstream::QueuedFrame> {
-    tokio::select! { biased; command = control.recv() => command, command = normal.recv() => command }
+    // A closed queue means "no more frames from this producer", not "the writer is
+    // finished". Conflating the two discards whatever the *other* queue still holds --
+    // and the last frame on the other queue is very often the one that explains why the
+    // connection is closing. The writer ends only when both producers are done.
+    let mut control_open = true;
+    let mut normal_open = true;
+    loop {
+        if !control_open && !normal_open {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            frame = control.recv(), if control_open => match frame {
+                Some(frame) => return Some(frame),
+                None => control_open = false,
+            },
+            frame = normal.recv(), if normal_open => match frame {
+                Some(frame) => return Some(frame),
+                None => normal_open = false,
+            },
+        }
+    }
 }
 
 /// Next raw upstream frame. Upstream traffic is already framed bytes, so it carries
@@ -1027,7 +1057,25 @@ pub(crate) async fn next_upstream_frame(
     control: &mut mpsc::Receiver<Vec<u8>>,
     normal: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Option<Vec<u8>> {
-    tokio::select! { biased; command = control.recv() => command, command = normal.recv() => command }
+    // Same rule as `next_queued_frame`: one closed producer does not end the writer.
+    let mut control_open = true;
+    let mut normal_open = true;
+    loop {
+        if !control_open && !normal_open {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            frame = control.recv(), if control_open => match frame {
+                Some(frame) => return Some(frame),
+                None => control_open = false,
+            },
+            frame = normal.recv(), if normal_open => match frame {
+                Some(frame) => return Some(frame),
+                None => normal_open = false,
+            },
+        }
+    }
 }
 #[cfg(test)]
 async fn next_intent_frame(

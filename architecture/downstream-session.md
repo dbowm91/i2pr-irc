@@ -54,3 +54,49 @@ Incomplete knowledge is expressed by omission, never by a false value. A mode le
 Every externally controlled quantity is bounded: 2048 members per channel, 8192 members in total, 128 channels, 128 ISUPPORT tokens, 128 mode letters per channel, 16 arguments per mode, 100-byte mode arguments, 400-byte topics, 8 prefix pairs, 8 channel-type symbols, 64 mode letters per `CHANMODES` group. Client queues hold 8 control and 64 normal frames, and the client writer task is aborted and joined on detach, so a canceled session cannot outlive itself. A projection larger than the bounded client queue fails the client explicitly with an overload disposition rather than unbounded buffering; the retained state itself stays with the generation for the next client.
 
 The current runtime advertises draft/chathistory, draft/read-marker, message-tags, batch and labeled-response. server-time and echo-message remain deliberately withheld until their full downstream semantics are implemented. Local SASL server authentication is not part of the current bound-session core.
+
+## Admission owns the socket before any Network does
+
+Since M005-A a client socket is not handed to a Network owner at accept time.
+`DownstreamAdmission` takes it first: it splits the stream, starts the writer task,
+allocates the ephemeral `SessionId`, and drives registration against a bounded ceiling.
+
+That ordering is what makes three things possible that were not possible before:
+
+- a client that registers with no Network selected has somewhere to be refused;
+- a client refused before registration can be told *why*, because the component holding
+  its write half is not the owner that just rejected it;
+- the per-Network session ceiling stops being the only admission control, so a client
+  flood against a full Network no longer spends owner work to be told the answer is no.
+
+Registration is enforced against the selected Network's registered nickname while it runs,
+so a client cannot claim an identity its Network did not register. The owner re-validates
+the same claim when it adopts the session, because the binding that selected the Network
+may predate a configuration change.
+
+### The transfer
+
+`PreparedSession` is one-shot and carries the reader itself: the socket half, the decoder
+with its undecoded bytes, the writer task, the negotiated capabilities, and the `SessionId`
+allocation. `SessionTask::resume` adds one task and nothing else.
+
+Nothing is recreated: no second socket, no second decoder, no second writer, no second
+registration projection, and no change of identity. Client lines that arrived in the same
+read that completed registration survive, because the decoder's decoded-but-untranslated
+batch is drained before the socket is read again.
+
+Because the session is consumed by value and is not `Clone`, a conversation cannot be
+offered to a second owner.
+
+### The unbound control-only session
+
+A client with no Network selected keeps a live socket and a working protocol. It is told
+plainly that it has no Network, receives no channel list, and every command that needs one
+is refused by name with a reason rather than dropped. It has no upstream authority.
+
+### Refusals are written, not dropped
+
+Ending a client's socket without saying why is indistinguishable from a fault. A refused
+registration writes its reason on the socket the client opened and then drains the writer
+before closing, so the explanation reaches the client rather than dying with the
+connection.

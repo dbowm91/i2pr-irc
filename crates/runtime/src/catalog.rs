@@ -45,6 +45,22 @@ pub enum SupervisorCommand {
         /// Answers whether the attachment was accepted.
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    /// Adopt one client that admission already registered.
+    ///
+    /// This is the transfer path, not a second form of `Attach`. The session arrives
+    /// with its socket half, writer task, decoder, and negotiated capabilities intact,
+    /// so the owner continues one conversation instead of starting another. The owner
+    /// still re-validates the claimed nickname against its own registered one: the
+    /// binding that selected this Network may have been made before a configuration
+    /// change, and an owner must never project a session under a name it does not hold.
+    AttachPrepared {
+        /// Boxed because it carries a live socket. A command enum is copied through a
+        /// bounded queue, and one variant must not be allowed to make every command
+        /// expensive to move.
+        session: Box<crate::admission::PreparedSession>,
+        /// Answers whether the adoption was accepted.
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     /// One session reported an intent or ended.
     Session {
         session: SessionId,
@@ -91,6 +107,21 @@ impl SupervisorHandle {
                 stream,
                 reply,
             })
+            .map_err(|_| RuntimeError::QueueOverloaded)?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    /// Adopts one already-registered client.
+    ///
+    /// Bounded by the same queue as `Attach`, so an adoption flood is refused as
+    /// overload rather than queued without limit.
+    pub async fn attach_prepared(
+        &self,
+        session: Box<crate::admission::PreparedSession>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .try_send(SupervisorCommand::AttachPrepared { session, reply })
             .map_err(|_| RuntimeError::QueueOverloaded)?;
         response.await.unwrap_or(Err(RuntimeError::Stopped))
     }
@@ -239,6 +270,19 @@ impl NetworkCatalog {
 
     pub fn subscribe_status(&self) -> watch::Receiver<CatalogStatus> {
         self.statuses.subscribe()
+    }
+
+    /// A clone of the process-wide status sender, for a new owner's context.
+    ///
+    /// Held by handle rather than cloned from a receiver so an owner created after a
+    /// publication still reports into the same view instead of a private one.
+    pub fn status_sender(&self) -> watch::Sender<CatalogStatus> {
+        self.statuses.clone()
+    }
+
+    /// The most recently published catalog view.
+    pub fn status(&self) -> CatalogStatus {
+        self.statuses.borrow().clone()
     }
 
     /// Publishes the current catalog view.

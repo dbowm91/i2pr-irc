@@ -27,13 +27,13 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 2
+## Schema version 3
 
-The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from a shared head, the versioned `history_events` body and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
+The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
 | Table | Purpose |
 |---|---|
-| `networks` | durable Network configuration |
+| `networks` | durable Network configuration, including its operator-facing display name |
 | `network_secrets` | restart-required SASL material, typed separately |
 | `desired_channels` | durable operator intent, ordered |
 | `clients` | durable client lineage |
@@ -61,6 +61,24 @@ A version 1 database on disk is real and evidence-closed, so the migration runs 
 `AUTOINCREMENT` survives because every `event_id` is copied explicitly, which moves `sqlite_sequence` forward and keeps a retained cursor from later aliasing a different event.
 
 A version 1 `server_time` outside the four-digit year window migrates as `NULL` rather than failing the migration. Version 1 accepted any integer within ±32.5e9 seconds, reaching back before year 1; under the protocol an inexpressible timestamp means "no timestamp", so the row and its canonical `HistoryEventId` order survive without one. Sub-second precision that version 1 already discarded is explicitly **not** invented backwards.
+
+### What version 3 added, and why
+
+Version 3 adds `networks.display_name`: the operator-chosen label a Network is listed under in operator-facing output.
+
+It is display only. It never participates in lookup, routing, or identity, and it is deliberately *not* derived from the endpoint, the nickname, or any local path — a display name is operator-facing text and must not leak the bouncer's upstream identity into list output.
+
+Existing rows receive `network-<id>`, derived only from the durable `NetworkId` the row already carries. That is deterministic, stable across restarts, and carries no endpoint, nick, path, or machine detail. `fallback_display_name` is the single definition, so a writer cannot invent a second spelling.
+
+The value is validated as a single bounded IRC token (ASCII graphic, no space, no parameter separator, at most `MAX_DISPLAY_NAME_BYTES`) because it is interpolated into operator-facing numeric replies and must not be able to change how the surrounding reply parses.
+
+### Migrating version 2
+
+The v2 → v3 step is an `ALTER TABLE ... ADD COLUMN` plus a fill, in the same transaction as the rest of the migration chain. The column is added with an empty default because SQLite forbids a non-constant column default, and every row is then set to `network-<id>`.
+
+Because the fill happens inside the migration transaction, a reader can never observe a mixture of migrated and unmigrated names: either the whole migration commits, or the database stays at version 2 with no column at all. A step that cannot complete leaves the version 2 database untouched and still openable.
+
+Migration steps are applied in order, one version at a time, so a database several versions behind walks the same path it would have taken on each intervening release rather than jumping.
 
 ## Open policy
 

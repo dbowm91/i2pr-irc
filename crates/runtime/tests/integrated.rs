@@ -19,7 +19,8 @@ use i2pr_irc_runtime::{
     resource::ResourceLedger,
 };
 use i2pr_irc_store::{
-    BufferKind, NetworkRecord, STORE_BUSY_TIMEOUT_MS, Store, StoreErrorKind, StoreHandle, StorePath,
+    BufferKind, NetworkRecord, STORE_BUSY_TIMEOUT_MS, Store, StoreErrorKind, StoreHandle,
+    StorePath, fallback_display_name,
 };
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -46,6 +47,7 @@ impl i2pr_irc_core::I2pStreamProvider for Shared {
 fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
     NetworkRecord {
         network: NetworkId(network),
+        display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
         nick: nick.into(),
         username: "user".into(),

@@ -267,21 +267,29 @@ impl SessionTask {
         stream: D,
         events_tx: mpsc::Sender<SessionEvent>,
     ) -> Self {
-        let (read, write) = tokio::io::split(stream);
-        let (control_tx, normal_tx, writer) = crate::downstream::spawn_session_writer(write);
-        let handle = SessionHandle {
-            session,
-            client,
-            control_tx,
-            normal_tx,
-            capabilities: std::sync::Arc::new(
-                std::sync::Mutex::new(SessionCapabilities::default()),
-            ),
-        };
-        let identity = session;
+        let wiring = ClientWiring::new(session, client, Some(expected_nick), stream);
+        Self::resume(wiring, events_tx)
+    }
+
+    /// Continues an accepted connection whose registration already completed.
+    ///
+    /// The wiring carries the socket half, the decoder, and the negotiated
+    /// capabilities that admission already established. `resume` adds exactly one
+    /// thing: a task that forwards this client's remaining intents to `events_tx`.
+    /// It does not re-read registration, re-parse, re-negotiate, or rebuild the writer,
+    /// so a client that joined a Network mid-stream is not registered twice.
+    pub fn resume<D: ByteStream + 'static>(
+        wiring: ClientWiring<D>,
+        events_tx: mpsc::Sender<SessionEvent>,
+    ) -> Self {
+        let ClientWiring {
+            mut reader,
+            handle,
+            writer,
+        } = wiring;
+        let identity = reader.session;
         let owner_handle = handle.clone();
-        let reader = tokio::spawn(async move {
-            let mut reader = SessionReader::new(identity, read, handle, expected_nick);
+        let task = tokio::spawn(async move {
             let disposition = reader.run(&events_tx).await;
             // The owner is told why this session ended so it can update diagnostics
             // and decide whether the upstream generation is affected.
@@ -294,7 +302,7 @@ impl SessionTask {
         });
         Self {
             handle: owner_handle,
-            reader,
+            reader: task,
             writer,
         }
     }
@@ -317,6 +325,219 @@ impl SessionTask {
     }
 }
 
+/// One accepted local connection, owned but not yet attached to a Network.
+///
+/// Admission builds this the moment a client connects, before anything is known about
+/// which Network it will use. Splitting the socket and starting the writer this early
+/// is what makes a rejection possible at all: a refused client still gets its protocol
+/// error written on the same socket it opened, rather than a dropped connection.
+pub struct ClientWiring<D: ByteStream + 'static = Box<dyn ByteStream>> {
+    reader: SessionReader<D>,
+    handle: SessionHandle,
+    writer: crate::downstream::SessionWriter,
+}
+
+impl<D: ByteStream + 'static> ClientWiring<D> {
+    /// Splits `stream` and starts the writer task.
+    ///
+    /// `expected_nick` is `None` when no Network has been selected yet, which is the
+    /// control-only case.
+    pub fn new(
+        session: SessionId,
+        client: ClientId,
+        expected_nick: Option<String>,
+        stream: D,
+    ) -> Self {
+        let (read, write) = tokio::io::split(stream);
+        let (control_tx, normal_tx, writer) = crate::downstream::spawn_session_writer(write);
+        let handle = SessionHandle {
+            session,
+            client,
+            control_tx,
+            normal_tx,
+            capabilities: std::sync::Arc::new(
+                std::sync::Mutex::new(SessionCapabilities::default()),
+            ),
+        };
+        Self {
+            reader: SessionReader::new(session, read, handle.clone(), expected_nick),
+            handle,
+            writer,
+        }
+    }
+
+    /// The handle a Network owner routes this client through.
+    pub fn handle(&self) -> &SessionHandle {
+        &self.handle
+    }
+
+    pub fn session(&self) -> SessionId {
+        self.reader.session
+    }
+
+    /// Records the capabilities this client negotiated, so the owner's later
+    /// decisions match what the client was actually told.
+    pub fn set_negotiated(&self, enabled: &std::collections::BTreeSet<String>) {
+        self.handle.set_negotiated(enabled);
+    }
+
+    /// Drains registration, returning the wiring ready to serve a bound client.
+    ///
+    /// On refusal the reader is already gone -- it owned the socket -- but the handle
+    /// and writer are handed back inside the refusal so the protocol error is written
+    /// on the very socket the client opened, instead of the connection just dropping.
+    pub(crate) async fn register(
+        self,
+        timeout: std::time::Duration,
+    ) -> Result<Self, RefusedRegistration> {
+        let Self {
+            reader,
+            handle,
+            writer,
+        } = self;
+        let claimed = reader
+            .registered_nick()
+            .map_or_else(|| "*".to_owned(), str::to_owned);
+        // The ceiling is applied here rather than by the caller so the handle and
+        // writer survive it. A client that stalls registration is still owed a written
+        // reason: cancelling outside this function would drop the only half of the
+        // socket that can say anything.
+        let outcome = crate::timeout_bounded(timeout, reader.run_until_registration()).await;
+        match outcome {
+            Ok(Ok(reader)) => Ok(Self {
+                reader,
+                handle,
+                writer,
+            }),
+            Ok(Err(disposition)) => Err(RefusedRegistration {
+                handle,
+                writer,
+                disposition,
+                nick: claimed,
+            }),
+            Err(_) => Err(RefusedRegistration {
+                handle,
+                writer,
+                disposition: DownstreamDisposition::RegistrationTimeout,
+                nick: claimed,
+            }),
+        }
+    }
+
+    /// The nickname this client registered with.
+    pub fn registered_nick(&self) -> Option<&str> {
+        self.reader.registered_nick()
+    }
+
+    /// The capabilities this client negotiated during registration.
+    pub fn negotiated(&self) -> &std::collections::BTreeSet<String> {
+        self.reader.negotiated()
+    }
+
+    /// Whether registration completed.
+    pub fn is_registered(&self) -> bool {
+        self.reader.registered_nick().is_some()
+    }
+
+    /// Drives this already-registered connection with a local handler.
+    ///
+    /// This is the control-only path: no Network owns the client, so its intents are
+    /// answered here and never submitted anywhere. The reader runs on its own task and
+    /// the writer is owned for the whole call, so the socket is closed on every exit --
+    /// there is no way to return while a task is still writing to a client nobody is
+    /// answering.
+    pub async fn serve_locally(
+        self,
+        mut answer: impl FnMut(SessionIntent),
+    ) -> DownstreamDisposition {
+        let Self {
+            mut reader,
+            handle,
+            writer,
+        } = self;
+        let (events_tx, mut events_rx) =
+            mpsc::channel::<SessionEvent>(SESSION_EVENT_QUEUE_CAPACITY);
+        let session = reader.session;
+        let task = tokio::spawn(async move {
+            let disposition = reader.run(&events_tx).await;
+            let _ = events_tx
+                .send(SessionEvent::Ended {
+                    session,
+                    disposition,
+                })
+                .await;
+        });
+        let mut disposition = DownstreamDisposition::Eof;
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                SessionEvent::Intent { intent, .. } => {
+                    if matches!(intent, SessionIntent::Quit) {
+                        disposition = DownstreamDisposition::LocalDetach;
+                        break;
+                    }
+                    answer(intent);
+                }
+                SessionEvent::Ended {
+                    disposition: ended, ..
+                } => {
+                    disposition = ended;
+                    break;
+                }
+            }
+        }
+        // The reader must not outlive the handler: it would keep writing to a socket
+        // this call is about to close.
+        task.abort();
+        let _ = task.await;
+        drop(handle);
+        writer.shutdown().await;
+        disposition
+    }
+
+    /// Writes one protocol error and closes the socket.
+    pub async fn refuse(self, nick: &str, code: &str, text: &str) {
+        let line = format!(":bouncer {code} {nick} :{text}\r\n");
+        let _ = self.handle.queue_normal(&line);
+        self.writer.shutdown().await;
+    }
+}
+
+/// One connection whose registration never completed.
+///
+/// The read half is gone with the reader, but the write half is still owned here: a
+/// client that is told *why* it was refused can act on that, while a client that is
+/// merely disconnected learns nothing.
+pub struct RefusedRegistration {
+    pub(crate) handle: SessionHandle,
+    pub(crate) writer: crate::downstream::SessionWriter,
+    pub(crate) disposition: DownstreamDisposition,
+    /// The nickname the client had claimed when it was refused, or `*`.
+    pub(crate) nick: String,
+}
+
+impl RefusedRegistration {
+    pub fn disposition(&self) -> DownstreamDisposition {
+        self.disposition
+    }
+
+    /// Writes the refusal, lets it reach the socket, then closes.
+    ///
+    /// The handle is released before the drain, because the writer only finishes once
+    /// both bounded queues are closed and the handle is what holds their senders.
+    pub async fn refuse(self, code: &str, text: &str) {
+        let line = format!(":bouncer {code} {} :{text}\r\n", self.nick);
+        let _ = self.handle.queue_normal(&line);
+        drop(self.handle);
+        self.writer.close_after_drain().await;
+    }
+
+    /// Closes the socket without writing anything, for a client that never registered.
+    pub async fn close(self) {
+        drop(self.handle);
+        self.writer.close_after_drain().await;
+    }
+}
+
 /// Per-session decoder and registration state.
 ///
 /// This is deliberately a plain struct owned by the reader task: it is the only
@@ -325,8 +546,13 @@ struct SessionReader<D: ByteStream> {
     session: SessionId,
     read: ReadHalf<D>,
     handle: SessionHandle,
-    /// The nickname this network registered, fixed for the session's lifetime.
-    expected_nick: String,
+    /// The nickname this Network registered, when one was selected before
+    /// registration started.
+    ///
+    /// `None` is the control-only case: the client registered against no Network, so
+    /// any syntactically valid nickname is accepted and is purely a local label. It is
+    /// never projected as an upstream identity, because no Network claimed it.
+    expected_nick: Option<String>,
     decoder: LineDecoder,
     registered_nick: Option<String>,
     user_received: bool,
@@ -339,14 +565,22 @@ struct SessionReader<D: ByteStream> {
     /// grow this set without limit by repeating `CAP REQ`.
     negotiated: std::collections::BTreeSet<String>,
     ready: bool,
+    /// Complete client lines already decoded but not yet translated.
+    ///
+    /// One read can yield several lines, and registration can complete part-way through
+    /// that batch. When the reader is transferred at the registration boundary the rest
+    /// of the batch must survive, so the remainder is parked here rather than dropped
+    /// with the local queue that produced it. It is drained before any further read, so
+    /// the client's own ordering is preserved across the transfer.
+    pending: VecDeque<Vec<u8>>,
 }
 
 impl<D: ByteStream> SessionReader<D> {
-    fn new(
+    pub(crate) fn new(
         session: SessionId,
         read: ReadHalf<D>,
         handle: SessionHandle,
-        expected_nick: String,
+        expected_nick: Option<String>,
     ) -> Self {
         Self {
             session,
@@ -359,6 +593,41 @@ impl<D: ByteStream> SessionReader<D> {
             cap_negotiating: false,
             negotiated: std::collections::BTreeSet::new(),
             ready: false,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Reads only the registration half of the protocol, then hands this reader over.
+    ///
+    /// Returns the reader itself once a valid `NICK` and `USER` have both arrived with
+    /// no `CAP` negotiation outstanding. The reader keeps its socket half, its decoder
+    /// with any undecoded bytes, the capabilities this client negotiated, and every
+    /// client line that arrived after the registration boundary. Nothing is recreated
+    /// and nothing is replayed, so the owner that receives it continues the *same*
+    /// conversation rather than starting a second one.
+    pub(crate) async fn run_until_registration(
+        mut self,
+    ) -> Result<SessionReader<D>, DownstreamDisposition> {
+        loop {
+            let raw = match self.next_line().await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => return Err(DownstreamDisposition::Eof),
+                Err(disposition) => return Err(disposition),
+            };
+            if raw.len() > MAX_CLIENT_LINE {
+                return Err(DownstreamDisposition::QueueOverload);
+            }
+            match self.translate(&raw) {
+                // The one pre-registration intent that ends this phase. Everything the
+                // reader owns is returned exactly as it stands.
+                Ok(Some(SessionIntent::RequestProjection)) => return Ok(self),
+                // No other intent can be produced before registration completes; a line
+                // that somehow yields one is refused rather than forwarded from a phase
+                // that is not allowed to touch the owner.
+                Ok(Some(_)) => return Err(DownstreamDisposition::ProtocolViolation),
+                Ok(None) => {}
+                Err(error) => return Err(DownstreamDisposition::from_error(&error)),
+            }
         }
     }
 
@@ -366,52 +635,83 @@ impl<D: ByteStream> SessionReader<D> {
     ///
     /// The only reasons this session ends are client-side. Upstream generation loss is
     /// owned by the network supervisor, which ends every session it holds itself.
-    async fn run(&mut self, events: &mpsc::Sender<SessionEvent>) -> DownstreamDisposition {
+    pub(crate) async fn run(
+        &mut self,
+        events: &mpsc::Sender<SessionEvent>,
+    ) -> DownstreamDisposition {
+        loop {
+            let raw = match self.next_line().await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => return DownstreamDisposition::Eof,
+                Err(disposition) => return disposition,
+            };
+            if raw.len() > MAX_CLIENT_LINE {
+                return DownstreamDisposition::QueueOverload;
+            }
+            match self.translate(&raw) {
+                Ok(Some(intent)) => {
+                    let event = SessionEvent::Intent {
+                        session: self.session,
+                        intent,
+                    };
+                    // A bounded queue is awaited here, so a client that outruns the
+                    // owner applies backpressure instead of growing memory. If the
+                    // owner is gone the session ends rather than blocking forever.
+                    if events.send(event).await.is_err() {
+                        return DownstreamDisposition::SupervisorStop;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return DownstreamDisposition::from_error(&error),
+            }
+        }
+    }
+
+    /// Returns the next complete client line, preferring any already decoded.
+    ///
+    /// Lines decoded from an earlier read but not yet translated are drained before the
+    /// socket is read again. That is what preserves a client's ordering across the
+    /// registration transfer: lines the client sent after `USER` are still delivered
+    /// when they arrived in the very read that completed registration.
+    async fn next_line(&mut self) -> Result<Option<Vec<u8>>, DownstreamDisposition> {
         let mut buf = [0u8; 2048];
         loop {
-            let count = match self.read.read(&mut buf).await {
-                Ok(0) => return DownstreamDisposition::Eof,
-                Ok(count) => count,
-                Err(_) => return DownstreamDisposition::ReadFailure,
-            };
-            let mut batch: VecDeque<Vec<u8>> = match self
+            if let Some(raw) = self.pending.pop_front() {
+                return Ok(Some(raw));
+            }
+            let count = self
+                .read
+                .read(&mut buf)
+                .await
+                .map_err(|_| DownstreamDisposition::ReadFailure)?;
+            if count == 0 {
+                return Ok(None);
+            }
+            // A framing or size violation is an explicit protocol failure, never a
+            // partial parse of the lines that happened to decode.
+            let batch = self
                 .decoder
                 .push(&buf[..count])
                 .into_iter()
-                .collect::<Result<VecDeque<_>, _>>()
-            {
-                Ok(lines) => lines,
-                // A framing or size violation is an explicit protocol failure, never a
-                // partial parse of the lines that happened to decode.
-                Err(_) => return DownstreamDisposition::ProtocolViolation,
-            };
+                .collect::<Result<VecDeque<Vec<u8>>, _>>()
+                .map_err(|_| DownstreamDisposition::ProtocolViolation)?;
             if batch.len() > MAX_LINES_PER_READ {
                 // One read yielding an unbounded number of lines is overload, not
                 // work: this bounds both memory and the owner's per-read duty.
-                return DownstreamDisposition::QueueOverload;
+                return Err(DownstreamDisposition::QueueOverload);
             }
-            while let Some(raw) = batch.pop_front() {
-                if raw.len() > MAX_CLIENT_LINE {
-                    return DownstreamDisposition::QueueOverload;
-                }
-                match self.translate(&raw) {
-                    Ok(Some(intent)) => {
-                        let event = SessionEvent::Intent {
-                            session: self.session,
-                            intent,
-                        };
-                        // A bounded queue is awaited here, so a client that outruns the
-                        // owner applies backpressure instead of growing memory. If the
-                        // owner is gone the session ends rather than blocking forever.
-                        if events.send(event).await.is_err() {
-                            return DownstreamDisposition::SupervisorStop;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => return DownstreamDisposition::from_error(&error),
-                }
-            }
+            self.pending = batch;
         }
+    }
+
+    /// The nickname this client registered, once registration has completed.
+    pub(crate) fn registered_nick(&self) -> Option<&str> {
+        self.registered_nick.as_deref()
+    }
+
+    /// The capabilities this client negotiated before registration completed.
+    pub(crate) fn negotiated(&self) -> &std::collections::BTreeSet<String> {
+        &self.negotiated
     }
 
     /// Converts one complete client line into an intent or a local reply.
@@ -444,11 +744,18 @@ impl<D: ByteStream> SessionReader<D> {
             "NICK" => {
                 if let Some(value) = message.params.first() {
                     let requested = String::from_utf8_lossy(value).into_owned();
-                    if crate::valid_client_nick(value)
-                        && i2pr_irc_core::Casemapping::Rfc1459.fold(requested.as_bytes())
-                            == i2pr_irc_core::Casemapping::Rfc1459
-                                .fold(self.expected_nick.as_bytes())
-                    {
+                    // With no Network selected there is nothing to collide with, so any
+                    // valid nickname registers. With one selected, only that nickname
+                    // does: a session may not claim an identity its Network did not
+                    // register, or it would be handed a view of a network it never joined.
+                    let claims_expected = match &self.expected_nick {
+                        None => true,
+                        Some(expected) => {
+                            i2pr_irc_core::Casemapping::Rfc1459.fold(requested.as_bytes())
+                                == i2pr_irc_core::Casemapping::Rfc1459.fold(expected.as_bytes())
+                        }
+                    };
+                    if crate::valid_client_nick(value) && claims_expected {
                         self.registered_nick = Some(requested);
                     } else {
                         self.handle.queue_normal(
@@ -553,7 +860,13 @@ impl<D: ByteStream> SessionReader<D> {
                 }));
             }
             _ => {
-                let nick = self.expected_nick.clone();
+                // The reply names what this client actually claimed, never the
+                // Network's configured nickname, so an unbound client is never told it
+                // failed to register under a name it never asked for.
+                let nick = self
+                    .registered_nick
+                    .clone()
+                    .unwrap_or_else(|| "*".to_owned());
                 self.handle
                     .queue_normal(&format!(":bouncer 421 {nick} * :Unsupported command\r\n"))?;
             }

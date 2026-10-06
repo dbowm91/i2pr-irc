@@ -15,7 +15,7 @@ use i2pr_irc_runtime::{
     reconnect::ReconnectScheduler,
     resource::ResourceLedger,
 };
-use i2pr_irc_store::{NetworkRecord, Store, StoreHandle, StorePath};
+use i2pr_irc_store::{NetworkRecord, Store, StoreHandle, StorePath, fallback_display_name};
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::{
@@ -34,6 +34,7 @@ fn store() -> (Store, StoreHandle) {
 fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
     NetworkRecord {
         network: NetworkId(network),
+        display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
         nick: nick.into(),
         username: "user".into(),

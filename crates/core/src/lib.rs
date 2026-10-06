@@ -171,6 +171,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for T {}
 pub trait I2pStreamProvider: Send + Sync {
     async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError>;
 }
+
+/// Shares one provider across every Network owner.
+///
+/// The controller owns exactly one provider and hands a shared reference to each owner
+/// it starts, so `N` supervised Networks still cost one configured transport rather than
+/// `N` copies of it. Delegating rather than cloning also means a provider that counts
+/// its own connections still sees one consistent count.
+#[async_trait]
+impl<P: I2pStreamProvider + ?Sized> I2pStreamProvider for std::sync::Arc<P> {
+    async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError> {
+        (**self).connect(endpoint).await
+    }
+}
 /// Accepts only the local downstream side. It is not an upstream connector.
 pub trait LocalAcceptor: Send + Sync {
     type Stream: ByteStream;

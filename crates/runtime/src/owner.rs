@@ -633,6 +633,25 @@ pub enum Phase {
     Stopped,
 }
 
+impl Phase {
+    /// A fixed, non-secret name for diagnostics.
+    ///
+    /// A `Debug` render would also work, but naming the set here means a variant
+    /// cannot be renamed without also changing an operator-facing string, which is
+    /// exactly the sort of silent contract change worth making loud.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Connecting => "connecting",
+            Self::Registering => "registering",
+            Self::Online => "online",
+            Self::Backoff => "backoff",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
 /// Owns one Network across connection generations and any number of local sessions.
 pub struct NetworkOwner<P> {
     provider: P,
@@ -661,6 +680,21 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         reconnect: ReconnectScheduler,
     ) -> Result<Self, RuntimeError> {
         let (snapshot, _) = watch::channel(NetworkSnapshot::default());
+        Self::with_snapshot_channel(provider, context, store, reconnect, snapshot)
+    }
+
+    /// Builds an owner over a snapshot channel the caller created.
+    ///
+    /// The controller owns the receiver so it can report per-Network gauges without
+    /// owning the owner. Holding a receiver rather than the owner is the point: the
+    /// controller must never be able to drive an owner it has a view of.
+    pub fn with_snapshot_channel(
+        provider: P,
+        context: crate::catalog::SupervisorContext,
+        store: StoreHandle,
+        reconnect: ReconnectScheduler,
+        snapshot: watch::Sender<NetworkSnapshot>,
+    ) -> Result<Self, RuntimeError> {
         snapshot.send_modify(|state| {
             state.network = Some(context.network);
             state.phase = Some(Phase::Idle);
@@ -1503,6 +1537,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     );
                     Ok(())
                 };
+                let _ = reply.send(accepted);
+            }
+            SupervisorCommand::AttachPrepared { session, reply } => {
+                let accepted = adopt_prepared_session(
+                    session,
+                    &state.nick,
+                    session_tx,
+                    sessions,
+                    &self.snapshot,
+                );
                 let _ = reply.send(accepted);
             }
             SupervisorCommand::Session { session, event } => {
@@ -2395,6 +2439,72 @@ fn attach_session<D: ByteStream + 'static>(
         state.sessions_accepted = state.sessions_accepted.saturating_add(1);
         state.attached_sessions = sessions.len();
     });
+}
+
+/// Adopts one client that admission already registered on this Network.
+///
+/// The transferred session keeps its socket, its writer task, its decoder, and its
+/// negotiated capabilities: nothing is recreated, so the client never sees a second
+/// connection or a second registration.
+///
+/// Two refusals are possible and both are explicit:
+///
+/// * the Network is already at its session ceiling, so accepting would exceed a bound;
+/// * the claimed nickname does not fold-match the nickname this Network registered.
+///   The binding that selected this Network may predate a configuration change, and a
+///   session must never be projected under an identity this Network does not hold.
+///
+/// On acceptance the registration projection is requested through the ordinary intent
+/// path rather than performed here. That is deliberate: there is exactly one
+/// implementation of the projection, so an adopted client and an attached one cannot
+/// diverge, and neither can be projected twice.
+fn adopt_prepared_session(
+    prepared: Box<crate::admission::PreparedSession>,
+    expected_nick: &str,
+    session_tx: &mpsc::Sender<SessionEvent>,
+    sessions: &mut BTreeMap<SessionId, SessionTask>,
+    snapshot: &watch::Sender<NetworkSnapshot>,
+) -> Result<(), RuntimeError> {
+    if sessions.len() >= MAX_SESSIONS_PER_NETWORK {
+        return Err(RuntimeError::QueueOverloaded);
+    }
+    let claimed = match prepared.registered_nick() {
+        Some(nick) => nick.to_owned(),
+        // A transferred session has always completed registration. One that did not is
+        // not a session, and admitting it would project a network to nobody.
+        None => return Err(RuntimeError::Protocol),
+    };
+    if i2pr_irc_core::Casemapping::Rfc1459.fold(claimed.as_bytes())
+        != i2pr_irc_core::Casemapping::Rfc1459.fold(expected_nick.as_bytes())
+    {
+        // The client is told, on its own socket, that its nickname is not available
+        // here. Silently closing would be indistinguishable from a network fault, and
+        // would leave a client that reconnected on the same stale selection with no way
+        // to tell that its configuration is what changed.
+        let _ = prepared.handle().queue_control(&format!(
+            ":bouncer 433 {claimed} :Nickname unavailable on this network\r\n"
+        ));
+        return Err(RuntimeError::InvalidConfig);
+    }
+    let session = prepared.session_id();
+    if sessions.contains_key(&session) {
+        // Session identities are allocated by admission and never reused, so this can
+        // only mean the same conversation was offered twice.
+        return Err(RuntimeError::Protocol);
+    }
+    prepared.publish_negotiated();
+    let task = SessionTask::resume(prepared.into_wiring(), session_tx.clone());
+    sessions.insert(session, task);
+    // The projection runs on the ordinary intent path. See the note above.
+    let _ = session_tx.try_send(SessionEvent::Intent {
+        session,
+        intent: SessionIntent::RequestProjection,
+    });
+    snapshot.send_modify(|state| {
+        state.sessions_accepted = state.sessions_accepted.saturating_add(1);
+        state.attached_sessions = sessions.len();
+    });
+    Ok(())
 }
 
 fn queue_upstream(

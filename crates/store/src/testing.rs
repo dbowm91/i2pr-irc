@@ -10,7 +10,8 @@
 #![doc(hidden)]
 
 use crate::{
-    StoreError,
+    StoreError, StoreErrorKind,
+    error::CommitState,
     schema::{self, OpenDisposition},
 };
 use rusqlite::Connection;
@@ -49,6 +50,25 @@ pub fn create_v1_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 1)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 2 and returns a raw connection to it.
+///
+/// Used to build the fixture the v2 -> v3 migration must handle. Like
+/// [`create_v1_database`] it cannot be produced by this build's own `open`, because
+/// that always migrates forward.
+pub fn create_v2_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v2())
+        .expect("schema 2 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 2)
         .expect("user_version is writable");
     connection
 }
@@ -166,6 +186,26 @@ pub fn optional_i64(path: &Path, sql: &str, args: &[i64]) -> Option<i64> {
     rows.next()
         .expect("at most one row")
         .and_then(|row| row.get::<_, i64>(0).ok())
+}
+
+/// A `StoreError` whose durable commit state is `Unknown`.
+///
+/// A real SQLite commit failure cannot be provoked from a test without corrupting a
+/// database, but the *decision* that follows one is exactly what has to be tested: a
+/// caller must re-read durable state rather than assume the mutation landed or did not.
+pub fn unknown_commit() -> StoreError {
+    StoreError::mutating(StoreErrorKind::Sqlite, CommitState::Unknown)
+}
+
+/// Reads every value of one text column, in the order the query produced them.
+pub fn texts(path: &Path, sql: &str) -> Vec<String> {
+    let connection = raw(path);
+    let mut statement = connection.prepare(sql).expect("query is valid");
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query executes");
+    rows.map(|row| row.expect("text column is readable"))
+        .collect()
 }
 
 /// Foreign-key enforcement is on, proven against the real schema.

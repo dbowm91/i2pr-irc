@@ -32,7 +32,7 @@ fn sql(_error: rusqlite::Error, commit: CommitState) -> StoreError {
 pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord>, StoreError> {
     let mut statement = connection
         .prepare(
-            "SELECT n.network_id, n.endpoint, n.nick, n.username, n.realname,
+            "SELECT n.network_id, n.endpoint, n.nick, n.username, n.realname, n.display_name,
                     s.sasl_username, s.sasl_password
              FROM networks n
              LEFT JOIN network_secrets s ON s.network_id = n.network_id
@@ -46,14 +46,16 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             let nick: String = row.get(2)?;
             let username: String = row.get(3)?;
             let realname: String = row.get(4)?;
-            let sasl_username: Option<String> = row.get(5)?;
-            let sasl_password: Option<Vec<u8>> = row.get(6)?;
+            let display_name: String = row.get(5)?;
+            let sasl_username: Option<String> = row.get(6)?;
+            let sasl_password: Option<Vec<u8>> = row.get(7)?;
             Ok((
                 network,
                 endpoint,
                 nick,
                 username,
                 realname,
+                display_name,
                 sasl_username,
                 sasl_password,
             ))
@@ -61,8 +63,16 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let mut records = Vec::new();
     for row in rows {
-        let (network, endpoint, nick, username, realname, sasl_username, sasl_password) =
-            row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        let (
+            network,
+            endpoint,
+            nick,
+            username,
+            realname,
+            display_name,
+            sasl_username,
+            sasl_password,
+        ) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
         if records.len() >= MAX_NETWORKS {
             return Err(StoreError::new(StoreErrorKind::Corrupt(
                 "network count exceeds ceiling",
@@ -94,6 +104,7 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             nick,
             username,
             realname,
+            display_name,
             sasl,
             desired_channels,
         };
@@ -162,14 +173,15 @@ pub(crate) fn save_network(
     }
     transaction
         .execute(
-            "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(network_id) DO UPDATE SET
                 endpoint=excluded.endpoint,
                 endpoint_kind=excluded.endpoint_kind,
                 nick=excluded.nick,
                 username=excluded.username,
-                realname=excluded.realname",
+                realname=excluded.realname,
+                display_name=excluded.display_name",
             params![
                 network,
                 record.endpoint.as_str(),
@@ -177,6 +189,7 @@ pub(crate) fn save_network(
                 record.nick,
                 record.username,
                 record.realname,
+                record.display_name,
             ],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;

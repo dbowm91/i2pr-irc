@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 [dependencies]
+async-trait.workspace = true
 i2pr-irc-core = { path = "../core" }
 i2pr-irc-store = { path = "../store" }
 i2pr-irc-wire = { path = "../wire" }

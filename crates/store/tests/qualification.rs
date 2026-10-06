@@ -6,9 +6,9 @@
 //! never depends on the same API that is under test.
 use i2pr_irc_core::{I2pEndpoint, WallTime};
 use i2pr_irc_store::{
-    BufferKind, EventDirection, HistoryEventId, NetworkId, NetworkRecord, NewHistoryEvent,
-    RetentionRequest, STORE_QUEUE_CAPACITY, Store, StoreErrorKind, StoreHealth, StorePath,
-    StoredSecret,
+    BufferKind, EventDirection, HistoryEventId, MAX_DISPLAY_NAME_BYTES, NetworkId, NetworkRecord,
+    NewHistoryEvent, RetentionRequest, STORE_QUEUE_CAPACITY, Store, StoreErrorKind, StoreHealth,
+    StorePath, StoredSecret, fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
 
@@ -19,6 +19,7 @@ fn store_at(path: &std::path::Path) -> Store {
 fn record(network: u64, channels: &[&str]) -> NetworkRecord {
     NetworkRecord {
         network: NetworkId(network),
+        display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
         nick: "bot".into(),
         username: "user".into(),
@@ -191,7 +192,7 @@ fn a_schema_one_database_is_migrated_to_two_on_open() {
     assert_eq!(testing::identity(&path).1, 1, "fixture is at schema 1");
 
     let store = store_at(&path);
-    assert_eq!(testing::identity(&path).1, 2, "open migrates forward");
+    assert_eq!(testing::identity(&path).1, 3, "open migrates forward");
 
     assert_eq!(
         testing::optional_text(
@@ -451,7 +452,7 @@ fn a_migration_that_fails_leaves_the_version_one_database_intact() {
     // failure rolled back rather than leaving a permanently poisoned database.
     testing::execute(&path, "DROP TABLE history_events_v2");
     let store = store_at(&path);
-    assert_eq!(testing::identity(&path).1, 2);
+    assert_eq!(testing::identity(&path).1, 3);
     assert_eq!(
         testing::optional_text(
             &path,
@@ -503,6 +504,168 @@ fn foreign_keys_reject_an_orphaned_child_row() {
          VALUES (4242, 0, x'00', '#room')",
     );
     assert!(error.to_string().contains("FOREIGN KEY"), "got: {error}");
+}
+
+// ------------------------------------------------------- schema 2 -> 3 migration
+
+/// Builds a v2 database holding `networks` rows whose endpoints are identifying.
+///
+/// The endpoint is deliberately an obviously recognisable string so the test can
+/// prove it never reaches the migrated display name.
+fn v2_fixture(path: &std::path::Path, networks: &[(i64, &str, &str)]) {
+    let connection = testing::create_v2_database(path);
+    for (network, nick, endpoint) in networks {
+        connection
+            .execute(
+                "INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname)
+                 VALUES (?1, ?2, 0, ?3, 'user', 'bouncer')",
+                rusqlite::params![network, endpoint, nick],
+            )
+            .expect("network fixture applies");
+    }
+}
+
+#[test]
+fn a_schema_two_database_is_migrated_to_three_on_open() {
+    let dir = testing::temp_dir("m23");
+    let path = dir.db("m23.sqlite3");
+    v2_fixture(
+        &path,
+        &[
+            (1, "bot", "identifying-endpoint-one.i2p"),
+            (7, "other", "identifying-endpoint-seven.i2p"),
+        ],
+    );
+    assert_eq!(testing::identity(&path).1, 2, "fixture is at schema 2");
+
+    let store = store_at(&path);
+    assert_eq!(testing::identity(&path).1, 3, "open migrates forward");
+
+    let names = testing::texts(
+        &path,
+        "SELECT display_name FROM networks ORDER BY network_id",
+    );
+    assert_eq!(
+        names,
+        vec![
+            fallback_display_name(NetworkId(1)),
+            fallback_display_name(NetworkId(7)),
+        ],
+        "every migrated row receives the deterministic NetworkId-derived fallback"
+    );
+    assert_eq!(
+        names,
+        vec!["network-1".to_owned(), "network-7".to_owned()],
+        "the fallback is derived only from the durable id"
+    );
+    for endpoint in [
+        "identifying-endpoint-one.i2p",
+        "identifying-endpoint-seven.i2p",
+    ] {
+        assert!(
+            !names.iter().any(|name| name.contains(endpoint)),
+            "the upstream endpoint must never appear in an operator-facing name: {names:?}"
+        );
+    }
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn the_migrated_display_name_is_readable_through_the_public_api() {
+    let dir = testing::temp_dir("m23api");
+    let path = dir.db("m23api.sqlite3");
+    v2_fixture(&path, &[(1, "bot", "irc.example.i2p")]);
+
+    let store = store_at(&path);
+    let records = store.handle().load_networks().await.expect("networks load");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].display_name,
+        fallback_display_name(NetworkId(1)),
+        "the migrated row loads with its durable fallback name"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn an_operator_chosen_display_name_round_trips_and_survives_reopen() {
+    let dir = testing::temp_dir("m23name");
+    let path = dir.db("m23name.sqlite3");
+    let mut record = record(1, &[]);
+    record.display_name = "hidden-service".into();
+    store_at(&path)
+        .handle()
+        .save_network(&record)
+        .await
+        .expect("record saves");
+
+    let store = store_at(&path);
+    let loaded = store.handle().load_networks().await.expect("networks load");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded[0].display_name, "hidden-service",
+        "an operator-chosen name is durable and is not overwritten by the fallback"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn a_display_name_that_could_alter_reply_parsing_is_refused() {
+    let mut record = record(1, &[]);
+    for rejected in [
+        "",
+        "has space",
+        "has:colon",
+        "has,comma",
+        "has\nnewline",
+        &"x".repeat(MAX_DISPLAY_NAME_BYTES + 1),
+    ] {
+        record.display_name = rejected.to_owned();
+        assert!(
+            record.validate().is_err(),
+            "a display name that could break operator-facing reply parsing must be refused: {rejected:?}"
+        );
+    }
+    record.display_name = "x".repeat(MAX_DISPLAY_NAME_BYTES);
+    assert!(
+        record.validate().is_ok(),
+        "a name exactly at the ceiling is accepted"
+    );
+}
+
+#[test]
+fn a_failed_v2_to_3_migration_leaves_the_version_two_database_intact() {
+    let dir = testing::temp_dir("m23rollback");
+    let path = dir.db("m23rollback.sqlite3");
+    v2_fixture(&path, &[(1, "bot", "irc.example.i2p")]);
+
+    // A `networks` row that cannot satisfy the column's own shape check does not exist
+    // (the column has no CHECK), so the migration is instead broken by occupying the
+    // schema with an incompatible `networks` replacement. `ALTER TABLE ADD COLUMN`
+    // fails when the column already exists.
+    testing::execute(
+        &path,
+        "ALTER TABLE networks ADD COLUMN display_name TEXT NOT NULL DEFAULT 'x'",
+    );
+    assert!(
+        Store::open(&StorePath::File(path.clone())).is_err(),
+        "a migration that cannot complete must not succeed"
+    );
+    assert_eq!(
+        testing::identity(&path).1,
+        2,
+        "a failed migration must leave the version two database untouched"
+    );
+    assert_eq!(
+        testing::optional_text(
+            &path,
+            "SELECT display_name FROM networks WHERE network_id = 1",
+            &[]
+        )
+        .as_deref(),
+        Some("x"),
+        "the pre-existing column is left exactly as it was rather than rewritten"
+    );
 }
 
 // ------------------------------------------------------------------- identity

@@ -14,7 +14,9 @@ use i2pr_irc_runtime::{
     journal::{HistoryJournal, IngestOutcome},
     session::SessionCapabilities,
 };
-use i2pr_irc_store::{BufferKind, NetworkRecord, Store, StoreHandle, StorePath};
+use i2pr_irc_store::{
+    BufferKind, NetworkRecord, Store, StoreHandle, StorePath, fallback_display_name,
+};
 
 // ------------------------------------------------------------------- fixtures
 
@@ -32,6 +34,7 @@ async fn journal_for(handle: &StoreHandle) -> HistoryJournal {
     handle
         .save_network(&NetworkRecord {
             network: NetworkId(1),
+            display_name: fallback_display_name(NetworkId(1)),
             endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
             nick: "bot".into(),
             username: "user".into(),
