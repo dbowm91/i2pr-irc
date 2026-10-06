@@ -9,11 +9,13 @@ Long-term references:
 - plans/002-long-term-roadmap.md
 - plans/research/001-bouncer-and-i2p-foundation.md
 - plans/research/005-m004-anonymity-and-adverse-network-research.md
+- plans/research/006-m005-mature-bouncer-and-control-session-research.md
 
 Related ADRs:
 
 - plans/adrs/ADR-0001-i2p-only-upstream-and-router-adapter-boundary.md
 - plans/adrs/ADR-0002-bounded-sqlite-persistence-history-order-and-session-identity.md
+- plans/adrs/ADR-0003-process-runtime-control-and-pre-bind-downstream-admission.md
 
 Post-closure corrective authority:
 
@@ -130,6 +132,8 @@ Research 005 decomposed M004 and promoted the unresolved response-routing findin
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
+Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below; only Plan 020 is dependency-ready.
+
 ## 5. Target architecture
 
 ~~~
@@ -223,16 +227,46 @@ adverse-network/resource qualification
        M004-D / 018
 integrated anonymity qualification + M004 closure
                |
-               v
-   +---------------------------+
-   |                           |
-   v                           v
-Corrective 019                 M005 feature set
-M004 findings closeout         |
-   |                           |
-   +---------------------------+
-   |
-   +--> router-integration M001 portable SAM
+      +--------+--------+
+      |                 |
+      v                 v
+Corrective 019      M005-A / 020
+(closed, non-gating) control + admission
+                        |
+                        v
+                   M005-B / 021
+                  detached channels
+                        |
+                        v
+                   M005-C / 022
+                 presence + keep-nick
+                        |
+                        v
+                   M005-D / 023
+               bouncer networks/admin
+                        |
+                        v
+                   M005-E / 024
+                  indexed history
+                        |
+                        v
+                   M005-F / 025
+                 IRCv3 protocol polish
+                        |
+                        v
+                   M005-G / 026
+                 richer IRCv3 state
+                        |
+                        v
+                   M005-H / 027
+             diagnostics/config/actions
+                        |
+                        v
+                   M005-I / 028
+              integrated M005 closure
+                        |
+                        v
+          router-integration R001 portable SAM
 ~~~
 
 Dependency classes:
@@ -476,27 +510,42 @@ Dependencies:
 
 - M004 closed.
 
-Candidate deliverables:
+Accepted deliverables:
 
-- detached/persistent channels;
-- automatic away policy;
-- keep-nick and nick reclaim;
-- constrained IRC-only perform/connect commands;
-- local IRC service administration;
-- soju.im/bouncer-networks;
-- richer reviewed IRCv3 capabilities;
-- bounded history search;
-- configuration import/export;
-- operator diagnostics.
+- process RuntimeController plus pre-bind/downstream control admission while retaining NetworkOwner ownership of bound sessions;
+- detached persistent channel policy;
+- automatic-away and preferred-nick/reclaim policy;
+- local IRC administration and soju.im/bouncer-networks under an I2P-only attribute profile;
+- indexed bounded history search and completion of the reviewed history adapter surface;
+- reviewed downstream and member-state IRCv3 capability tranches;
+- bounded/redacted operator diagnostics;
+- versioned non-secret configuration snapshots;
+- constrained post-registration actions instead of arbitrary raw network quote.
+
+Implementation decomposition:
+
+1. M005-A / Plan 020 — runtime control and downstream admission foundation. **Ready**.
+2. M005-B / Plan 021 — durable detached-channel policy. **Blocked on Plan 020 closure**.
+3. M005-C / Plan 022 — presence and preferred-nick policy. **Blocked on Plan 021 closure**.
+4. M005-D / Plan 023 — bouncer-networks and local IRC administration. **Blocked on Plan 022 closure**.
+5. M005-E / Plan 024 — indexed history search and CHATHISTORY completion. **Blocked on Plan 023 closure**.
+6. M005-F / Plan 025 — downstream IRCv3 protocol polish. **Blocked on Plan 024 closure**.
+7. M005-G / Plan 026 — richer IRCv3 member-state mediation. **Blocked on Plan 025 closure**.
+8. M005-H / Plan 027 — operator diagnostics, configuration snapshots and constrained registration actions. **Blocked on Plan 026 closure**.
+9. M005-I / Plan 028 — integrated mature-bouncer qualification and M005 closure. **Blocked on Plan 027 closure**.
+
+Only the earliest dependency-ready plan is executable at a time. Research 006 and ADR-0003 are the architecture authority for the control-session line.
 
 Exit conditions:
 
-Each accepted feature has bounded semantics, restart behavior, multi-client behavior, anonymity review, and focused tests. The milestone must not become a catch-all plugin platform.
+Each accepted feature has bounded semantics, restart behavior, multi-client behavior, anonymity review, and focused tests. Plan 028 must integrate them against the M004 adverse-network/privacy invariants. The milestone must not become a catch-all plugin platform.
 
 Deferred:
 
 - arbitrary native/script plugins;
 - generic external integrations;
+- raw network quote/arbitrary command execution;
+- generic port/TLS/clearnet semantics in bouncer-network attributes;
 - router-specific code.
 
 ## 8. Cross-cutting requirements
@@ -629,4 +678,13 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M004-C / Plan 017 | closed | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closed |
 | M004-D / Plan 018 | closed | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | plans/closure/bouncer-core/018-status.md | Plan 017 closure |
 | C019 / Corrective 019 | closed | plans/implementation/bouncer-core/019-m004-findings-corrective.md | plans/closure/bouncer-core/019-status.md | Closed UF-015-1, UF-017-1, UF-018-1; never gated M005 |
-| M005 | not started — planning/research eligible | future | future | M004 closure satisfied |
+| M005 | active — decomposed; M005-A ready | plans 020-028 | future plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
+| M005-A / Plan 020 | ready | plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md | future plans/closure/bouncer-core/020-status.md | M004 + ADR-0003 |
+| M005-B / Plan 021 | blocked | plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md | future plans/closure/bouncer-core/021-status.md | Plan 020 closure |
+| M005-C / Plan 022 | blocked | plans/implementation/bouncer-core/022-m005c-presence-and-preferred-nick-policy.md | future plans/closure/bouncer-core/022-status.md | Plan 021 closure |
+| M005-D / Plan 023 | blocked | plans/implementation/bouncer-core/023-m005d-bouncer-networks-and-local-irc-administration.md | future plans/closure/bouncer-core/023-status.md | Plan 022 closure |
+| M005-E / Plan 024 | blocked | plans/implementation/bouncer-core/024-m005e-indexed-history-search-and-chathistory-completion.md | future plans/closure/bouncer-core/024-status.md | Plan 023 closure |
+| M005-F / Plan 025 | blocked | plans/implementation/bouncer-core/025-m005f-downstream-ircv3-protocol-polish.md | future plans/closure/bouncer-core/025-status.md | Plan 024 closure |
+| M005-G / Plan 026 | blocked | plans/implementation/bouncer-core/026-m005g-richer-ircv3-member-state-mediation.md | future plans/closure/bouncer-core/026-status.md | Plan 025 closure |
+| M005-H / Plan 027 | blocked | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | future plans/closure/bouncer-core/027-status.md | Plan 026 closure |
+| M005-I / Plan 028 | blocked | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | future plans/closure/bouncer-core/028-status.md | Plan 027 closure |

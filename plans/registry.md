@@ -26,14 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | Corrective 019 closed; M005 planning eligible | Corrective 014, M004-A/B/C/D and Corrective 019 are closed, so M004 is complete with no open findings. UF-015-1, UF-017-1 and UF-018-1 were all closed by Corrective 019 after independent review revised two of the three remedies the M004 closure record proposed. M005 remains planning/research eligible and was never blocked by this corrective. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M005-A / Plan 020 ready; M005 decomposed | M004 and Corrective 019 are closed. Research 006 and ADR-0003 freeze M005 control-session/runtime ownership. Plan 020 is the only dependency-ready M005 handoff; Plans 021-028 are registered behind sequential closure gates. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| _(none)_ | | | | |
+| Bouncer Core M005-A / Plan 020 — Runtime Control and Downstream Admission Foundation | ready | infrastructure + invariant | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/020-status.md |
 
 ## Recently closed implementation plans
 
@@ -61,21 +61,30 @@ Canonical direction:
 
 ## Blocked implementation plans
 
-None. Every registered implementation plan is either closed or dependency-ready. Router
-integration remains blocked, but on bouncer-core M005 rather than on any plan in this
-table; see the subsystem table above and `plans/subsystems/i2p-router-integration-roadmap.md`.
+| Plan | Status | Blocker |
+|---|---|---|
+| Bouncer Core M005-B / Plan 021 — Durable Detached-Channel Policy | blocked | Plan 020 closure |
+| Bouncer Core M005-C / Plan 022 — Presence and Preferred-Nick Policy | blocked | Plan 021 closure |
+| Bouncer Core M005-D / Plan 023 — Bouncer Networks and Local IRC Administration | blocked | Plan 022 closure |
+| Bouncer Core M005-E / Plan 024 — Indexed History Search and CHATHISTORY Completion | blocked | Plan 023 closure |
+| Bouncer Core M005-F / Plan 025 — Downstream IRCv3 Protocol Polish | blocked | Plan 024 closure |
+| Bouncer Core M005-G / Plan 026 — Richer IRCv3 Member-State Mediation | blocked | Plan 025 closure |
+| Bouncer Core M005-H / Plan 027 — Operator Diagnostics, Configuration Snapshots, and Constrained Registration Actions | blocked | Plan 026 closure |
+| Bouncer Core M005-I / Plan 028 — Integrated Mature-Bouncer Qualification and M005 Closure | blocked | Plan 027 closure |
+
+Router integration remains blocked on M005 closure; see the subsystem table and plans/subsystems/i2p-router-integration-roadmap.md.
 
 ## Unplanned later milestones
 
-M004 is fully decomposed, registered and closed; its open findings are owned by Corrective
-019. Only later roadmap milestones remain intentionally unplanned.
+M004 is fully closed and M005 is now fully decomposed into registered Plans 020-028. Only Plan 020 is ready.
 
-- Bouncer Core M005 — mature operator feature set;
-- Router R001 — portable SAM adapter/cross-router qualification;
+The later router milestones remain intentionally outside this handoff:
+
+- Router R001 — portable SAM adapter/cross-router qualification, blocked on M005 closure;
 - Router R002 — i2pr managed-app adapter;
 - Router R003 — optional scoped Proposal 170/control integration.
 
-Do not create implementation code for these merely from their roadmap descriptions. Research may continue, but implementation handoffs must be written/refreshed against the then-current repository state and dependency closures.
+Do not skip a registered M005 dependency gate or begin router implementation merely from the long-term roadmap.
 
 ## Accepted architecture decisions
 
@@ -83,6 +92,7 @@ Do not create implementation code for these merely from their roadmap descriptio
 |---|---|---|
 | plans/adrs/ADR-0001-i2p-only-upstream-and-router-adapter-boundary.md | accepted | Upstream IRC authority is structurally I2P-only through I2pStreamProvider; SAM/i2pr are adapters; Proposal 170 is separate optional control plane. |
 | plans/adrs/ADR-0002-bounded-sqlite-persistence-history-order-and-session-identity.md | accepted | M003 uses an owned bounded rusqlite worker; durable DesiredState/history/cursors remain separate from live ObservedState; HistoryEventId is canonical order; SessionId is ephemeral and distinct from durable ClientId. |
+| plans/adrs/ADR-0003-process-runtime-control-and-pre-bind-downstream-admission.md | accepted | M005 adds a bounded process RuntimeController and pre-bind DownstreamAdmission; a selected session transfers exactly once into the existing NetworkOwner, which remains the bound data-path owner. |
 
 ## Research authority
 
@@ -91,6 +101,7 @@ Current foundation research:
 - plans/research/001-bouncer-and-i2p-foundation.md
 - plans/research/004-m003-storage-multiclient-history-research.md
 - plans/research/005-m004-anonymity-and-adverse-network-research.md
+- plans/research/006-m005-mature-bouncer-and-control-session-research.md
 
 Important retained conclusions:
 
@@ -104,16 +115,10 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Plan or research only:
+Implement only:
 
-- bouncer-core M005 — no implementation plan exists yet.
+- plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md
 
-Corrective 019 is closed (`plans/closure/bouncer-core/019-status.md`). It left M004 with no
-open findings: it gated the duplicate network owner out of the shipped API, deleted an
-unenforced stale constant, repaired a vacuous qualification campaign into one whose bound is
-mutation-verified, and ported two production behaviours that had previously been tested only
-by the code being gated.
+Research 006 and ADR-0003 freeze the control-session/runtime ownership needed by M005. Plan 020 adds process control and pre-bind admission without moving bound-session or upstream ownership out of NetworkOwner.
 
-M005 was never blocked by Corrective 019 and its scope is unchanged by it. Router
-integration remains blocked behind M005, and no router-specific implementation is authorized
-by M004 closure alone.
+Plans 021-028 are registered but blocked behind sequential closure gates. Router integration remains blocked behind M005 closure, and no router-specific implementation is authorized by the M004 closure or the M005 planning handoff.
