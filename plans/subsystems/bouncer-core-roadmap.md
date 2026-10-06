@@ -19,6 +19,7 @@ Post-closure corrective authority:
 
 - plans/subsystems/bouncer-core-m002-lifecycle-corrective-addendum.md
 - plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md
+- plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md
 
 Pre-M003 gates:
 
