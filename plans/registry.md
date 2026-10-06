@@ -26,20 +26,21 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M004-B ready | Corrective 014 and M004-A closed. M004-B is unblocked; M004-C waits on it. UF-015-1 (a legacy duplicate network implementation) is recorded and non-blocking. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M004-C ready | Corrective 014, M004-A, and M004-B closed. M004-C is unblocked; M004-D waits on it. UF-015-1 (a legacy duplicate network implementation) is recorded and non-blocking. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M004-B / Plan 016 — Global Reconnect Budget | ready | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/016-status.md |
+| Bouncer Core M004-C / Plan 017 — Adverse-Network and Resource Qualification | ready | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/017-status.md |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M004-B / Plan 016 — Global Reconnect Budget | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/016-status.md |
 | Bouncer Core M004-A / Plan 015 — Anonymity Protocol Mediation | closed | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/015-status.md |
 | Bouncer Core Corrective 014 — Live Multi-Client Response Routing | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/014-status.md |
 | Bouncer Core Corrective 013 — Post-M003 IRCv3 Time/History and Queue-Integrity Conformance | closed | invariant + protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/013-status.md |
@@ -60,9 +61,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M004-A — Anonymity Protocol Mediation | blocked | Corrective 014 closure | plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md |
-| Bouncer Core M004-B — Global Reconnect Budget and Fair Scheduling | blocked | Corrective 014 closure | plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md |
-| Bouncer Core M004-C — Adverse-Network and Resource Qualification | blocked | Plans 015 and 016 closure | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md |
 | Bouncer Core M004-D — Integrated Anonymity Qualification and M004 Closure | blocked | Plan 017 closure | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md |
 
 ## Unplanned later milestones
@@ -105,15 +103,13 @@ Important retained conclusions:
 
 Implement only:
 
-- `plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md`
+- `plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md`
 
-Corrective 014 owns UF-013-1 and makes the existing ResponseRouter live on the real client/upstream path. It must prove labeled-response translation and bounded WHOIS/WHO/NAMES/LIST fallback deliver replies only to the requesting SessionId.
+Plan 017 owns adverse-network and resource qualification: bounded behaviour under hostile
+inputs, stalled and flapping upstreams, resource ceilings, and the qualification evidence
+that M004-D integrates. Corrective 014, M004-A, and M004-B are closed, so 017's stated
+precondition is satisfied.
 
-After Corrective 014 closes, Plans 015 and 016 may proceed independently/in parallel:
-
-- `plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md`
-- `plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md`
-
-Plan 017 waits on both, and Plan 018 is the integrated M004 qualification/closure pass.
+Plan 018 is the integrated M004 qualification and closure pass, and remains blocked on 017.
 
 M005 remains sequenced behind full M004 closure, and router integration remains blocked behind M005.
