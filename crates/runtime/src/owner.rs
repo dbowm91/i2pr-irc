@@ -14,11 +14,13 @@
 use crate::{
     CONNECT_TIMEOUT, CONTROL_QUEUE_CAPACITY, IntentClass, NORMAL_QUEUE_CAPACITY, OutboundIntent,
     REGISTRATION_TIMEOUT, RuntimeError,
+    capability::UpstreamCapabilities,
     catalog::SupervisorCommand,
     downstream::DownstreamDisposition,
     journal::IngestOutcome,
     playback::PlaybackOutcome,
     projection,
+    routing::ResponseRouter,
     session::{
         SESSION_EVENT_QUEUE_CAPACITY, SessionEvent, SessionHandle, SessionIntent, SessionTask,
     },
@@ -175,6 +177,10 @@ pub struct NetworkSnapshot {
     /// Lines dropped because the ingestion queue was full.
     pub history_dropped: u64,
     /// Events confirmed delivered to clients by automatic backlog.
+    /// Negotiated upstream capabilities, as a bounded fingerprint. Never a payload.
+    pub upstream_capabilities: String,
+    /// Routes currently open for this generation. Never durable.
+    pub response_routes: usize,
     pub backlog_delivered: u64,
     /// True when more retained history exists beyond what the cap delivered.
     pub backlog_truncated: bool,
@@ -362,7 +368,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let mut ubuf = [0u8; 2048];
         let mut welcomed = false;
         let mut cap_finished = false;
-        let mut offered = std::collections::BTreeSet::new();
+        // Upstream capability negotiation is generation-owned and downstream-client
+        // independent: it is a pure function of what the server offered.
+        let mut upstream_caps = UpstreamCapabilities::default();
         let mut sasl_plain_offered = false;
         let mut requested = false;
         let mut sasl_active = false;
@@ -405,13 +413,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     match command.as_str() {
                         "CAP" if params.iter().any(|p| p == "LS") => {
                             let capabilities = params.last().map(String::as_str).unwrap_or("");
-                            offered.extend(capabilities.split_whitespace().map(|item| {
-                                item.trim_start_matches(':')
-                                    .split('=')
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_owned()
-                            }));
+                            for token in capabilities.split_whitespace() {
+                                upstream_caps.note_offer(token.trim_start_matches(':'));
+                            }
                             sasl_plain_offered |= capabilities.split_whitespace().any(|item| {
                                 item.strip_prefix("sasl=").is_some_and(|mechanisms| {
                                     mechanisms
@@ -422,17 +426,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             let continuation = params.get(2).is_some_and(|p| p == "*");
                             if !requested && !continuation {
                                 if self.context.record.sasl.is_some()
-                                    && (!offered.contains("sasl") || !sasl_plain_offered)
+                                    && (!upstream_caps.was_offered("sasl") || !sasl_plain_offered)
                                 {
                                     return Err(RuntimeError::Registration);
                                 }
-                                let wanted: Vec<&str> = if self.context.record.sasl.is_some()
-                                    && offered.contains("sasl")
+                                // The requested set is the reviewed foundational set
+                                // plus SASL when configured. It never depends on an
+                                // attached client, because upstream negotiation happens
+                                // once per generation while clients attach freely.
+                                let mut wanted = upstream_caps.request_set();
+                                if self.context.record.sasl.is_some()
+                                    && upstream_caps.was_offered("sasl")
                                 {
-                                    vec!["sasl"]
-                                } else {
-                                    Vec::new()
-                                };
+                                    wanted.insert(0, "sasl".to_owned());
+                                }
                                 if wanted.is_empty() {
                                     send(&mut uw, "CAP END\r\n").await?;
                                     cap_finished = true;
@@ -444,9 +451,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             }
                         }
                         "CAP" if params.iter().any(|p| p == "ACK") => {
-                            let sasl_accepted = params
-                                .iter()
-                                .any(|p| p.split_whitespace().any(|cap| cap.starts_with("sasl")));
+                            for token in params.iter().flat_map(|p| p.split_whitespace()) {
+                                upstream_caps.note_enabled(token);
+                            }
+                            let sasl_accepted = upstream_caps.is_enabled("sasl");
                             if self.context.record.sasl.is_some() && !sasl_accepted {
                                 return Err(RuntimeError::Registration);
                             }
@@ -465,6 +473,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             return Err(RuntimeError::Registration);
                         }
                         "CAP" if params.iter().any(|p| p == "NAK") => {
+                            // A NAK means the server refused something we asked for. The
+                            // non-SASL capabilities are optional, so negotiation simply
+                            // proceeds with whatever was granted.
                             send(&mut uw, "CAP END\r\n").await?;
                             cap_finished = true;
                         }
@@ -539,6 +550,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             snapshot.generation = Some(generation);
             snapshot.last_error = None;
             snapshot.reconnect_attempt = 0;
+            snapshot.upstream_capabilities = upstream_caps.fingerprint();
+            // Routes are generation-local, so a fresh generation starts with none.
+            snapshot.response_routes = 0;
         });
         self.publish_state(&state);
 
@@ -587,6 +601,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             }
         }
         let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestItem>(INGEST_QUEUE_CAPACITY);
+        // Response routing is generation-local and SessionId-scoped. It is created per
+        // generation, so nothing can survive into a different connection.
+        let mut router = ResponseRouter::default();
         // Attachments that arrived while this generation was starting.
         for (session, client, stream) in pending_attach.drain(..).take(MAX_SESSIONS_PER_NETWORK) {
             attach_session(
@@ -636,6 +653,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         generation,
                         &mut journal,
                         &buffers,
+                        &mut router,
                     )
                     .await;
                 }
@@ -685,6 +703,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                 }
                 _ = probe.tick() => {
+                    // Expired routes release their slots deterministically, so a slow
+                    // server cannot wedge the router.
+                    let expired = router.expire(std::time::Instant::now());
+                    if expired > 0 {
+                        self.snapshot
+                            .send_modify(|snapshot| snapshot.response_routes = router.open_routes());
+                    }
                     if awaiting_pong.as_ref().is_some_and(|(since, _)| since.elapsed() >= crate::LIVENESS_DEADLINE) {
                         break Err(RuntimeError::Timeout);
                     }
@@ -754,6 +779,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 }
             }
             self.snapshot.send_modify(|snapshot| {
+                snapshot.response_routes = router.open_routes();
                 snapshot.upstream_normal_queue_depth = NORMAL_QUEUE_CAPACITY - normal_tx.capacity();
                 snapshot.upstream_control_queue_depth =
                     CONTROL_QUEUE_CAPACITY - control_tx.capacity();
@@ -940,6 +966,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         generation: ConnectionGeneration,
         journal: &mut crate::journal::HistoryJournal,
         buffers: &BTreeMap<String, BufferId>,
+        router: &mut ResponseRouter,
     ) {
         match event {
             SessionEvent::Ended {
@@ -949,6 +976,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 if let Some(task) = sessions.remove(&session) {
                     task.shutdown().await;
                 }
+                // A detached client must never receive a reply that arrives later, even
+                // if the server is slow. Dropping its routes is what guarantees that.
+                router.drop_session(session);
                 self.snapshot.send_modify(|snapshot| {
                     snapshot.sessions_ended = snapshot.sessions_ended.saturating_add(1);
                     snapshot.last_session_disposition = Some(disposition.class());
@@ -989,6 +1019,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         if let Some(task) = sessions.remove(&session) {
                             task.shutdown().await;
                         }
+                        router.drop_session(session);
                         self.snapshot.send_modify(|snapshot| {
                             snapshot.sessions_ended = snapshot.sessions_ended.saturating_add(1);
                             snapshot.last_session_disposition =

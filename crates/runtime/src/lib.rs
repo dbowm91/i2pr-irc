@@ -4,12 +4,15 @@
 //! across connection generations. `LocalAcceptor` supplies at most one disposable
 //! downstream view at a time; client attachment is never a precondition for the
 //! upstream session and client detach never ends the upstream generation.
+pub mod capability;
 pub mod catalog;
 pub mod downstream;
+pub mod ircv3;
 pub mod journal;
 pub mod owner;
 pub mod playback;
 pub mod projection;
+pub mod routing;
 pub mod session;
 pub mod state;
 

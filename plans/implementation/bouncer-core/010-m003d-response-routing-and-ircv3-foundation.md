@@ -1,6 +1,6 @@
 # Bouncer Core M003-D — Response Routing and Foundational IRCv3 Mediation
 
-Status: ready for handoff
+Status: closed — see `plans/closure/bouncer-core/010-status.md`
 
 Blocker cleared:
 

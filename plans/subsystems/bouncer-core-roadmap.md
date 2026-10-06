@@ -319,7 +319,7 @@ Implementation decomposition:
 5. M003-E / Plan 011 — chathistory/read-marker adapters.
 6. M003-F / Plan 012 — integrated qualification and M003 closure.
 
-Only the earliest dependency-ready plan is executable at a time. Plans 007-009 are closed in `plans/closure/bouncer-core/007-status.md`, `008-status.md`, and `009-status.md`; Plan 010 is the current executable plan and Plans 011-012 remain blocked on their direct predecessor closure.
+Only the earliest dependency-ready plan is executable at a time. Plans 007-010 are closed in `plans/closure/bouncer-core/007-status.md` through `010-status.md`; Plan 011 is the current executable plan and Plan 012 remains blocked on its direct predecessor closure.
 
 Deliverable boundary:
 
