@@ -26,20 +26,21 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M004-D ready | Corrective 014, M004-A, M004-B and M004-C closed. M004-D is unblocked and closes the milestone. UF-015-1 (a legacy duplicate network implementation) and UF-017-1 (an uninjectable reconnect backoff) are recorded and non-blocking. |
+| Bouncer core | active | plans/subsystems/bouncer-core-roadmap.md | M005 planning eligible | Corrective 014 and M004-A/B/C/D are closed, so M004 is complete. UF-015-1 (a legacy duplicate network implementation) and UF-017-1 (an uninjectable reconnect backoff) are recorded and non-blocking. No implementation plan is registered yet; M005 requires planning/research before a handoff may be written. |
 | I2P router integration | proposed / blocked | plans/subsystems/i2p-router-integration-roadmap.md | R001 blocked | Canonical ordering requires bouncer-core M005 before portable SAM implementation. R002 additionally waits on stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core M004-D / Plan 018 — Integrated Anonymity Qualification and M004 Closure | ready | invariant qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/018-status.md |
+| _None_ | — | — | — | Every registered implementation plan is closed or awaiting planning. |
 
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M004-D / Plan 018 — Integrated Anonymity Qualification and M004 Closure | closed | invariant qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/018-status.md |
 | Bouncer Core M004-C / Plan 017 — Adverse-Network and Resource Qualification | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/017-status.md |
 | Bouncer Core M004-B / Plan 016 — Global Reconnect Budget | closed | invariant + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/016-status.md |
 | Bouncer Core M004-A / Plan 015 — Anonymity Protocol Mediation | closed | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/015-status.md |
@@ -66,7 +67,8 @@ table; see the subsystem table above and `plans/subsystems/i2p-router-integratio
 
 ## Unplanned later milestones
 
-M004 is now fully decomposed and registered. Only later roadmap milestones remain intentionally unplanned.
+M004 is fully decomposed, registered and closed. Only later roadmap milestones remain
+intentionally unplanned.
 
 - Bouncer Core M005 — mature operator feature set;
 - Router R001 — portable SAM adapter/cross-router qualification;
@@ -102,13 +104,12 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Implement only:
+No implementation plan is currently authorized. M004 is closed at
+`plans/closure/bouncer-core/018-status.md`.
 
-- `plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md`
+The next eligible work is M005 planning and research. A plan cannot be written until the
+milestone is decomposed against the repository state that M004 closure produced; when one
+exists it must be registered here before implementation begins.
 
-Plan 018 is the integrated M004 qualification and closure pass. It runs the privacy,
-routing, reconnect-budget and durable-state properties together against the integrated
-subsystems, and closes the milestone. Corrective 014, M004-A, M004-B and M004-C are
-closed, so 018's stated precondition is satisfied.
-
-M005 remains sequenced behind full M004 closure, and router integration remains blocked behind M005.
+Router integration remains blocked behind M005, and no router-specific implementation is
+authorized by M004 closure alone.

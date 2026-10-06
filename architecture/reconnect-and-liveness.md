@@ -9,3 +9,7 @@ A failed local accept is a local-only failure. It leaves the generation online, 
 Explicit stop raises a shutdown fence before sending its single bounded upstream `QUIT`, so no queued user traffic reaches the network after the fence. Failed generations are aborted instead, and user messages are never queued across the failure boundary.
 
 The implementation uses Tokio's monotonic timer for these runtime deadlines. Paused-time integration tests advance the online probe with no client attached and prove a missing matching PONG causes a fresh generation. The M001 core `Clock`/`Timer` abstraction remains available for a later runtime adapter.
+
+Backoff bounds how often *one* Network retries. It does nothing about the case that
+actually hurts on a router restart, where every Network fails together and retries together.
+A process-wide `ReconnectScheduler` gates that separately — see `reconnect-budget.md`.

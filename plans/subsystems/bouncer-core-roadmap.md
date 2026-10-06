@@ -126,7 +126,7 @@ A post-closure source/specification review against the current IRCv3 documents f
 
 Corrective 013 owned these findings and has now closed them; see `plans/closure/bouncer-core/013-status.md`. Historical M003 evidence remains useful and was not rewritten.
 
-Research 005 decomposes M004 and promotes the unresolved response-routing finding UF-013-1 into Corrective 014. M004 now has registered handoffs: Corrective 014 first, M004-A and M004-B after it, M004-C after both, and M004-D for integrated closure. No M004 implementation may skip that sequence.
+Research 005 decomposed M004 and promoted the unresolved response-routing finding UF-013-1 into Corrective 014. The registered sequence was Corrective 014, then M004-A and M004-B, then M004-C, then M004-D for integrated closure; no M004 implementation skipped it, and all five handoffs are now closed.
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
@@ -233,7 +233,7 @@ Dependency classes:
 
 - M002 has a hard dependency on M001.
 - M003 depends on historical M002 completion and Corrective 004, plus three pre-M003 gates that are all closed: Corrective 005, Corrective 006 (raised by the Research 002 corpus), and the Research 002 conformance/decision dependency with no unresolved M003-affecting correctness defect.
-- M004 has a hard dependency on M003 plus the post-M003 correctness gates. Corrective 014 was the direct prerequisite and is closed; M004-A and M004-B then proceeded independently and are both closed; M004-C required both and is closed; M004-D is ready and closes the milestone.
+- M004 had a hard dependency on M003 plus the post-M003 correctness gates. Corrective 014 was the direct prerequisite and is closed; M004-A and M004-B then proceeded independently and are both closed; M004-C required both and is closed; M004-D closed the milestone. M004 is complete.
 - M005 has a hard dependency on M004.
 - Router integration has a hard dependency on M005 under the canonical phase ordering.
 - External router interoperability fixtures are operational dependencies for router claims, not core M001-M005.
@@ -399,10 +399,13 @@ Implementation decomposition:
 2. M004-A / Plan 015 — anonymity protocol mediation. **Closed**; see `plans/closure/bouncer-core/015-status.md`.
 3. M004-B / Plan 016 — global reconnect budget and fair scheduling. **Closed**; see `plans/closure/bouncer-core/016-status.md`.
 4. M004-C / Plan 017 — adverse-network/resource qualification. **Closed**; see `plans/closure/bouncer-core/017-status.md`.
-5. M004-D / Plan 018 — integrated anonymity qualification and M004 closure. **Ready**.
+5. M004-D / Plan 018 — integrated anonymity qualification and M004 closure. **Closed**; see `plans/closure/bouncer-core/018-status.md`.
 
-Corrective 014, M004-A, M004-B, and M004-C are all closed, so M004-D is unblocked and closes
-the milestone. M004-C added the process-wide baseline/peak/settled resource reading, exposed
+All five M004 handoffs are closed, so M004 is complete. M004-D ran the cross-subsystem
+claims that no single mechanism suite can catch — the CLIENTTAGDENY advertisement against the
+mediator that enforces it, the upstream-fingerprint sweep across the projection, the CTCP
+auto-answer and the diagnostics, and the structural proof that no raw-protocol logging sink
+exists — and reconciled the documentation. M004-C added the process-wide baseline/peak/settled resource reading, exposed
 the one routing gauge nothing had reported, and put the connect budget and its backoff on a
 single clock so an integrated campaign can run under pinned virtual time. The three defects
 those campaigns found, and the reused section 4/6 evidence, are recorded in its closure
@@ -596,9 +599,9 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M003-F / Plan 012 | closed | plans/implementation/bouncer-core/012-m003f-integrated-qualification-and-closure.md | plans/closure/bouncer-core/012-status.md | none |
 | C004 / Corrective 013 | closed | plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md | plans/closure/bouncer-core/013-status.md | UF-013-1 promoted to Corrective 014 |
 | C005 / Corrective 014 | closed | plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md | plans/closure/bouncer-core/014-status.md | none |
-| M004 | active | plans 016-018 | future plans/closure/bouncer-core/018-status.md | Corrective 014, M004-A, M004-B and M004-C closed |
+| M004 | closed | plans 014-018 | plans/closure/bouncer-core/018-status.md | Corrective 014, M004-A, M004-B, M004-C and M004-D closed |
 | M004-A / Plan 015 | closed | plans/implementation/bouncer-core/015-m004a-anonymity-protocol-mediation.md | plans/closure/bouncer-core/015-status.md | Corrective 014 closed |
 | M004-B / Plan 016 | closed | plans/implementation/bouncer-core/016-m004b-global-reconnect-budget.md | plans/closure/bouncer-core/016-status.md | Corrective 014 closed |
 | M004-C / Plan 017 | closed | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closed |
-| M004-D / Plan 018 | ready | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | future plans/closure/bouncer-core/018-status.md | Plan 017 closure |
-| M005 | not started | future | future | M004 closure |
+| M004-D / Plan 018 | closed | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | plans/closure/bouncer-core/018-status.md | Plan 017 closure |
+| M005 | not started — planning/research eligible | future | future | M004 closure satisfied |
