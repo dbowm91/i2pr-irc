@@ -94,13 +94,19 @@ pub use crate::state::{
 
 pub const NORMAL_QUEUE_CAPACITY: usize = 64;
 pub const CONTROL_QUEUE_CAPACITY: usize = 8;
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Ceiling on acquiring one upstream stream from [`I2pStreamProvider`].
+///
+/// Renamed from `CONNECT_TIMEOUT` because "connect" stopped meaning generic TCP when the
+/// SAM adapter landed: the wait now covers a router-side cold path that can include
+/// building a lease set and a tunnel pool. 120 s was shorter than that path, so a
+/// working router could be reported as failing.
+pub const PROVIDER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(180);
 pub const CAP_SASL_TIMEOUT: Duration = Duration::from_secs(90);
 pub const MAX_CREDENTIAL_BYTES: usize = 1024;
 /// Ceiling on releasing one Network's provider scope.
 ///
-/// Deliberately far below [`CONNECT_TIMEOUT`]: release runs on the deletion and
+/// Deliberately far below [`PROVIDER_ACQUIRE_TIMEOUT`]: release runs on the deletion and
 /// shutdown paths, where the caller is already waiting for the Network to go away.
 /// Reusing the connect budget would let a wedged router adapter hold a delete open for
 /// two minutes per Network, and shutdown has no timeout of its own at all.
@@ -406,7 +412,7 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
             self.set_phase(Phase::Connecting, Some(ConnectionGeneration(generation)));
             let connection = tokio::select! {
                 _ = stopped(&mut stop) => { self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation))); return Ok(()) },
-                result = timeout(CONNECT_TIMEOUT, self.provider.connect(self.network, &self.config.endpoint)) => {
+                result = timeout(PROVIDER_ACQUIRE_TIMEOUT, self.provider.connect(self.network, &self.config.endpoint)) => {
                     match result { Ok(Ok(stream)) => Ok(stream), Ok(Err(e)) => Err(RuntimeError::Provider(e)), Err(_) => Err(RuntimeError::Timeout) }
                 }
             };

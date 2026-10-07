@@ -27,11 +27,12 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
 };
 
 /// The only address the fake ever binds.
@@ -39,6 +40,14 @@ use tokio::{
 /// A named constant so the boundary scan and this test can both assert it, and so a
 /// future edit that widens the bind has exactly one place to change.
 pub const FAKE_BIND: &str = "127.0.0.1:0";
+
+/// Ceiling on streams the bridge will hold open for a test to drive.
+///
+/// Explicit because the registry is a collection fed by network-triggered events. A test
+/// that exceeded it is not testing anything the plan asked for, and the bridge records the
+/// refusal rather than growing — so `FakeIrcPeer::refused` is a checkable assertion rather
+/// than an assumption.
+pub const MAX_ESTABLISHED_STREAMS: usize = 64;
 
 /// A loopback endpoint nothing is listening on.
 ///
@@ -58,29 +67,93 @@ pub async fn absent_endpoint() -> crate::endpoint::SamBridgeEndpoint {
         .expect("a bound loopback address is a valid bridge endpoint")
 }
 
-/// A scripted reply sequence.
+/// What the bridge answers to one kind of request.
+///
+/// Keyed by request verb rather than by arrival order. Order-keyed scripting was tried
+/// first and it does not work for the provider: two Networks connecting concurrently
+/// interleave their sockets, so a single queue hands one Network the other's reply and the
+/// test fails for a reason that has nothing to do with the claim under test. Keying by verb
+/// makes each reply independent of how the connections interleave.
 #[derive(Debug, Clone, Default)]
 pub struct Script {
-    /// Replies, in order, written back after each request is read.
-    pub replies: Vec<Vec<u8>>,
-    /// Whether to close the connection after the last reply.
+    /// Replies for a `HELLO`, in order. A second `HELLO` on the same connection takes the
+    /// second entry.
+    pub hello: Vec<Vec<u8>>,
+    /// Replies for a `SESSION CREATE`.
+    pub session: Vec<Vec<u8>>,
+    /// Replies for a `STREAM CONNECT`.
+    pub stream: Vec<Vec<u8>>,
+    /// Sent once every scripted reply is exhausted, with no request to trigger it.
+    pub trailing: Vec<u8>,
+    /// Whether to hang up once every scripted reply has been served.
     ///
-    /// Set for the "control close" case. A bridge that hangs up is a real router
-    /// behaviour, and the client must surface it as a closed connection rather than
-    /// waiting for a deadline.
+    /// Across the whole script rather than scoped to `STREAM CONNECT`. Both shapes a test
+    /// needs are the same shape — "the bridge has said all it is going to say, then the
+    /// connection ends" — and the two differ only in how many replies precede it. One with
+    /// an empty `stream` script closes right after the session create, which is what a
+    /// router dropping a control socket mid-exchange looks like; one with a scripted
+    /// stream closes after the trailing payload, which is a completed stream ending.
+    ///
+    /// A request with nothing scripted for it does not trigger the close: silence is a
+    /// separate behaviour, and conflating the two would make a deadline test unable to
+    /// distinguish "the router is not answering" from "the router hung up".
     pub close_after: bool,
+    /// Whether to hang up on the connection that answered a `SESSION CREATE`.
+    ///
+    /// Separate from `close_after` because the two describe different failures. This one
+    /// is the router dropping a control socket while the session is still nominally fine,
+    /// which the provider can only notice by watching the socket; `close_after` is the
+    /// bridge reaching the end of everything it had to say.
+    pub close_after_session: bool,
     /// Write each reply one byte at a time.
     ///
-    /// Forces the client's partial-read path to reassemble, which is otherwise easy to
-    /// leave untested on a loopback socket that always delivers whole writes.
+    /// Forces the client's partial-read path to reassemble, which a loopback socket that
+    /// delivers whole writes would otherwise never exercise.
     pub fragment: bool,
-    /// Sent on the last connection once the last reply has been written, without being
-    /// preceded by a request.
+}
+
+impl Script {
+    /// A bridge that answers `streams` connects from **one** Network.
     ///
-    /// This is how raw application data gets onto a socket that has already answered
-    /// `STREAM STATUS RESULT=OK`. A reply list alone cannot express it, because after
-    /// the stream status there is no further request to trigger the next reply.
-    pub trailing: Vec<u8>,
+    /// This is what a healthy provider connect costs: each connect is two sockets, and
+    /// each socket says `HELLO`, so `streams` connects need `2 * streams` hellos. The
+    /// original allocation of `streams + 1` was right only for a single connect and ran
+    /// the script dry on the second, where the client then waited out its full hello
+    /// deadline and the test reported a ten-second stall instead of a missing reply.
+    ///
+    /// Only one `SESSION CREATE` is scripted, because that is the property under test:
+    /// reconnecting does **not** mean re-identifying. A test that needs several Networks
+    /// says so with an explicit script, since the number of sessions is precisely what it
+    /// is asserting about.
+    pub fn healthy(streams: usize) -> Self {
+        Self {
+            hello: (0..streams.saturating_mul(2)).map(|_| hello_ok()).collect(),
+            session: vec![session_ok_with_destination()],
+            stream: (0..streams).map(|_| stream_ok()).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// A bridge that answers one session and `streams` connects per Network, for
+    /// `networks` Networks.
+    ///
+    /// The join the single-verb script cannot express: N Networks means N sessions, and
+    /// getting it wrong would silently collapse the very distinction the test exists to
+    /// draw.
+    pub fn scoped(networks: usize, streams: usize) -> Self {
+        Self {
+            hello: (0..networks.saturating_mul(streams).saturating_mul(2))
+                .map(|_| hello_ok())
+                .collect(),
+            session: (0..networks)
+                .map(|_| session_ok_with_destination())
+                .collect(),
+            stream: (0..networks.saturating_mul(streams))
+                .map(|_| stream_ok())
+                .collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// What the fake observed.
@@ -115,6 +188,7 @@ pub struct FakeBridge {
     addr: SocketAddr,
     observed: Arc<Observed>,
     connections: Arc<AtomicUsize>,
+    peer: Arc<FakeIrcPeer>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -129,16 +203,22 @@ impl FakeBridge {
             .expect("the bound address is readable");
         let observed = Arc::new(Observed::default());
         let connections = Arc::new(AtomicUsize::new(0));
+        let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(FakeIrcPeer::new(Arc::clone(&streams), Arc::clone(&refused)));
         let handle = tokio::spawn(serve(
             listener,
             script,
             Arc::clone(&observed),
             Arc::clone(&connections),
+            streams,
+            refused,
         ));
         Self {
             addr,
             observed,
             connections,
+            peer,
             handle,
         }
     }
@@ -158,6 +238,11 @@ impl FakeBridge {
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
+
+    /// The IRC side of every stream this bridge has established.
+    pub fn peer(&self) -> Arc<FakeIrcPeer> {
+        Arc::clone(&self.peer)
+    }
 }
 
 impl Drop for FakeBridge {
@@ -171,63 +256,135 @@ async fn serve(
     script: Script,
     observed: Arc<Observed>,
     connections: Arc<AtomicUsize>,
+    streams: Arc<std::sync::Mutex<Vec<Stream>>>,
+    refused: Arc<AtomicUsize>,
 ) {
     let fragment = script.fragment;
-    let replies = script.replies.clone();
     let close_after = script.close_after;
-    let trailing = Arc::new(script.trailing.clone());
-    while let Ok((mut stream, _)) = listener.accept().await {
+    let close_after_session = script.close_after_session;
+    let trailing = script.trailing;
+    // One shared, mutex-guarded cursor per verb. Shared because the provider opens
+    // several sockets concurrently and a per-connection cursor would let each replay the
+    // whole script from the beginning.
+    let hello = Cursor::new(script.hello);
+    let session = Cursor::new(script.session);
+    let stream = Cursor::new(script.stream);
+    while let Ok((mut socket, _)) = listener.accept().await {
         connections.fetch_add(1, Ordering::SeqCst);
-        let replies = replies.clone();
+        let hello = Arc::clone(&hello);
+        let session = Arc::clone(&session);
+        let stream = Arc::clone(&stream);
         let observed = Arc::clone(&observed);
-        // Shared rather than cloned per accept: the loop moves its binding into the
-        // first connection task, so an outer `Arc` is what leaves one for the second.
-        let trailing = Arc::clone(&trailing);
+        let trailing = trailing.clone();
+        let streams = Arc::clone(&streams);
+        let refused = Arc::clone(&refused);
         tokio::spawn(async move {
             let mut reader = LineAccumulator::default();
             let mut chunk = [0u8; 512];
-            let mut index = 0usize;
             loop {
-                // Answer only once a whole request line has arrived, so the client
-                // cannot receive a reply before it has finished sending.
-                if reader
-                    .take_line()
-                    .map(|line| {
-                        observed.record(line);
-                        true
-                    })
-                    .unwrap_or(false)
-                    && index < replies.len()
-                {
-                    let reply = replies[index].clone();
-                    index += 1;
-                    if fragment {
-                        for byte in reply {
-                            if stream.write_all(&[byte]).await.is_err() {
-                                return;
-                            }
-                        }
-                    } else if stream.write_all(&reply).await.is_err() {
-                        return;
+                // Answer only once a whole request line has arrived, so the client cannot
+                // receive a reply before it has finished sending.
+                let Some(request) = reader.take_line() else {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(count) => reader.push(&chunk[..count]),
                     }
-                    if index == replies.len() && !trailing.is_empty() {
-                        // The exchange is over; what remains is application data.
-                        let _ = stream.write_all(&trailing).await;
-                        if close_after {
+                    continue;
+                };
+                observed.record(request.clone());
+                let reply = if request.starts_with("HELLO") {
+                    hello.take()
+                } else if request.starts_with("SESSION CREATE") {
+                    session.take()
+                } else if request.starts_with("STREAM CONNECT") {
+                    stream.take()
+                } else {
+                    None
+                };
+                let Some(reply) = reply else {
+                    // Nothing scripted for this request. Staying silent is a real router
+                    // behaviour and is what the deadline tests need.
+                    continue;
+                };
+                // Whether this reply was the last one the script had to give.
+                //
+                // Checked across every verb, so a script that never scripted a stream
+                // still closes once the session create is answered — the case that has
+                // to read as a hang-up rather than as a router that stopped talking.
+                let script_spent = hello.is_empty() && session.is_empty() && stream.is_empty();
+                // Captured before the write, because the fragmented path consumes `reply`.
+                let acknowledged_stream = reply.starts_with(b"STREAM STATUS RESULT=OK");
+                if fragment {
+                    for byte in reply {
+                        if socket.write_all(&[byte]).await.is_err() {
                             return;
                         }
                     }
-                    if close_after && index == replies.len() {
+                } else if socket.write_all(&reply).await.is_err() {
+                    return;
+                }
+                // Trailing bytes belong to the connection that just reached `RESULT=OK`.
+                // Attaching them to any other reply would put application data into the
+                // middle of an exchange. Written *before* the close, because a close
+                // immediately after `RESULT=OK` would cut the payload short — and a
+                // truncated payload is exactly the failure this fixture exists to detect.
+                if !trailing.is_empty() && acknowledged_stream {
+                    let _ = socket.write_all(&trailing).await;
+                }
+                if close_after_session && request.starts_with("SESSION CREATE") {
+                    return;
+                }
+                if close_after && script_spent {
+                    return;
+                }
+                // An acknowledged stream stops being protocol and becomes an IRC
+                // conversation, so hand the socket to the test rather than looping on it.
+                // Registering after the write is what guarantees a test that saw
+                // `RESULT=OK` can find the socket without polling for it.
+                if acknowledged_stream && socket.flush().await.is_ok() {
+                    let mut registry = streams.lock().expect("the stream registry is writable");
+                    if registry.len() >= MAX_ESTABLISHED_STREAMS {
+                        refused.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
-                    continue;
-                }
-                match stream.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(count) => reader.push(&chunk[..count]),
+                    registry.push(Arc::new(tokio::sync::Mutex::new((
+                        socket,
+                        IrcSide::default(),
+                    ))));
+                    return;
                 }
             }
         });
+    }
+}
+
+/// A shared, bounded queue of scripted replies for one request verb.
+///
+/// `take` hands out the next reply or `None`. It never blocks and never grows, so a peer
+/// that sends more requests than were scripted simply gets silence after the last one.
+#[derive(Debug)]
+struct Cursor {
+    replies: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+}
+
+impl Cursor {
+    fn new(replies: Vec<Vec<u8>>) -> Arc<Self> {
+        Arc::new(Self {
+            replies: std::sync::Mutex::new(replies.into()),
+        })
+    }
+    fn take(&self) -> Option<Vec<u8>> {
+        self.replies
+            .lock()
+            .expect("the scripted reply queue is writable")
+            .pop_front()
+    }
+    /// Whether nothing is left to answer.
+    fn is_empty(&self) -> bool {
+        self.replies
+            .lock()
+            .expect("the scripted reply queue is readable")
+            .is_empty()
     }
 }
 
@@ -280,6 +437,204 @@ pub fn stream_ok() -> Vec<u8> {
     line("STREAM STATUS RESULT=OK")
 }
 
+// --------------------------------------------------------------- the IRC side
+
+/// One established stream and the log of what the client sent over it.
+///
+/// The log is per-stream but read back merged, so a test can assert across a reconnect —
+/// "this line must never appear twice" is the whole point of the no-replay property, and
+/// inspecting one stream at a time would make a resent line look like one line on each
+/// side of a fresh connection.
+#[derive(Debug, Default)]
+struct IrcSide {
+    log: std::sync::Mutex<Vec<u8>>,
+}
+
+/// A registered stream: the socket plus its read log.
+///
+/// An async mutex because the peer holds it across a socket read, and only the test ever
+/// touches it, so there is no contention to justify anything heavier.
+type Stream = Arc<tokio::sync::Mutex<(TcpStream, IrcSide)>>;
+
+/// The far side of every stream the bridge has established.
+///
+/// This is the fake IRC upstream. Once a `STREAM CONNECT` is answered `RESULT=OK`, the
+/// socket stops being SAM and becomes an IRC conversation, so a test can drive a real
+/// `RuntimeController` end to end without a router: the runtime opens a genuine socket
+/// through the provider, and this is what it is talking to.
+pub struct FakeIrcPeer {
+    streams: Arc<std::sync::Mutex<Vec<Stream>>>,
+    refused: Arc<AtomicUsize>,
+}
+
+impl FakeIrcPeer {
+    fn new(streams: Arc<std::sync::Mutex<Vec<Stream>>>, refused: Arc<AtomicUsize>) -> Self {
+        Self { streams, refused }
+    }
+
+    fn snapshot(&self) -> Vec<Stream> {
+        self.streams
+            .lock()
+            .expect("the stream registry is readable")
+            .clone()
+    }
+
+    /// How many streams are currently established.
+    pub fn live_streams(&self) -> usize {
+        self.streams
+            .lock()
+            .expect("the stream registry is readable")
+            .len()
+    }
+
+    /// How many established streams the ceiling refused.
+    ///
+    /// Zero in a passing test. Exposed because a silently dropped stream would look to the
+    /// runtime like a router failure and so mask the defect the test was written to catch.
+    pub fn refused(&self) -> usize {
+        self.refused.load(Ordering::SeqCst)
+    }
+
+    /// Writes IRC server bytes to every established stream.
+    ///
+    /// To all of them rather than to one, because the test does not own the reconnect
+    /// schedule: whichever stream the runtime opened next is the one that receives this.
+    pub async fn send(&self, bytes: &[u8]) {
+        for stream in self.snapshot() {
+            let mut guard = stream.lock().await;
+            if guard.0.write_all(bytes).await.is_err() {
+                continue;
+            }
+            let _ = guard.0.flush().await;
+        }
+    }
+
+    /// Everything the client has sent, across every stream, in registry order.
+    ///
+    /// Merged rather than per-stream on purpose: the no-replay property is about the whole
+    /// conversation across a reconnect, and a per-stream view would make a resent line
+    /// look like one line on each side of a fresh stream.
+    pub async fn received(&self) -> Vec<u8> {
+        let mut all = Vec::new();
+        for stream in self.snapshot() {
+            let guard = stream.lock().await;
+            all.extend_from_slice(&guard.1.log.lock().expect("the IRC read log is readable"));
+        }
+        all
+    }
+
+    /// Everything the client sent on each stream, in stream order.
+    ///
+    /// This is the view the no-replay property needs. A merged log would let a line that
+    /// appeared on both sides of a reconnect look like one line; keeping the streams apart
+    /// is what makes "the new connection re-sent something the old one already sent"
+    /// expressible as an assertion rather than as an impression.
+    pub async fn received_per_stream(&self) -> Vec<Vec<u8>> {
+        let mut all = Vec::new();
+        for stream in self.snapshot() {
+            let guard = stream.lock().await;
+            all.push(
+                guard
+                    .1
+                    .log
+                    .lock()
+                    .expect("the IRC read log is readable")
+                    .clone(),
+            );
+        }
+        all
+    }
+
+    /// Whether every stream's log so far contains `needle`.
+    pub async fn contains(&self, needle: &[u8]) -> bool {
+        let needle = needle.to_vec();
+        for stream in self.snapshot() {
+            let guard = stream.lock().await;
+            let log = guard.1.log.lock().expect("the IRC read log is readable");
+            if log.windows(needle.len()).any(|window| window == needle) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reads until the client has sent something containing `needle`, or `timeout` elapses.
+    ///
+    /// Reads rather than only inspecting, because the log is populated by the reads
+    /// themselves: nothing pumps these sockets except this fixture, so a test that merely
+    /// looked at the log would wait for a reading that only it could produce.
+    pub async fn wait_for(&self, needle: &[u8], timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.contains(needle).await {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let _ = self.recv(remaining.min(POLL * 8)).await;
+        }
+    }
+
+    /// Waits until the client has sent something, or `timeout` elapses.
+    ///
+    /// Explicit pumping rather than a background reader task: a reader would need its own
+    /// half of each socket, and a read half held outside this registry is precisely what
+    /// would stop [`FakeIrcPeer::close`] from being able to close anything.
+    pub async fn recv(&self, timeout: Duration) -> Option<Vec<u8>> {
+        let streams = self.snapshot();
+        tokio::time::timeout(timeout, async {
+            loop {
+                for stream in &streams {
+                    let mut guard = stream.lock().await;
+                    let mut chunk = [0u8; 512];
+                    // A short inner poll so a stream with nothing to say cannot monopolise
+                    // the wait while another one is producing data.
+                    let Ok(result) = tokio::time::timeout(POLL, guard.0.read(&mut chunk)).await
+                    else {
+                        continue;
+                    };
+                    match result {
+                        Ok(0) | Err(_) => continue,
+                        Ok(count) => {
+                            guard
+                                .1
+                                .log
+                                .lock()
+                                .expect("the IRC read log is writable")
+                                .extend_from_slice(&chunk[..count]);
+                            return chunk[..count].to_vec();
+                        }
+                    }
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Shuts every established stream down, which the client sees as an IRC EOF.
+    ///
+    /// `shutdown` rather than dropping the socket: dropping one end of a loopback socket
+    /// leaves the connection half-open, and the runtime would then be retrying a stream
+    /// that had never ended rather than reconnecting after a genuine EOF.
+    ///
+    /// The streams stay in the registry afterwards, so a test can still read what was sent
+    /// on the connection that just died. That is the whole point for the no-replay
+    /// property — the bytes of the old connection are the evidence.
+    pub async fn close(&self) {
+        for stream in self.snapshot() {
+            let mut guard = stream.lock().await;
+            let _ = guard.0.shutdown().await;
+        }
+    }
+}
+
+/// How long one pass of [`FakeIrcPeer::recv`] waits on a single stream before moving on.
+const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn the_fake_records_requests_and_counts_connections() {
         let bridge = FakeBridge::start(Script {
-            replies: vec![hello_ok()],
+            hello: vec![hello_ok()],
             ..Script::default()
         })
         .await;

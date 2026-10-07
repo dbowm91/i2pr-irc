@@ -13,8 +13,8 @@
 //! - A disconnect after an outbound command leaves delivery ambiguous. Nothing user
 //!   typed is ever retained for replay into a later generation.
 use crate::{
-    CONNECT_TIMEOUT, CONTROL_QUEUE_CAPACITY, IntentClass, NORMAL_QUEUE_CAPACITY, OutboundIntent,
-    REGISTRATION_TIMEOUT, RuntimeError,
+    CONTROL_QUEUE_CAPACITY, IntentClass, NORMAL_QUEUE_CAPACITY, OutboundIntent,
+    PROVIDER_ACQUIRE_TIMEOUT, REGISTRATION_TIMEOUT, RuntimeError,
     capability::UpstreamCapabilities,
     catalog::SupervisorCommand,
     downstream::DownstreamDisposition,
@@ -4134,7 +4134,7 @@ async fn next_intent_frame(
 async fn timeout_connection<T>(
     future: impl std::future::Future<Output = T>,
 ) -> Result<T, RuntimeError> {
-    crate::timeout_bounded(CONNECT_TIMEOUT, future)
+    crate::timeout_bounded(PROVIDER_ACQUIRE_TIMEOUT, future)
         .await
         .map_err(|_| RuntimeError::Timeout)
 }

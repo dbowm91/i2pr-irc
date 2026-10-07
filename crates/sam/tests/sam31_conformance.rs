@@ -107,7 +107,9 @@ async fn wait_for_requests(bridge: &FakeBridge, count: usize) {
 #[tokio::test]
 async fn a_session_and_a_raw_stream_open_in_order() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination(), stream_ok()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        stream: vec![stream_ok()],
         ..Script::default()
     })
     .await;
@@ -147,7 +149,10 @@ async fn a_session_and_a_raw_stream_open_in_order() {
 #[tokio::test]
 async fn a_fragmented_reply_produces_the_same_result() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination(), stream_ok()],
+        // One connection: `SamClient` speaks hello, session, and stream on the same socket.
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        stream: vec![stream_ok()],
         fragment: true,
         ..Script::default()
     })
@@ -162,10 +167,9 @@ async fn a_fragmented_reply_produces_the_same_result() {
 #[tokio::test]
 async fn two_replies_in_one_segment_are_both_read() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![
-            b"HELLO OK\r\nSESSION STATUS RESULT=OK ID=abc\r\n".to_vec(),
-            stream_ok(),
-        ],
+        // Two replies in one write, to prove the client does not lose the second.
+        hello: vec![b"HELLO OK\r\nSESSION STATUS RESULT=OK ID=abc\r\n".to_vec()],
+        stream: vec![stream_ok()],
         ..Script::default()
     })
     .await;
@@ -187,7 +191,7 @@ async fn every_hello_outcome_is_classified() {
         ("HELLO NOVERSION", Err(SamError::UnsupportedVersion)),
     ] {
         let bridge = FakeBridge::start(Script {
-            replies: vec![line(reply)],
+            hello: vec![line(reply)],
             ..Script::default()
         })
         .await;
@@ -217,7 +221,8 @@ async fn every_session_outcome_is_classified() {
         ),
     ] {
         let bridge = FakeBridge::start(Script {
-            replies: vec![hello_ok(), line(reply)],
+            hello: vec![hello_ok()],
+            session: vec![line(reply)],
             ..Script::default()
         })
         .await;
@@ -262,7 +267,9 @@ async fn every_stream_outcome_is_classified() {
         ),
     ] {
         let bridge = FakeBridge::start(Script {
-            replies: vec![hello_ok(), session_ok_with_destination(), line(reply)],
+            hello: vec![hello_ok()],
+            session: vec![session_ok_with_destination()],
+            stream: vec![line(reply)],
             ..Script::default()
         })
         .await;
@@ -278,7 +285,10 @@ async fn every_stream_outcome_is_classified() {
 #[tokio::test]
 async fn a_control_close_is_reported_as_closed() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        // Nothing scripted for the stream, and `close_after` on an empty stream script
+        // means the bridge hangs up as the client reaches for a stream it will never get.
         close_after: true,
         ..Script::default()
     })
@@ -294,7 +304,8 @@ async fn a_control_close_is_reported_as_closed() {
 #[tokio::test]
 async fn an_out_of_order_reply_is_a_protocol_failure() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), stream_ok()],
+        hello: vec![hello_ok()],
+        session: vec![stream_ok()],
         ..Script::default()
     })
     .await;
@@ -317,7 +328,8 @@ async fn a_malformed_reply_is_refused_without_echoing_router_text() {
     // damaging if it reached an operator's terminal.
     let secret = "router said something identifying";
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), line(&format!("!!! {secret}"))],
+        hello: vec![hello_ok()],
+        session: vec![line(&format!("!!! {secret}"))],
         ..Script::default()
     })
     .await;
@@ -351,7 +363,8 @@ async fn an_over_long_reply_is_discarded_and_the_reader_recovers() {
     let mut both = oversized;
     both.extend_from_slice(b"SESSION STATUS RESULT=OK\r\n");
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), both],
+        hello: vec![hello_ok()],
+        session: vec![both],
         ..Script::default()
     })
     .await;
@@ -374,7 +387,9 @@ async fn an_over_long_reply_is_discarded_and_the_reader_recovers() {
 #[tokio::test]
 async fn after_result_ok_nothing_is_parsed_as_sam() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination(), stream_ok()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        stream: vec![stream_ok()],
         // Raw bytes the client must not interpret, sent once the stream is established.
         trailing: vec![
             0x00, 0xff, 0xfe, b'S', b'T', b'R', b'E', b'A', b'M', b' ', b'S', b'T', b'A', b'T',
@@ -419,7 +434,9 @@ async fn a_raw_destination_reaches_the_router_unmodified() {
     let destination = format!("{}+/{}", "A".repeat(300), "B".repeat(400));
     let parsed = I2pEndpoint::parse(&destination).expect("a real destination parses");
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination(), stream_ok()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        stream: vec![stream_ok()],
         ..Script::default()
     })
     .await;
@@ -447,7 +464,9 @@ async fn an_unwritable_destination_is_refused_rather_than_truncated() {
     let at_ceiling = I2pEndpoint::parse(&"A".repeat(MAX_I2P_ENDPOINT_BYTES))
         .expect("the endpoint ceiling parses as a Destination");
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination(), stream_ok()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        stream: vec![stream_ok()],
         ..Script::default()
     })
     .await;
@@ -483,7 +502,8 @@ async fn an_unwritable_destination_is_refused_rather_than_truncated() {
 async fn every_exchange_deadline_fires_and_names_its_phase() {
     // Hello: no reply at all, and no deadline for the phases that follow it.
     let bridge = FakeBridge::start(Script {
-        replies: Vec::new(),
+        // No replies at all: the fake accepts and then says nothing, so whichever exchange
+        // the client is in runs out of time.
         ..Script::default()
     })
     .await;
@@ -505,7 +525,7 @@ async fn every_exchange_deadline_fires_and_names_its_phase() {
 
     // Session create: the hello succeeds, then nothing further arrives.
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok()],
+        hello: vec![hello_ok()],
         ..Script::default()
     })
     .await;
@@ -525,9 +545,11 @@ async fn every_exchange_deadline_fires_and_names_its_phase() {
         "the session-create exchange must time out and say so"
     );
 
-    // Stream connect: hello and session both succeed, then nothing further arrives.
+    // Stream connect: hello and session both succeed, then nothing further arrives. One
+    // connection, because `SamClient` speaks all three on the same socket.
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
         ..Script::default()
     })
     .await;
@@ -596,7 +618,8 @@ fn the_bridge_connect_deadline_is_bounded() {
 #[tokio::test]
 async fn a_delayed_reply_within_the_deadline_is_accepted() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
         ..Script::default()
     })
     .await;
@@ -641,7 +664,7 @@ fn the_client_only_accepts_loopback() {
 #[tokio::test]
 async fn a_failing_random_source_prevents_the_exchange() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok()],
+        hello: vec![hello_ok()],
         ..Script::default()
     })
     .await;
@@ -658,7 +681,8 @@ async fn a_failing_random_source_prevents_the_exchange() {
 #[tokio::test]
 async fn the_session_id_carries_no_identifying_material() {
     let bridge = FakeBridge::start(Script {
-        replies: vec![hello_ok(), session_ok_with_destination()],
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
         ..Script::default()
     })
     .await;

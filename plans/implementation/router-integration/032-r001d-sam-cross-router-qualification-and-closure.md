@@ -1,10 +1,10 @@
 # Router Integration R001-D / Plan 032 — SAM Cross-Router Qualification and R001 Closure
 
-Status: blocked
+Status: ready
 
 Hard dependency:
 
-- plans/closure/router-integration/031-status.md
+- plans/closure/router-integration/031-status.md (met)
 
 Operational dependencies:
 

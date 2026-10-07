@@ -18,7 +18,10 @@
 
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -276,6 +279,17 @@ impl SamClient {
         Ok((client, id))
     }
 
+    /// Hands over the underlying socket, abandoning any buffered protocol bytes.
+    ///
+    /// For the caller that keeps a session alive without talking to it on any more: it
+    /// needs the socket so it can notice the router ending the session, and it has no
+    /// use for bytes already read into the framing layer. Any bytes dropped here were
+    /// never protocol this crate needs — a control socket sends nothing unsolicited — and
+    /// keeping them would mean holding the client, which is the state that has to end.
+    pub fn into_socket(self) -> TcpStream {
+        self.stream
+    }
+
     /// Opens the socket without speaking. Used by tests and by the session path.
     pub async fn open_socket(config: &SamClientConfig) -> Result<Self, SamError> {
         let stream = timeout(
@@ -473,6 +487,26 @@ impl SamClient {
     }
 }
 
+/// Watches an idle control socket and clears `lost` when the router ends it.
+///
+/// The half of session-keeping that is about the socket rather than the protocol. SAM 3.1
+/// sends nothing unsolicited on a control socket, so bytes that do arrive are not protocol
+/// events and are discarded; the only thing this looks for is the connection ending.
+///
+/// It lives here, not in the provider, because the provider has no business holding a
+/// socket: keeping this in the one module that already owns TCP authority is what lets the
+/// boundary scan hold the provider to the same rule as everything else.
+pub async fn watch_control_socket(mut socket: TcpStream, lost: Arc<AtomicBool>) {
+    let mut sink = [0u8; 64];
+    loop {
+        match socket.read(&mut sink).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+    lost.store(false, Ordering::SeqCst);
+}
+
 /// Maps a `STREAM STATUS` failure onto the taxonomy the runtime maps onto reconnect.
 pub fn stream_error(rejection: StreamRejection) -> SamError {
     SamError::PeerUnavailable { rejection }
@@ -504,35 +538,37 @@ mod tests {
         );
     }
 
-    /// The cold-session path does **not** fit the runtime's connect budget, and this is
-    /// recorded as a finding rather than papered over.
+    /// The cold-session path fits inside the runtime's provider-acquire budget.
     ///
-    /// Plan 030 section 10 says "Plan 031 must reconcile the outer runtime
-    /// provider-connect timeout with the complete cold-session path", so the mismatch is
-    /// expected at this stage: 10 + 10 + 120 = 140 s of deadlines against a
-    /// `CONNECT_TIMEOUT` of 120 s. A cold first connect would be cut off by the runtime
-    /// while the router was still building tunnels, which fails a working Network.
-    ///
-    /// The numbers are asserted as *this* state so that a later plan which fixes the
-    /// budget has to update this test deliberately. Silently changing either side is how
-    /// the mismatch would have gone unnoticed.
+    /// This test failed to compile against the original numbers, which is the point: 10 +
+    /// 10 + 120 = 140 s of SAM deadlines sat inside a 120 s runtime ceiling, so a cold
+    /// first connect could be cut off while the router was still building tunnels. Plan
+    /// 031 reconciled it by raising the outer ceiling to 300 s and renaming it to say what
+    /// it now bounds.
     ///
     /// The runtime constant is inlined rather than imported: an adapter crate must not
-    /// depend on the component that consumes it, and a duplicate that drifts is better
-    /// than a dependency cycle.
+    /// depend on the component that consumes it. Duplication that can drift is a smaller
+    /// problem than a dependency cycle, and the assertion below is what catches the drift.
     #[test]
-    fn the_cold_session_path_exceeds_the_runtime_connect_budget() {
-        const RUNTIME_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+    fn the_cold_session_path_fits_inside_the_runtime_acquire_budget() {
+        const RUNTIME_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(300);
         let timeouts = SamTimeouts::default();
         let cold_session = timeouts.bridge_connect + timeouts.hello + timeouts.session_create;
         assert_eq!(
             cold_session,
             Duration::from_secs(140),
-            "the SAM-side cold path is 140s against a 120s runtime budget"
+            "the SAM-side cold path is 140s"
         );
         assert!(
-            cold_session > RUNTIME_CONNECT_TIMEOUT,
-            "the mismatch Plan 031 must resolve is real, not hypothetical: {cold_session:?} > {RUNTIME_CONNECT_TIMEOUT:?}"
+            cold_session < RUNTIME_ACQUIRE_TIMEOUT,
+            "a cold session must fit the runtime's acquire budget: {cold_session:?} >= {RUNTIME_ACQUIRE_TIMEOUT:?}"
+        );
+        // And with room for a second cold attempt inside the same budget, so a reconnect
+        // after a lost session is not immediately cut off.
+        assert!(
+            2 * cold_session < RUNTIME_ACQUIRE_TIMEOUT,
+            "two cold attempts must fit one budget: {:?} >= {RUNTIME_ACQUIRE_TIMEOUT:?}",
+            2 * cold_session
         );
     }
 

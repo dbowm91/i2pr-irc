@@ -797,7 +797,7 @@ async fn a_raw_destination_reaches_the_provider_through_a_network_record() {
 #[test]
 fn the_release_deadline_is_bounded_and_shorter_than_the_connect_budget() {
     let release = i2pr_irc_runtime::PROVIDER_RELEASE_TIMEOUT;
-    let connect = i2pr_irc_runtime::CONNECT_TIMEOUT;
+    let connect = i2pr_irc_runtime::PROVIDER_ACQUIRE_TIMEOUT;
     assert!(release > Duration::ZERO, "the deadline is a real bound");
     assert!(
         release < connect,

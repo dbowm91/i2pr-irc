@@ -48,6 +48,17 @@ pub trait RandomSource: Send + Sync {
 #[error("OS randomness unavailable")]
 pub struct RandomUnavailable;
 
+/// A shared reference to any source is itself a source.
+///
+/// Written as a blanket impl rather than asking every caller to wrap their source, because
+/// a `SamClientConfig` holds an `Arc<dyn RandomSource>` and a caller who has a concrete
+/// source should be able to hand it over without an adapter of their own.
+impl<T: RandomSource + ?Sized> RandomSource for Arc<T> {
+    fn fill(&self, out: &mut [u8]) -> Result<(), RandomUnavailable> {
+        (**self).fill(out)
+    }
+}
+
 /// The production source: the operating system's CSPRNG.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsRandom;

@@ -37,9 +37,11 @@ pub mod error;
 pub mod fake;
 pub mod line;
 pub mod protocol;
+pub mod provider;
 pub mod session_id;
 
 pub use client::{SamClient, SamClientConfig, SamRawStream, SamTimeouts};
 pub use endpoint::{DEFAULT_SAM_BRIDGE, DEFAULT_SAM_BRIDGE_PORT, SamBridgeEndpoint};
 pub use error::{SamError, SamPhase, SessionRejection, StreamRejection};
+pub use provider::{SAM_SCOPE_REQUEST_CAPACITY, SamDiagnostics, SamProvider};
 pub use session_id::SamSessionId;

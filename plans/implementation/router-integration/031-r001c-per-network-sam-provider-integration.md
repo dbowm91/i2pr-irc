@@ -1,8 +1,8 @@
 # Router Integration R001-C / Plan 031 — Per-Network SAM Provider Integration
 
-Status: ready
+Status: closed
 
-Closure: plans/closure/router-integration/030-status.md
+Closure: plans/closure/router-integration/031-status.md
 
 Hard dependency:
 
