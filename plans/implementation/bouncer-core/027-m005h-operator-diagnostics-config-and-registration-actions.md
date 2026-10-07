@@ -1,6 +1,8 @@
 # Bouncer Core M005-H / Plan 027 — Operator Diagnostics, Configuration Snapshots, and Constrained Registration Actions
 
-Status: ready
+Status: closed
+
+Closure: plans/closure/bouncer-core/027-status.md
 
 Blocker:
 

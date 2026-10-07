@@ -1,10 +1,17 @@
 # Bouncer Core M005-I / Plan 028 — Integrated Mature-Bouncer Qualification and M005 Closure
 
-Status: blocked
+Status: ready
 
 Blocker:
 
-- Plan 027 closure accepted
+- None. Plan 027 closure accepted; see plans/closure/bouncer-core/027-status.md.
+
+Carried in from the Plan 027 closure, to resolve rather than merely re-measure:
+
+- A generation teardown takes about 120 s to be noticed. Plan 027 recorded this as a
+  pre-existing finding after measuring 120.9 s with no registration actions configured at
+  all, against a CONNECT_TIMEOUT of 120 s: the owner does not begin a new generation until
+  roughly that long after the upstream stream ends, rather than reacting to the end of it.
 
 Research authority:
 

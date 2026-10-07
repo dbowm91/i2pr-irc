@@ -258,11 +258,11 @@ Corrective 019      M005-A / 020
                  richer IRCv3 state
                         |
                         v
-                   M005-H / 027 (ready)
+                   M005-H / 027 (closed)
              diagnostics/config/actions
                         |
                         v
-                   M005-I / 028
+                   M005-I / 028 (ready)
               integrated M005 closure
                         |
                         v
@@ -531,8 +531,8 @@ Implementation decomposition:
 5. M005-E / Plan 024 — indexed history search and CHATHISTORY completion. **Closed**, no open findings. Landed the `soju.im/search` adapter, schema 6's FTS5 side index whose rowid is the `HistoryEventId`, the `effective_time` rule with a single shared definition, indexed `msgid` and `timestamp` reference lookups, the `HistoryPosition` model for out-of-window references, and a two-seek `AROUND`. Removed `reference_candidates`, the window scan every reference used to go through.
 6. M005-F / Plan 025 — downstream IRCv3 protocol polish. **Closed**, no open findings. Landed the `server-time`, `standard-replies`, `cap-notify` and `draft/no-implicit-names` promotions, `echo-message` as a conditional capability, a three-state per-session tag surface, a per-session refusal form, and one live advertisement shared by the owner and the session reader. Upstream `CAP` lines are consumed rather than fanned out.
 7. M005-G / Plan 026 — richer IRCv3 member-state mediation. **Closed**.
-8. M005-H / Plan 027 — operator diagnostics, configuration snapshots and constrained registration actions. **Ready**.
-9. M005-I / Plan 028 — integrated mature-bouncer qualification and M005 closure. **Blocked on Plan 027 closure**.
+8. M005-H / Plan 027 — operator diagnostics, configuration snapshots and constrained registration actions. **Closed**.
+9. M005-I / Plan 028 — integrated mature-bouncer qualification and M005 closure. **Ready**; dependency-ready on the Plan 027 closure accepted.
 
 Only the earliest dependency-ready plan is executable at a time. Research 006 and ADR-0003 are the architecture authority for the control-session line.
 
@@ -678,7 +678,7 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M004-C / Plan 017 | closed | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closed |
 | M004-D / Plan 018 | closed | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | plans/closure/bouncer-core/018-status.md | Plan 017 closure |
 | C019 / Corrective 019 | closed | plans/implementation/bouncer-core/019-m004-findings-corrective.md | plans/closure/bouncer-core/019-status.md | Closed UF-015-1, UF-017-1, UF-018-1; never gated M005 |
-| M005 | active — decomposed; M005-A through M005-F closed, M005-G ready | plans 020-028 | future plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
+| M005 | active — decomposed; M005-A through M005-H closed, M005-I ready | plans 020-028 | future plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
 | M005-A / Plan 020 | closed | plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md | plans/closure/bouncer-core/020-status.md | M004 + ADR-0003 |
 | M005-B / Plan 021 | closed | plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md | plans/closure/bouncer-core/021-status.md | Plan 020 closure |
 | M005-C / Plan 022 | closed | plans/implementation/bouncer-core/022-m005c-presence-and-preferred-nick-policy.md | plans/closure/bouncer-core/022-status.md | Plan 021 closure |
