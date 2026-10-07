@@ -1,6 +1,6 @@
 # Bouncer Core Corrective 034 — Restore Rust 1.88 Repository Verification
 
-Status: ready for handoff
+Status: closed 2026-10-07 — see plans/closure/bouncer-core/034-status.md
 
 Repository baseline:
 

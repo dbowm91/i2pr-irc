@@ -591,7 +591,7 @@ mod tests {
         // A destination keeps its own case: it is opaque key material, not a name.
         assert_eq!(parsed.as_str(), destination);
         assert_eq!(
-            format!("{:?}", parsed),
+            format!("{parsed:?}"),
             "I2pEndpoint([redacted])",
             "908 characters of key material must never reach a log line"
         );

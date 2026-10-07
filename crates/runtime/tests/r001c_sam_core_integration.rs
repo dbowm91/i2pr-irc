@@ -360,9 +360,8 @@ async fn a_reconnect_replays_no_upstream_frame_from_the_old_connection() {
                 || frame.starts_with("USER ")
                 || frame.starts_with("CAP ")
                 || frame.starts_with("JOIN "),
-            "the replacement connection carried {:?}, which is not part of a fresh \
-             registration and therefore looks like a replay",
-            frame
+            "the replacement connection carried {frame:?}, which is not part of a fresh \
+             registration and therefore looks like a replay"
         );
     }
 
