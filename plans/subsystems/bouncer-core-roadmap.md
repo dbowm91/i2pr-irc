@@ -132,7 +132,9 @@ Research 005 decomposed M004 and promoted the unresolved response-routing findin
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
-Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. All nine are closed, M005 is complete, and no bouncer-core implementation plan remains executable.
+Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. All nine are closed and M005 remains complete.
+
+Corrective 034 is a post-M005 maintenance corrective raised by Corrective 033's closure evidence. The repository declares Rust 1.88 as its MSRV, but the full Rust 1.88 verification currently fails in pre-existing crates/core formatting/lint code while current-toolchain verification and the SAM crate's Rust 1.88 checks pass. Corrective 034 owns only restoration of the declared repository verification floor; it does not reopen M005 behavior, R001 SAM behavior, or any network/security architecture.
 
 ## 5. Target architecture
 
@@ -722,3 +724,4 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M005-G / Plan 026 | closed | plans/implementation/bouncer-core/026-m005g-richer-ircv3-member-state-mediation.md | plans/closure/bouncer-core/026-status.md | Plan 025 closure |
 | M005-H / Plan 027 | closed | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | plans/closure/bouncer-core/027-status.md | Plan 026 closure |
 | M005-I / Plan 028 | closed | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | plans/closure/bouncer-core/028-status.md | Plan 027 closure |
+| C034 / Corrective 034 | ready | plans/implementation/bouncer-core/034-rust-1-88-verification-corrective.md | future plans/closure/bouncer-core/034-status.md | none; maintenance-only MSRV verification repair |
