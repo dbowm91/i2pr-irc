@@ -145,7 +145,7 @@ fn a_database_claiming_our_version_but_missing_tables_is_refused() {
 #[test]
 fn every_promised_table_is_required_at_open() {
     for table in EXPECTED_TABLES {
-        let dir = testing::temp_dir(&format!("req{}", table));
+        let dir = testing::temp_dir(&format!("req{table}"));
         let path = dir.db("req.sqlite3");
         store_at(&path).shutdown().expect("store shuts down");
         testing::execute(&path, &format!("DROP TABLE {table}"));

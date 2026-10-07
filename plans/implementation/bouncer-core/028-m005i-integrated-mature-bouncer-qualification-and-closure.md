@@ -1,10 +1,13 @@
 # Bouncer Core M005-I / Plan 028 — Integrated Mature-Bouncer Qualification and M005 Closure
 
-Status: ready
+Status: closed
+
+Closure: plans/closure/bouncer-core/028-status.md
 
 Blocker:
 
 - None. Plan 027 closure accepted; see plans/closure/bouncer-core/027-status.md.
+- Cleared during execution: see the "Carried in from the Plan 027 closure" note below.
 
 Carried in from the Plan 027 closure, to resolve rather than merely re-measure:
 

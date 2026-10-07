@@ -262,11 +262,12 @@ Corrective 019      M005-A / 020
              diagnostics/config/actions
                         |
                         v
-                   M005-I / 028 (ready)
+                   M005-I / 028 (closed)
               integrated M005 closure
                         |
                         v
           router-integration R001 portable SAM
+               (now dependency-ready)
 ~~~
 
 Dependency classes:
@@ -274,11 +275,19 @@ Dependency classes:
 - M002 has a hard dependency on M001.
 - M003 depends on historical M002 completion and Corrective 004, plus three pre-M003 gates that are all closed: Corrective 005, Corrective 006 (raised by the Research 002 corpus), and the Research 002 conformance/decision dependency with no unresolved M003-affecting correctness defect.
 - M004 had a hard dependency on M003 plus the post-M003 correctness gates. Corrective 014 was the direct prerequisite and is closed; M004-A and M004-B then proceeded independently and are both closed; M004-C required both and is closed; M004-D closed the milestone. M004 is complete.
-- M005 has a hard dependency on M004.
+- M005 had a hard dependency on M004. **M005 is now closed**, so that dependency is discharged.
+  Work package A of Plan 028 also found that two test names cited in the Plan 020 and 021
+  closure records do not resolve; both properties are evidenced under other names, and the
+  correction is carried in `plans/closure/bouncer-core/028-status.md` rather than by rewriting
+  historical records.
 - Corrective 019 depended only on M004 closure, was **not** a prerequisite for M005, and did
   not gate it. It is closed. The findings it owned were non-blocking by construction, and its
   own acceptance criteria did not depend on M005 scope.
-- Router integration has a hard dependency on M005 under the canonical phase ordering.
+- Router integration has a hard dependency on M005 under the canonical phase ordering. **That
+  dependency is now discharged with no router-blocking finding outstanding**, so R001 portable
+  SAM is eligible under its own prerequisites. M005 closure does not authorise R002
+  managed-i2pr integration or R003 Proposal 170 control work beyond their existing interface
+  and product gates; ADR-0001's boundary is unchanged.
 - External router interoperability fixtures are operational dependencies for router claims, not core M001-M005.
 
 ## 7. Milestones
@@ -532,7 +541,32 @@ Implementation decomposition:
 6. M005-F / Plan 025 — downstream IRCv3 protocol polish. **Closed**, no open findings. Landed the `server-time`, `standard-replies`, `cap-notify` and `draft/no-implicit-names` promotions, `echo-message` as a conditional capability, a three-state per-session tag surface, a per-session refusal form, and one live advertisement shared by the owner and the session reader. Upstream `CAP` lines are consumed rather than fanned out.
 7. M005-G / Plan 026 — richer IRCv3 member-state mediation. **Closed**.
 8. M005-H / Plan 027 — operator diagnostics, configuration snapshots and constrained registration actions. **Closed**.
-9. M005-I / Plan 028 — integrated mature-bouncer qualification and M005 closure. **Ready**; dependency-ready on the Plan 027 closure accepted.
+9. M005-I / Plan 028 — integrated mature-bouncer qualification and M005 closure. **Closed**; M005 is complete.
+
+The integrated pass was not a formality. Three production defects were live that eight
+per-subsystem suites had each correctly passed over, and each is a case where the evidence
+existed and pointed at the wrong thing:
+
+- the connect **rate limiter could hang**. `ReconnectScheduler::acquire` has two gates, and
+  only one of them signals: in-flight capacity frees when a permit drops, but the token gate
+  frees on a clock, and nothing notifies for a clock. A waiter blocked only on tokens slept
+  until an unrelated event touched the queue — so on a cold start of more Networks than
+  `MAX_CONNECT_BURST`, every Network past the burst stayed unconnected forever. The mechanism
+  built to prevent a startup herd was itself the failure.
+- **`ControlSnapshot` answered from memory.** `publish()` ran only from `commit()`, which
+  fires on control-plane mutations, so phase and attached sessions were stale until an
+  unrelated edit happened. A Network with two live sessions reported `attached=0 phase=idle`
+  indefinitely; every `BOUNCER NET` told an Operator nobody was connected.
+- **A promised table was not required at open.** `registration_actions`, `clients` and
+  `network_secrets` were absent from `REQUIRED_TABLES`, so a database declaring the current
+  version without them opened fine and failed later.
+
+It also **withdrew** the finding Plan 027 carried into it. The "~120 s generation-teardown
+delay" was a fixture defect: `drop_generation` was an `if let Some(..)` that silently matched
+nothing because the controller had been discarded, so the test waited out `LIVENESS_DEADLINE`
+and measured the keepalive timer, not the bouncer. The bouncer ends a generation on
+end-of-stream immediately. The `m005h_diagnostics` suite went from 121.4 s to 6.2 s, and now
+drops the generation it means to.
 
 Only the earliest dependency-ready plan is executable at a time. Research 006 and ADR-0003 are the architecture authority for the control-session line.
 
