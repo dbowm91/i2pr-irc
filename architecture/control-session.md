@@ -1,6 +1,7 @@
 # M005 process control and downstream admission
 
-Status: planned architecture authority for M005
+Status: implemented. Plans 020 through 027 are closed; M005 closure rests on Plan 028. See the
+"What Plan 020 landed" section below for the ownership that actually shipped.
 
 Decision authority: plans/adrs/ADR-0003-process-runtime-control-and-pre-bind-downstream-admission.md
 
@@ -63,7 +64,10 @@ Expected request families include:
 - create/change/delete Network;
 - reconcile Network;
 - channel policy changes;
-- operator policy changes.
+- operator policy changes;
+- bounded diagnostics for the process or one Network;
+- configuration snapshot export and plan-then-apply import;
+- replacement of one Network's registration-action list.
 
 Wire adapters such as soju.im/bouncer-networks and BouncerServ render these typed results independently.
 
@@ -213,13 +217,31 @@ own.
 deliberately small vocabulary: `BIND`, `LISTNETWORKS`, `ADDNETWORK`, `CHANGENETWORK`,
 `DELNETWORK`. `BouncerServ` is the local administration service, reached the ordinary IRC
 way — `PRIVMSG BouncerServ :…` — so that an existing client needs no new verb to
-administer the bouncer.
+administer the bouncer. Its command set is the closed `ServCommand` enum:
+
+| Command | Effect |
+|---|---|
+| `HELP` | the bounded command list as text |
+| `NETWORK LIST` / `NETWORK STATUS <netid>` | list every Network and its live state, or report one |
+| `NETWORK CREATE …` / `NETWORK UPDATE <netid> …` / `NETWORK DELETE <netid>` | create, partially update, forget |
+| `CHANNEL STATUS` / `DETACH` / `ATTACH <netid> <channel>` | read or change one channel's presentation policy |
+| `PRESENCE STATUS` / `SET <netid> auto_away=on\|off` | read or change auto-away policy |
+| `NICK STATUS` / `SET <netid> keep_nick=on\|off` | read or change keep-nick policy |
+| `SASL STATUS` / `SET <netid> user=<user> pass=<pass>` / `RESET <netid>` | report a credential's existence and name, set it, forget it |
+| `DIAG` / `DIAG NETWORK <netid>` | bounded, secret-free diagnostics for the process or one Network |
+| `CONFIG EXPORT` / `CONFIG PLAN` | write the versioned snapshot, or report what applying it would do |
+| `ACTION STATUS` / `SET <netid> [mode=<modes>] [message=<serv> text=<text>]` | report the action count, or replace the whole list |
+
+`HELP` lists only commands this build actually implements. A help text naming a command that is
+refused would be the same failure as advertising a capability that is not live.
 
 A `ControlSurface` holds a `RuntimeControlHandle` and nothing else. It cannot reach a
 `StoreHandle`, a `SupervisorHandle`, or an owner directly; every mutation it performs is a
 typed request through the one bounded queue the controller owns. That is what makes "all
 process mutation flows through the typed controller" a property of the type rather than a
-review convention. See [bouncer networks and administration](bouncer-networks.md).
+review convention. See [bouncer networks and administration](bouncer-networks.md) and
+[operator diagnostics, configuration snapshots, and registration
+actions](operator-surfaces.md).
 
 ### Authorization
 

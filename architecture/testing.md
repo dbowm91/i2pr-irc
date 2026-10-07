@@ -12,6 +12,13 @@ The ownership campaign adds evidence for upstream registration and liveness with
 
 The M005 suites add, per plan: `m005a_controller_admission` (bounded controller, pre-bind admission, one-shot transfer, ambiguous-commit recovery), `m005b_detached_policy` (durable detach across restart, deferred reveal, fanout redaction), `m005c_presence_nick` (presence transition matrix, bounded deterministic fallback, both reclaim mechanisms, generation fencing), `m005d_bouncer_networks` (discovery, selection, attribute refusal, notifications, and the administration surface), and `m005e_search_history` (search framing, refusal, scoping, retention, restart identity, `AROUND` edges, and liveness under search load), and `m005f_protocol_polish` (one advertisement, per-session tag surface, per-session refusal form, implicit-name suppression, capability-change notification, and echo-message confirmation), and `m005g_member_state` (advertisement conditioned on upstream, extended-JOIN reduction, per-session gating of `ACCOUNT`/`AWAY`/`SETNAME`, prefix width in NAMES and in routed `WHO`/`WHOIS`, the `SETNAME` command gate, the realname ceiling, and the boundary between what a reattaching client is shown and what only a live one is). `m005h_diagnostics` covers the three Operator surfaces: bounded diagnostics under connect, backoff, terminal and reconcile states with no endpoint, credential or action payload anywhere in the reply; snapshot export/import round trips, version and identity refusals, and the promise that a failed import writes nothing; and the registration-action command matrix, count and byte ceilings, redaction, and intentional replay on reconnect.
 
+`m005i_integration` is the Plan 028 qualification suite: the cross-cutting claim that the
+mature-feature line did not regress the ordinary client. It exercises registration, JOIN/PART,
+chat, WHOIS/NAMES/LIST routing and bounded automatic backlog together, because a mature feature
+set is not closed if a pre-M005 client's ordinary path regressed underneath it. Its evidence,
+and the remaining M005 closure record, live in
+`plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md`.
+
 Two harness rules this repo now depends on, both learned from suites that reported passes
 for the wrong reason:
 

@@ -327,6 +327,10 @@ impl ReconnectScheduler {
             // Register before waiting, so a permit that frees up between this check and
             // the await cannot be missed.
             let notified = self.inner.ready.notified();
+            // How long this waiter must sleep on a clock rather than on a notification.
+            // `None` means it is waiting for in-flight capacity, which a permit release
+            // signals.
+            let mut token_due = None;
             {
                 let mut state = lock(&self.inner.state);
                 if state.terminal.contains(&network) {
@@ -361,8 +365,24 @@ impl ReconnectScheduler {
                         scheduler: self.clone(),
                     });
                 }
+                // The two gates are released by different things, and only one of them
+                // signals. In-flight capacity frees when a permit is dropped, and `release`
+                // notifies. The token gate frees on a clock, and *nothing* notifies for a
+                // clock -- so a waiter blocked only on tokens must wait for its own
+                // deadline. Without this it sleeps until some unrelated release happens to
+                // touch the queue, which for a cold start of more Networks than the burst
+                // allows means never: the rate limiter that exists to prevent a startup
+                // herd would instead leave every Network past the burst unconnected.
+                if at_front && state.in_flight < self.inner.budget.max_in_flight {
+                    token_due = token_due_in(&state, self.inner.budget);
+                }
             }
-            notified.await;
+            match token_due {
+                Some(wait) => {
+                    let _ = tokio::time::timeout(wait, notified).await;
+                }
+                None => notified.await,
+            }
         }
     }
 
@@ -438,6 +458,23 @@ fn refill(state: &mut SchedulerState, budget: ReconnectBudget) {
     state.last_refill = now;
     let per_second = 1_000_000.0 / budget.token_interval.as_micros().max(1) as f64;
     state.tokens = (state.tokens + elapsed.as_secs_f64() * per_second).min(budget.max_burst as f64);
+}
+
+/// How long until the bucket holds one whole token.
+///
+/// `None` when it already does, which the caller has checked before asking.
+///
+/// The token clock advances only when [`refill`] runs, which happens when a waiter
+/// re-checks. So this is the deadline that waiter's next re-check has to be scheduled at,
+/// derived from the same rate the refill uses -- not a second, independent notion of "how
+/// long a token takes" that could drift from the bucket it is meant to predict.
+fn token_due_in(state: &SchedulerState, budget: ReconnectBudget) -> Option<Duration> {
+    let missing = 1.0 - state.tokens;
+    if missing <= 0.0 {
+        return None;
+    }
+    let per_second = 1_000_000.0 / budget.token_interval.as_micros().max(1) as f64;
+    Some(Duration::from_secs_f64(missing / per_second))
 }
 
 /// Deterministic herd-decorrelation jitter for one attempt.

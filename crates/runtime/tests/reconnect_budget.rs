@@ -430,3 +430,111 @@ async fn diagnostics_carry_counts_only() {
     let _: SchedulerDiagnostics = scheduler.diagnostics();
     let _ = Arc::new(scheduler);
 }
+
+// ------------------------------------------------------------- token gate wakeup
+
+/// A waiter blocked *only* on the token gate is admitted when its token comes due.
+///
+/// The two admission gates release differently, and only one of them signals anything.
+/// In-flight capacity frees when a permit is dropped, which calls `notify_waiters`. The
+/// token gate frees on a clock, and no code path notifies for a clock -- the bucket is
+/// refilled lazily, when a waiter re-checks it. A waiter that parked only on the
+/// notification therefore slept until some *unrelated* release happened to touch the queue.
+///
+/// On a cold start that is every Network past the burst, and nothing else: the burst is
+/// spent, no further permit is ever dropped, and no timer exists. The rate limiter built
+/// to stop a startup herd from becoming a simultaneous connect would instead leave those
+/// Networks permanently unconnected. In-flight capacity is deliberately left free here, so
+/// the token is provably the only thing standing in the way.
+///
+/// Virtual time, so "ten seconds" is instant and the assertion is about the wakeup rather
+/// than about the machine being fast.
+#[tokio::test(start_paused = true)]
+async fn a_waiter_blocked_only_on_the_token_gate_is_admitted_when_its_token_is_due() {
+    const TOKEN_INTERVAL: Duration = Duration::from_secs(10);
+
+    let scheduler = ReconnectScheduler::new(ReconnectBudget {
+        // Generous in-flight capacity, single-token burst: the token is the only gate.
+        max_in_flight: 4,
+        max_burst: 1,
+        token_interval: TOKEN_INTERVAL,
+        max_waiters: MAX_RECONNECT_WAITERS,
+        seed: 0x0123_4567_89ab_cdef,
+    })
+    .expect("bounded budget");
+
+    let held = scheduler
+        .acquire(NetworkId(1))
+        .await
+        .expect("the first attempt spends the only token");
+
+    let waiter = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.acquire(NetworkId(2)).await }
+    });
+
+    let permit = timeout(TOKEN_INTERVAL * 3, waiter)
+        .await
+        .expect(
+            "a rate-limited waiter must wake on its own token deadline, not wait for an \
+             unrelated event to release a permit",
+        )
+        .expect("the waiter task joins")
+        .expect("the waiter is admitted once its token is due");
+    drop(permit);
+    drop(held);
+
+    let diagnostics = scheduler.diagnostics();
+    assert_eq!(
+        diagnostics.admitted, 2,
+        "both attempts were admitted, in order"
+    );
+}
+
+/// The token gate still holds the start rate: two waiters cannot both outrun one interval.
+///
+/// The mirror of the test above. Waking on the clock must not become waking immediately --
+/// if the fix degenerated into "ignore the rate gate", this fails while the other passes.
+#[tokio::test(start_paused = true)]
+async fn the_token_gate_holds_the_start_rate_even_though_waiters_wake_on_time() {
+    const TOKEN_INTERVAL: Duration = Duration::from_secs(10);
+
+    let scheduler = ReconnectScheduler::new(ReconnectBudget {
+        max_in_flight: 4,
+        max_burst: 1,
+        token_interval: TOKEN_INTERVAL,
+        max_waiters: MAX_RECONNECT_WAITERS,
+        seed: 0x0123_4567_89ab_cdef,
+    })
+    .expect("bounded budget");
+
+    let held = scheduler
+        .acquire(NetworkId(1))
+        .await
+        .expect("the first attempt spends the only token");
+
+    let second = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.acquire(NetworkId(2)).await }
+    });
+    let third = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.acquire(NetworkId(3)).await }
+    });
+
+    // Strict FIFO means the second waiter cannot take the token the third waiter's deadline
+    // would otherwise produce, so advancing past one interval admits exactly one of them.
+    let permit = timeout(TOKEN_INTERVAL * 2, second)
+        .await
+        .expect("the head of the queue is admitted after one interval")
+        .expect("task joins")
+        .expect("admitted");
+    drop(permit);
+
+    assert!(
+        !third.is_finished(),
+        "the third waiter must still be waiting: one interval buys one token, not two"
+    );
+    drop(held);
+    let _ = third.await;
+}

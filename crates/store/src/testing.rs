@@ -100,12 +100,16 @@ pub fn create_v3_database(path: &Path) -> Connection {
 
 /// Creates a database at schema version 4 and returns a raw connection to it.
 ///
-/// Used to build the fixture the v4 -> v5 migration must handle.
+/// Used to build the fixture the v4 -> v5 migration must handle. Seeded with a Network and
+/// a desired channel so the migration has durable state to preserve: the columns v5 adds
+/// must appear *alongside* existing rows, and a fixture holding only an empty schema would
+/// pass whether the migration backfilled correctly or not.
 pub fn create_v4_database(path: &Path) -> Connection {
     let connection = Connection::open(path).expect("database file is creatable");
     connection
         .execute_batch(&schema::schema_v4())
         .expect("schema 4 applies");
+    seed_policy_for_presence(&connection);
     connection
         .pragma_update(None, "application_id", crate::APPLICATION_ID)
         .expect("application_id is writable");
@@ -113,6 +117,24 @@ pub fn create_v4_database(path: &Path) -> Connection {
         .pragma_update(None, "user_version", 4)
         .expect("user_version is writable");
     connection
+}
+
+/// Seeds the rows the schema 5 migration must carry forward unchanged.
+///
+/// One Network and one *attached* desired channel: attached, because a v5 database that
+/// migrated a detached channel correctly and one that lost the flag entirely would both
+/// open without complaint, and only the row's own value tells them apart.
+fn seed_policy_for_presence(connection: &Connection) {
+    connection
+        .execute_batch(
+            "INSERT INTO networks
+                (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+             VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p', 1,
+                     'bot', 'user', 'bouncer', 'lab');
+             INSERT INTO desired_channels (network_id, casemap_key, target, position, detached)
+             VALUES (1, x'23726f6f6d', '#room', 0, 0);",
+        )
+        .expect("presence policy fixture is insertable");
 }
 
 /// Creates a database at schema version 5 and returns a raw connection to it.
@@ -131,6 +153,29 @@ pub fn create_v5_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 5)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 6 and returns a raw connection to it.
+///
+/// Used to build the fixture the v6 -> v7 migration must handle. The v6 additions are the
+/// first ones a build cannot reproduce by opening an older database, because migration 6
+/// also *derives* state -- it populates `effective_time` and backfills the FTS side index
+/// for every row already retained. So this fixture runs the same backfills rather than
+/// declaring empty columns.
+pub fn create_v6_database(path: &Path) -> Connection {
+    let mut connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v6())
+        .expect("schema 6 applies");
+    seed_history_for_backfill(&connection);
+    schema::seed_schema_v6(&mut connection);
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 6)
         .expect("user_version is writable");
     connection
 }

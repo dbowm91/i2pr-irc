@@ -59,9 +59,10 @@ accepting `state=connected` would leave a client believing it had asked the boun
 connect a Network that is in fact disconnected.
 
 Every refusal carries a reason. `FAIL BOUNCER <subcommand> :<reason>` is the draft's
-required form, and this build uses it *without* advertising `standard-replies`, because it
-does not implement that capability's full semantics. Plan 025 promotes the advertisement
-once it does.
+required form, and this build now advertises `standard-replies` because the refusal surface is
+implemented across `BOUNCER`, `CHATHISTORY`, `MARKREAD` and `SEARCH` rather than borrowed for a
+single command: every refusal this build serves is a `FAIL` with a standard numeric and a fixed
+reason, and none of them echoes the request back.
 
 ## Selection is a registration-time decision
 

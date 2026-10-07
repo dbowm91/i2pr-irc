@@ -377,10 +377,16 @@ CREATE VIRTUAL TABLE history_search USING fts5(
 );
 "#;
 
-/// The current schema, created directly when no database exists yet.
-pub(crate) fn schema_v7() -> String {
+/// Schema 6, used to build the fixture the schema 7 migration must handle.
+///
+/// Declared as its own shape rather than `schema_v7()` minus a table, for the same reason
+/// every earlier version is: a migration fixture has to describe a database this build
+/// actually wrote. A v6 database is "v5 plus the 6 additions" and *not* "v7 less the
+/// registration-action table", and the difference matters the moment a future migration
+/// changes the tail.
+pub(crate) fn schema_v6() -> String {
     format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}",
         compose(
             DESIRED_CHANNELS_V4,
             NETWORKS_V5,
@@ -390,8 +396,31 @@ pub(crate) fn schema_v7() -> String {
         HISTORY_EFFECTIVE_TIME_V6,
         HISTORY_REFERENCE_INDEXES_V6,
         HISTORY_SEARCH_V6,
-        REGISTRATION_ACTIONS_V7,
     )
+}
+
+/// The current schema, created directly when no database exists yet.
+pub(crate) fn schema_v7() -> String {
+    format!("{}{}", schema_v6(), REGISTRATION_ACTIONS_V7)
+}
+
+/// Fills in the derived state migration 6 added, for a schema 6 fixture.
+///
+/// A genuine v6 database has its `effective_time` populated and its FTS side index built,
+/// because migration 6 is what did that to every row already retained. A fixture that
+/// declared the columns and then left them empty would still pass the 6 -> 7 migration --
+/// which is additive and reads neither -- while proving nothing about the state an
+/// actually-migrated database is in when a later reader opens it.
+///
+/// It calls the same two backfills the migration calls, rather than hand-written SQL that
+/// would agree with them today and drift from them the first time either changed.
+pub(crate) fn seed_schema_v6(connection: &mut Connection) {
+    let tx = connection
+        .transaction()
+        .expect("fixture transaction begins");
+    backfill_search_index(&tx).expect("the fixture backfills its search index");
+    backfill_effective_time(&tx).expect("the fixture backfills effective time");
+    tx.commit().expect("fixture transaction commits");
 }
 
 /// Every FTS5 feature this schema needs must be present in the linked SQLite.
@@ -619,6 +648,14 @@ fn verify_promised_tables(connection: &Connection) -> Result<(), StoreError> {
 }
 
 /// Tables that must exist before this build serves any request.
+///
+/// This is deliberately the *whole* promised set rather than the tables the M001-M004
+/// migration path happened to touch. A database missing `registration_actions` or
+/// `network_secrets` declares the current version perfectly well -- `user_version` is a
+/// header, not a proof -- and would open successfully, only to fail later: every stored
+/// credential unreadable, every action replay refused. Refusing at open turns a runtime
+/// failure into a refusal the Operator sees at startup, which is the only place they can
+/// act on it.
 const REQUIRED_TABLES: &[&str] = &[
     "networks",
     "desired_channels",
@@ -626,9 +663,15 @@ const REQUIRED_TABLES: &[&str] = &[
     "client_cursors",
     "buffers",
     "read_markers",
+    "clients",
+    "network_secrets",
     // The FTS5 side index. It is a virtual table, so it appears in `sqlite_master`
     // alongside ordinary tables and can be checked the same way.
     "history_search",
+    // Schema 7's registration actions. Purely additive when it was introduced, and holding
+    // payloads that may be service credentials, so its absence must be an open failure
+    // rather than a per-request one.
+    "registration_actions",
 ];
 
 /// Indexes this build promises, beyond the presence of their table.

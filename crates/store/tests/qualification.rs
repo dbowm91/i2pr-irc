@@ -135,6 +135,32 @@ fn a_database_claiming_our_version_but_missing_tables_is_refused() {
     );
 }
 
+/// Every promised table is load-bearing at open, not just the ones an early migration used.
+///
+/// The existing test drops `history_events`, which the M001-M002 migration path also
+/// touches. This one walks the whole promised set, because `user_version` is a header a
+/// tampered or truncated database can claim at will: a database missing
+/// `registration_actions` or `network_secrets` looks perfectly current until the first
+/// replay or the first reconnection needs them.
+#[test]
+fn every_promised_table_is_required_at_open() {
+    for table in EXPECTED_TABLES {
+        let dir = testing::temp_dir(&format!("req{}", table));
+        let path = dir.db("req.sqlite3");
+        store_at(&path).shutdown().expect("store shuts down");
+        testing::execute(&path, &format!("DROP TABLE {table}"));
+
+        assert_eq!(
+            Store::open(&StorePath::File(path.clone()))
+                .err()
+                .map(|error| *error.kind()),
+            Some(StoreErrorKind::Corrupt("missing schema table")),
+            "a database missing {table} declares the current version and must be refused \
+             at open, not discovered when the table is first read"
+        );
+    }
+}
+
 #[test]
 fn strict_tables_reject_a_wrong_storage_class() {
     let dir = testing::temp_dir("strict");
@@ -2704,4 +2730,367 @@ async fn deleting_a_network_deletes_its_actions() {
     );
 
     store.shutdown().expect("store shuts down");
+}
+
+// ------------------------------------------- Plan 028: predecessor chain / restart
+
+/// Builds a fixture at each schema version this build can still be handed.
+///
+/// Every version is a *real* declaration rather than a newer one subtracted, and versions
+/// 4, 5 and 6 are seeded, because the migrations that follow them have to preserve
+/// something. A fixture holding only an empty schema passes whether a migration is correct
+/// or merely syntactically valid.
+fn predecessor_fixture(path: &std::path::Path, version: i64) {
+    match version {
+        1 => drop(testing::create_v1_database(path)),
+        2 => drop(testing::create_v2_database(path)),
+        3 => drop(testing::create_v3_database(path)),
+        4 => drop(testing::create_v4_database(path)),
+        5 => drop(testing::create_v5_database(path)),
+        6 => drop(testing::create_v6_database(path)),
+        other => panic!("no fixture for schema {other}"),
+    };
+}
+
+/// Every schema version a supported predecessor could have left on disk opens.
+///
+/// The point is the *chain*, not each step. `migrate_forward` applies one version at a time
+/// so a database several versions behind walks the path it would have taken on each
+/// intervening release; a set of per-step tests would not show that a v1 database, four
+/// releases out of date, still arrives intact.
+#[test]
+fn every_supported_predecessor_schema_opens_and_reaches_the_current_version() {
+    for version in 1..SCHEMA_VERSION {
+        let dir = testing::temp_dir(&format!("chain{version}"));
+        let path = dir.db("chain.sqlite3");
+        predecessor_fixture(&path, version);
+        assert_eq!(
+            testing::identity(&path).1,
+            version,
+            "fixture {version} declares its own version"
+        );
+
+        let store = store_at(&path);
+        assert_eq!(
+            testing::identity(&path).1,
+            SCHEMA_VERSION,
+            "a schema {version} database must reach the current schema in one open"
+        );
+        assert_eq!(
+            testing::tables(&path),
+            EXPECTED_TABLES,
+            "a schema {version} database must arrive at exactly the promised table set, \
+             not merely a version number that claims it did"
+        );
+        store.shutdown().expect("store shuts down");
+    }
+}
+
+/// A schema 4 database -- the last one M004 shipped -- reaches schema 7 with its Network
+/// intact and both M005 presence policies **off**.
+///
+/// "Off" is the load-bearing half. An upgraded binary that defaulted either policy on would
+/// start sending `AWAY` and reclaiming nicks upstream that the Operator never asked for,
+/// and nothing in the data would look wrong: the flags are valid, the rows are intact, and
+/// the bouncer connects. The only evidence that is a *default* is the default itself.
+#[tokio::test]
+async fn a_schema_four_database_reaches_the_current_schema_with_policies_disabled() {
+    let dir = testing::temp_dir("m4full");
+    let path = dir.db("m4full.sqlite3");
+    testing::create_v4_database(&path);
+    assert_eq!(testing::identity(&path).1, 4, "fixture is at schema 4");
+
+    let store = store_at(&path);
+    let records = store.handle().load_networks().await.expect("networks load");
+    assert_eq!(records.len(), 1, "the pre-existing Network survives");
+    let migrated = &records[0];
+    assert_eq!(
+        migrated.network,
+        NetworkId(1),
+        "the Network keeps its identity across four versions"
+    );
+    assert_eq!(
+        migrated.nick, "bot",
+        "the preferred nick is durable state and is carried forward unchanged"
+    );
+    assert_eq!(
+        migrated.desired_channels,
+        vec![i2pr_irc_store::DesiredChannelRecord::at("#room", 0, false)],
+        "desired membership is carried forward, and the channel that predates detached \
+         policy stays attached because hiding it would remove a channel nobody removed"
+    );
+    assert!(
+        !migrated.auto_away,
+        "auto-away must migrate disabled: an upgrade is not consent to start sending AWAY"
+    );
+    assert!(
+        !migrated.keep_nick,
+        "keep-nick must migrate disabled: an upgrade is not consent to start reclaiming nicks"
+    );
+
+    // And they are genuinely settable afterwards, rather than being read-only columns that
+    // always report false.
+    let mut enabled = migrated.clone();
+    enabled.auto_away = true;
+    enabled.keep_nick = true;
+    store
+        .handle()
+        .save_network(&enabled)
+        .await
+        .expect("policy saves");
+    let round = store
+        .handle()
+        .load_networks()
+        .await
+        .expect("networks reload");
+    assert!(
+        round[0].auto_away && round[0].keep_nick,
+        "a migrated column that could never be set would read as a policy that cannot \
+         be changed, which is exactly the failure a default-disabled policy hides"
+    );
+
+    store.shutdown().expect("store shuts down");
+}
+
+/// A schema 6 database reaches schema 7 with no registration actions invented for it.
+///
+/// The inverse of the previous test, and the reason the migration is additive: a Network
+/// that predates the action table must come back with an *empty* set, not a default action
+/// and not a row that replays something nobody configured.
+#[tokio::test]
+async fn a_schema_six_database_reaches_schema_seven_with_an_empty_action_set() {
+    let dir = testing::temp_dir("m67");
+    let path = dir.db("m67.sqlite3");
+    testing::create_v6_database(&path);
+    assert_eq!(testing::identity(&path).1, 6, "fixture is at schema 6");
+
+    let store = store_at(&path);
+    assert_eq!(
+        testing::identity(&path).1,
+        SCHEMA_VERSION,
+        "migrated forward"
+    );
+    assert!(
+        store
+            .handle()
+            .load_registration_actions(NetworkId(1))
+            .await
+            .expect("actions readable")
+            .is_empty(),
+        "a Network that predates registration actions must come back with none, rather \
+         than with a default that would replay upstream on every reconnect"
+    );
+    // The retained history the v6 fixture carries has to survive an unrelated migration.
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        3,
+        "an additive migration reads no existing table, so history is untouched by it"
+    );
+
+    store.shutdown().expect("store shuts down");
+}
+
+/// The schema 6 fixture carries the state migration 6 *derived*, not just declared.
+///
+/// Without this the v6 fixture is a shape, not a database: an empty `effective_time` and an
+/// empty FTS index would make every test above pass while describing something migration 6
+/// never produces. This is the fixture asserting its own faithfulness, so a future change to
+/// the backfill cannot quietly leave the migration matrix testing a fiction.
+#[test]
+fn the_schema_six_fixture_carries_the_state_its_migration_derived() {
+    let dir = testing::temp_dir("v6derived");
+    let path = dir.db("v6derived.sqlite3");
+    testing::create_v6_database(&path);
+
+    assert_eq!(
+        testing::count(
+            &path,
+            "SELECT count(*) FROM history_events WHERE effective_time = ''"
+        ),
+        0,
+        "every retained row has an effective time: the migration fills this in, and a row \
+         left at the empty default would sort before every real timestamp"
+    );
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_search"),
+        2,
+        "the side index is built for the two searchable events, not left empty"
+    );
+    assert_eq!(
+        testing::texts(
+            &path,
+            "SELECT body FROM history_search WHERE body != '' ORDER BY body"
+        ),
+        vec!["goodbye now".to_owned(), "hello there".to_owned()],
+        "the backfilled text is the stored payload's text, so search over a migrated \
+         buffer answers with what was actually said"
+    );
+}
+
+/// A migration that cannot complete leaves its predecessor exactly as it found it.
+///
+/// Repeated for the three M005-era steps, which previously had no rollback evidence at all
+/// -- only the 1 -> 2 and 2 -> 3 steps did. Each migration is broken the same way the
+/// existing tests break theirs: by occupying the schema with the thing it is about to add,
+/// so `ALTER TABLE ADD COLUMN` or `CREATE TABLE` fails on a real constraint.
+#[test]
+fn a_failed_m005_era_migration_leaves_its_predecessor_intact() {
+    // 4 -> 5 adds `networks.auto_away`.
+    let four = testing::temp_dir("m45rollback");
+    let four_path = four.db("m45.sqlite3");
+    testing::create_v4_database(&four_path);
+    testing::execute(
+        &four_path,
+        "ALTER TABLE networks ADD COLUMN auto_away INTEGER NOT NULL DEFAULT 0",
+    );
+    assert!(
+        Store::open(&StorePath::File(four_path.clone())).is_err(),
+        "a 4 -> 5 migration that cannot complete must not succeed"
+    );
+    assert_eq!(
+        testing::identity(&four_path).1,
+        4,
+        "a failed migration must leave the version four database untouched"
+    );
+    assert_eq!(
+        testing::count(&four_path, "SELECT count(*) FROM desired_channels"),
+        1,
+        "the pre-existing desired state is left exactly as it was rather than dropped"
+    );
+
+    // 5 -> 6 adds `history_events.effective_time`.
+    let five = testing::temp_dir("m56rollback");
+    let five_path = five.db("m56.sqlite3");
+    testing::create_v5_database(&five_path);
+    testing::execute(
+        &five_path,
+        "ALTER TABLE history_events ADD COLUMN effective_time TEXT NOT NULL DEFAULT ''",
+    );
+    assert!(
+        Store::open(&StorePath::File(five_path.clone())).is_err(),
+        "a 5 -> 6 migration that cannot complete must not succeed"
+    );
+    assert_eq!(
+        testing::identity(&five_path).1,
+        5,
+        "a failed migration must leave the version five database untouched"
+    );
+    assert_eq!(
+        testing::count(&five_path, "SELECT count(*) FROM history_events"),
+        3,
+        "retained history survives a failed migration intact"
+    );
+
+    // 6 -> 7 creates `registration_actions`.
+    let six = testing::temp_dir("m67rollback");
+    let six_path = six.db("m67r.sqlite3");
+    testing::create_v6_database(&six_path);
+    testing::execute(
+        &six_path,
+        "CREATE TABLE registration_actions (occupied TEXT NOT NULL)",
+    );
+    assert!(
+        Store::open(&StorePath::File(six_path.clone())).is_err(),
+        "a 6 -> 7 migration that cannot complete must not succeed"
+    );
+    assert_eq!(
+        testing::identity(&six_path).1,
+        6,
+        "a failed migration must leave the version six database untouched"
+    );
+}
+
+/// Nothing about a live session is written to the database.
+///
+/// Stated as a column-set assertion rather than a scan for values, because the failure this
+/// guards against is not "a stale nick was stored" but "a column exists that holds live
+/// state at all". A column that holds nothing today is a persistence surface a later change
+/// can fill, and the schema is the only place that can be closed against it.
+#[tokio::test]
+async fn a_restart_persists_desired_state_and_no_live_state() {
+    let dir = testing::temp_dir("restart028");
+    let path = dir.db("restart.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+
+    let mut durable = record(1, &["#alpha", "#beta"]);
+    durable.nick = "bot".into();
+    handle.save_network(&durable).await.expect("durable");
+    handle
+        .save_registration_actions(
+            NetworkId(1),
+            &[
+                stored_action(RegistrationActionKind::Mode, "+B", ""),
+                stored_action(RegistrationActionKind::Mode, "+o", "bot"),
+            ],
+        )
+        .await
+        .expect("durable");
+
+    let networks_columns: Vec<String> = testing::texts(
+        &path,
+        "SELECT name FROM pragma_table_info('networks') ORDER BY name",
+    );
+    assert_eq!(
+        networks_columns,
+        vec![
+            "auto_away".to_owned(),
+            "display_name".to_owned(),
+            "endpoint".to_owned(),
+            "endpoint_kind".to_owned(),
+            "keep_nick".to_owned(),
+            "network_id".to_owned(),
+            "nick".to_owned(),
+            "realname".to_owned(),
+            "username".to_owned(),
+        ],
+        "the Network row holds preferred identity, policy and endpoint -- and nothing \
+         else. A column for an observed nick, a live generation, a route, or a presence \
+         observation would be this exact test failing"
+    );
+    for forbidden in ["session", "generation", "route", "presence", "observed"] {
+        assert!(
+            !networks_columns.iter().any(|name| name.contains(forbidden)),
+            "{forbidden} state must not be a persisted column, found in {networks_columns:?}"
+        );
+    }
+    assert_eq!(
+        testing::tables(&path),
+        EXPECTED_TABLES,
+        "the table set has no live-state table either"
+    );
+    store.shutdown().expect("store shuts down");
+
+    // And the same durable facts come back, in order, after a real reopen.
+    let reopened = store_at(&path);
+    let reloaded = reopened
+        .handle()
+        .load_networks()
+        .await
+        .expect("networks reload");
+    assert_eq!(
+        reloaded[0].nick, "bot",
+        "the preferred nick, not an observed one"
+    );
+    assert_eq!(
+        reloaded[0].desired_channels, durable.desired_channels,
+        "desired membership returns in the order it was configured"
+    );
+    let actions = reopened
+        .handle()
+        .load_registration_actions(NetworkId(1))
+        .await
+        .expect("actions readable");
+    assert_eq!(
+        actions
+            .iter()
+            .map(|a| (a.kind, a.target.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (RegistrationActionKind::Mode, "+B"),
+            (RegistrationActionKind::Mode, "+o"),
+        ],
+        "replay order is part of the meaning of an action set, so it survives a restart"
+    );
+    reopened.shutdown().expect("store shuts down");
 }

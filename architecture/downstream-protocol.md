@@ -213,9 +213,11 @@ Two test-harness defects are recorded for the same reason as Plan 024's:
 
 - **No mid-generation `CAP REQ` for anything the bouncer does not serve.** Requesting a
   capability it cannot use would be a request for nothing.
-- **No `away-notify` or `account-notify`.** The bouncer does not implement them, and an
-  upstream announcement about one is not reported: it would advertise something no client
-  could ever get.
+- **No `away-notify` or `account-notify` without the upstream acknowledgement.** M005-G
+  accepted both, so they are no longer absent. They are advertised downstream only once the
+  server *acknowledged* them, and an upstream announcement about one reaches only the sessions
+  that negotiated it. Advertising them against a server that never offered them would advertise
+  something no client could ever get. See [member state](member-state.md).
 - **No upstream `time` fabrication on live frames.** See above.
 - **No `msgid` synthesis.** A `msgid` on a replayed message is emitted only when one was
   genuinely preserved upstream, unchanged from the pre-M005 plan.

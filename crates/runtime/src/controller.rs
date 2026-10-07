@@ -640,7 +640,16 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                     self.stopping = true;
                     break;
                 }
-                Some(request) = self.requests.recv() => self.dispatch(request).await,
+                Some(request) = self.requests.recv() => {
+                    self.dispatch(request).await;
+                    // Republished after every request, not only after a mutation, so a
+                    // `subscribe_status` watcher learns about owner-side movement (a
+                    // session attaching, a generation ending, an advertisement changing)
+                    // rather than only about the control-plane edits this controller
+                    // happens to be handling. Bounded by the same request queue that
+                    // already bounds control traffic.
+                    self.publish();
+                }
             }
         }
         self.shutdown().await;
@@ -921,6 +930,16 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
     async fn dispatch(&mut self, request: ControlRequest) {
         match request {
             ControlRequest::Status { reply } => {
+                // Recomputed rather than read from the last published value. Every
+                // owner-owned field in a `ControlNetwork` -- phase, attached sessions, the
+                // upstream advertisement -- is owned by a task this controller does not
+                // drive, and none of them changes because a *control-plane* mutation
+                // happened. Republishing only from `commit` therefore left `status()`
+                // answering from a snapshot taken before the last client attached: a LIST
+                // reported zero attached sessions for a Network with clients on it, and a
+                // stale phase. Republishing here is what makes the answer an observation
+                // rather than a memory.
+                self.publish();
                 let _ = reply.send(self.status.borrow().clone());
             }
             ControlRequest::Advertisement { network, reply } => {

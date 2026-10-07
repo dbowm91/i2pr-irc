@@ -27,9 +27,11 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 6
+## Schema version 7
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
+
+`SCHEMA_VERSION` is 7. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every database written since M002 migrates forward in place rather than being refused.
 
 | Table | Purpose |
 |---|---|
@@ -41,6 +43,7 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 | `history_events` | bounded durable history |
 | `client_cursors` | per-`(ClientId, BufferId)` playback position |
 | `read_markers` | per-`BufferId` operator read state |
+| `registration_actions` | ordered post-registration replay list, one row per Network position |
 | `history_search` | FTS5 **side index** over searchable history; `history_events` remains the source of truth |
 
 `history_search` is a virtual table, so its `…_data`, `…_idx`, `…_docsize`, `…_content`
@@ -140,6 +143,39 @@ after every INTEGER value regardless of the numbers involved — so the predicat
 either everything or nothing while still looking like a time comparison. `recent_targets`
 had exactly this bug and shipped it silently; `canonical_time` is now the only path by
 which a time bound reaches SQL.
+
+### What version 7 added, and why
+
+Version 7 adds `registration_actions` alone, for [constrained post-registration
+actions](operator-surfaces.md). Nothing existing is read, written, or rebuilt.
+
+The table is keyed `(network_id, position)` and that key is the design decision. Replay order
+is part of the meaning — an Operator who configured two actions wants them in the order they
+wrote them — and a store returning rows in an unspecified order would replay them in an
+arbitrary one. Making position part of the primary key settles the order at the storage layer
+instead of trusting a `SELECT` to happen to preserve insertion order.
+
+`kind` is `CHECK`-constrained to `('mode', 'message')`, the two shapes the runtime allowlist
+constructs. The constraint is the point: a row written by a future build is refused by SQLite
+rather than read back as an unknown kind that something downstream would have to guess at.
+
+The `payload` column is a `TEXT` blob that may hold a service password, so the read path wraps
+it in a `StoredSecret` before returning: no caller is handed an ordinary `String` that could be
+printed. Storage cannot enforce redaction on the way out; the read path can, and does.
+
+A read is `ORDER BY position` and bounded by `MAX_STORED_ACTIONS`, so a table holding more rows
+than the runtime's ceiling is truncated rather than replayed — the ceiling is a property of the
+model, and storage enforces the same one rather than assuming it.
+
+Cascading on `networks` means a deleted Network takes its actions with it, for the same reason
+it takes its buffers and history: a reused `NetworkId` must not inherit a list of commands it
+never configured.
+
+### Migrating version 6
+
+The v6 → v7 step is a single `CREATE TABLE`, inside the same migration transaction as every
+other step. There is no backfill because there is nothing to reinterpret, which is why an older
+bouncer binary pointed at a migrated database still sees exactly the configuration it had.
 
 ### Migrating version 5
 
