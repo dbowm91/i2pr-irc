@@ -1,6 +1,6 @@
 # Bouncer Core M005-G / Plan 026 — Richer IRCv3 Member-State Mediation
 
-Status: blocked
+Status: ready
 
 Blocker:
 
