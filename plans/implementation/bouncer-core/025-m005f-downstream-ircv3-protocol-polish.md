@@ -1,6 +1,6 @@
 # Bouncer Core M005-F / Plan 025 — Downstream IRCv3 Protocol Polish
 
-Status: blocked
+Status: ready
 
 Blocker:
 
