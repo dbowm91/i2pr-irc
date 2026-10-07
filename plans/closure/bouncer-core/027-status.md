@@ -201,6 +201,34 @@ The test is kept despite its two-minute cost, and the cost is documented on it, 
 replay on reconnect is a claim only a real reconnect can establish. Asserting it against a
 simulated generation would be asserting the fixture.
 
+#### Post-closure annotation (Plan 028) — the finding above was a fixture defect
+
+The finding is **withdrawn**. It was accurate as a measurement and wrong as a conclusion, and
+both halves of that are worth keeping on the record.
+
+What was measured was real: 120.9 s, matching `LIVENESS_DEADLINE` (120 s) rather than
+`CONNECT_TIMEOUT`. What was inferred from it — "the owner does not begin a new generation
+until roughly a `CONNECT_TIMEOUT` after the upstream ends" — was not a property of the bouncer
+at all. The bouncer ends a generation on end-of-stream **immediately**; `count == 0` from the
+owner's upstream read breaks the generation loop on the spot.
+
+The 120 s was the test's own. `Runtime::plain_peer` discarded the `FaultController` and
+`drive_registration` registered every generation with `upstreams_closable.push(None)`, so
+`drop_generation` was an `if let Some(..)` that silently matched nothing. The generation was
+never ended. The test then blocked in `next_peer()` waiting for a reconnect that only arrived
+when the keepalive liveness deadline expired, and asserted its real subject against that
+accidental reconnect. The replay assertion passed; it was measuring the keepalive timer.
+
+A second defect sat underneath it, in `crates/testkit`: `FaultController::close_write` woke
+`read_wakers[side]` and no writer waker, where the peer observing end-of-file is side
+`1 - side` and the closing side's own parked writer is also owed a wake. So even a working
+`drop_generation` would have stalled until some unrelated event touched the connection. The
+correct closure is now `close_write_half`, shared with `poll_shutdown`.
+
+Resolved in Plan 028: `crates/runtime/tests/m005h_diagnostics.rs` and
+`crates/testkit/src/lib.rs`, with three fixture tests pinning the wake contract. The test now
+completes in ~2 s instead of ~121 s, and it drops the generation it means to drop.
+
 ### Stated boundary: import is not transactional across Networks
 
 Recorded above under "The stated boundary". It is a deliberate limit of this plan, permitted
@@ -240,7 +268,8 @@ dependency-ready**. Everything it integrates is landed and tested:
 
 Plan 028 inherits two items it should resolve rather than merely re-measure:
 
-1. the ~120 s generation-teardown delay recorded above, which is a real maturity gap and which
+1. the ~120 s generation-teardown delay recorded above, which Plan 028 has since shown to be a
+   fixture defect rather than a bouncer behaviour (see the post-closure annotation), and which
    the known pre-existing `adverse.rs` startup-herd teardown flake sits next to;
 2. the cross-cutting qualification sweep — the privacy/redaction campaign, the restart
    campaign, and the anonymity review this plan performed only per-surface.

@@ -259,17 +259,46 @@ async fn wait_until(label: &str, mut ready: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
 
-/// Asserts a settled process really did return to where it started.
+/// How long a campaign is given to settle before the wait itself is the failure.
+const SETTLE_CEILING: Duration = Duration::from_secs(5);
+
+/// Waits for the process to return to `baseline`, then asserts it did.
 ///
-/// The peak is reported on failure because "settled != baseline" is far easier to
-/// diagnose when the caller can also see what the process was holding.
-#[track_caller]
-fn assert_settled(baseline: &ResourceSnapshot, settled: &ResourceSnapshot) {
-    assert_eq!(
-        settled.current, baseline.current,
-        "the process did not return to its baseline; peak was {:?}",
-        settled.peak
-    );
+/// The store worker is a separate task draining a bounded queue, so a request enqueued by
+/// an owner that has just been joined can still be in flight at the moment the last owner
+/// task returns. Reading the ledger in that same instant races the store worker, and the
+/// race showed up as a single leftover `store_queue` entry on roughly one run in eight.
+///
+/// That entry is not a leak. It is a request that has not been serviced yet, and it is
+/// indistinguishable from a serviced one the moment after -- which is precisely why the
+/// claim under test is that the process *settles*, not that it is instantly quiet. So the
+/// assertion waits for its own premise.
+///
+/// The wait is bounded and tight, so this cannot hide a real leak: a request the store
+/// never services would leave the queue permanently non-empty and fail at the ceiling.
+///
+/// No `#[track_caller]`: it is a no-op on an async fn, and the failure message below is
+/// self-describing anyway.
+async fn settle_within(
+    resources: &ResourceLedger,
+    baseline: &ResourceSnapshot,
+) -> ResourceSnapshot {
+    let deadline = tokio::time::Instant::now() + SETTLE_CEILING;
+    loop {
+        let settled = resources.snapshot();
+        if settled.current == baseline.current {
+            return settled;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the process did not settle to its baseline within {SETTLE_CEILING:?}; \
+             last reading was {:?} against baseline {:?}; peak was {:?}",
+            settled.current,
+            baseline.current,
+            settled.peak
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 // ------------------------------------------------- section 3: startup herd
@@ -356,13 +385,12 @@ async fn a_startup_herd_at_the_ceiling_never_exceeds_the_connect_ceiling() {
     );
 
     fleet.shutdown().await;
-    let settled = resources.snapshot();
+    let settled = settle_within(&resources, &baseline).await;
     assert!(
         settled.current.owner_tasks == 0,
         "stopping the fleet must return the process to zero owner tasks"
     );
     assert_eq!(settled.networks, 0, "no Network may outlive its owner");
-    assert_settled(&baseline, &settled);
 }
 
 /// The rate axis, at fleet scale.
@@ -419,7 +447,7 @@ async fn a_startup_herd_is_admitted_at_the_burst_rate_not_all_at_once() {
     );
 
     fleet.shutdown().await;
-    assert_settled(&baseline, &resources.snapshot());
+    settle_within(&resources, &baseline).await;
 }
 
 // ------------------------------------------------ section 3: shared outage
@@ -538,7 +566,7 @@ async fn a_simultaneous_outage_ends_every_generation_and_replays_nothing() {
         task.abort();
         let _ = task.await;
     }
-    assert_settled(&baseline, &resources.snapshot());
+    settle_within(&resources, &baseline).await;
 }
 
 async fn read_until(stream: &mut ScriptedStream, needle: &[u8]) -> Vec<u8> {
@@ -705,7 +733,7 @@ async fn a_stalled_provider_produces_a_bounded_number_of_attempts() {
         member.task.abort();
         let _ = member.task.await;
     }
-    assert_settled(&baseline, &resources.snapshot());
+    settle_within(&resources, &baseline).await;
 }
 
 // ------------------------------------------------ section 10: churn at scale
@@ -778,5 +806,5 @@ async fn reconnect_churn_leaves_no_residue() {
     );
 
     fleet.shutdown().await;
-    assert_settled(&baseline, &resources.snapshot());
+    settle_within(&resources, &baseline).await;
 }

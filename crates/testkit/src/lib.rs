@@ -147,13 +147,29 @@ impl FaultController {
         s.read_reset[side] = true;
         wake(&mut s.read_wakers[side]);
     }
+    /// Closes one side's write half.
+    ///
+    /// Two readers of the connection depend on that, and missing either one produces a
+    /// stall rather than an error:
+    ///
+    /// - the **peer's reader** (`read_wakers[1 - side]`), because bytes written by one side
+    ///   land in the other side's input buffer, so `1 - side` is the side that next sees
+    ///   end-of-file. This is the target `poll_shutdown` and `Drop` already use.
+    /// - **the closing side's own writer** (`write_wakers[side]`), because its writes now
+    ///   return `BrokenPipe`. A writer parked waiting for buffer capacity has no other way
+    ///   to learn that its own write half went away, and in the owner that parked writer is
+    ///   the task whose exit is what ends the generation.
+    ///
+    /// Waking neither, or the wrong one, leaves the connection looking alive to both ends:
+    /// the owner then took a full liveness interval (120 s) to notice a disconnect that had
+    /// already happened, because the only thing that eventually woke it was the next
+    /// keepalive probe tick.
     pub fn close_write(&self, side: usize) {
         if side > 1 {
             return;
         }
         let mut s = self.0.0.lock().expect("fixture lock poisoned");
-        s.write_closed[side] = true;
-        wake(&mut s.read_wakers[side]);
+        close_write_half(&mut s, side);
     }
     pub fn bytes_written(&self, side: usize) -> Vec<u8> {
         if side > 1 {
@@ -193,6 +209,18 @@ fn wake(slot: &mut Option<Waker>) {
     if let Some(w) = slot.take() {
         w.wake()
     }
+}
+
+/// Applies a closed write half, and wakes everything that was waiting on that state.
+///
+/// Shared by [`FaultController::close_write`] and `poll_shutdown` because the two are the
+/// same transition reached by different routes, and a fixture where a graceful shutdown
+/// and a scripted one disagree about who to wake is a fixture whose disconnect campaigns
+/// measure the wrong thing.
+fn close_write_half(s: &mut State, side: usize) {
+    s.write_closed[side] = true;
+    wake(&mut s.write_wakers[side]);
+    wake(&mut s.read_wakers[1 - side]);
 }
 pub struct ScriptedStream {
     shared: Arc<Shared>,
@@ -334,8 +362,7 @@ impl AsyncWrite for ScriptedStream {
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         let side = self.side;
         let mut s = self.shared.0.lock().expect("fixture lock poisoned");
-        s.write_closed[side] = true;
-        wake(&mut s.read_wakers[1 - side]);
+        close_write_half(&mut s, side);
         Poll::Ready(Ok(()))
     }
 }
@@ -780,5 +807,82 @@ mod tests {
             "a delayed release must not buffer past the capacity the script declares"
         );
         assert_eq!(c.delivered(1), 4);
+    }
+
+    #[tokio::test]
+    async fn closing_one_side_wakes_the_peers_reader() {
+        let (_a, mut b, c) = ScriptedStream::pair(FaultScript::default());
+        // `b` is side 1, so it observes the end of side 0's write half. Park it on an
+        // empty buffer first: that is the only state in which the wake is load-bearing,
+        // because a reader holding bytes does not need to be told that the stream ended.
+        let read = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            b.read(&mut buf).await.unwrap()
+        });
+        tokio::task::yield_now().await;
+        c.close_write(0);
+        // A test timeout rather than a bare await: the defect this guards against does not
+        // hang, it stalls. The reader is woken by some *later*, unrelated event -- in the
+        // owner, the liveness probe tick -- so the stall is bounded but very long, and a
+        // plain `await` would look like a slow machine rather than a wrong wake target.
+        let count = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("the peer reader is woken when the far side closes its write")
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a closed write half reads as end-of-file, not as data"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_one_side_does_not_wake_the_closing_sides_reader() {
+        let (mut a, _b, c) = ScriptedStream::pair(FaultScript::default());
+        // The mirror image, and the half of the pair that actually went wrong. Waking
+        // `read_wakers[side]` wakes the closer, whose read is still legitimately pending,
+        // and leaves the peer that is owed the end-of-file asleep until something else
+        // happens to touch the connection.
+        let read = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            a.read(&mut buf).await.unwrap()
+        });
+        tokio::task::yield_now().await;
+        c.close_write(0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), read)
+                .await
+                .is_err(),
+            "side 0's own read is not finished by side 0 closing its write"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_one_side_wakes_that_sides_parked_writer() {
+        let (a, _b, c) = ScriptedStream::pair(FaultScript {
+            // A full buffer is the only way a writer parks: with room left, every write
+            // completes on its first poll and there is nothing for a wake to interrupt.
+            capacity: 1,
+            ..Default::default()
+        });
+        let writer = tokio::spawn(async move {
+            let mut a = a;
+            a.write_all(b"far too many bytes to fit").await
+        });
+        tokio::task::yield_now().await;
+        c.close_write(0);
+        // This is the wake whose absence cost the owner a full liveness interval. The
+        // upstream writer task is parked here waiting for capacity; closing its own write
+        // half must return `BrokenPipe` immediately rather than leaving the generation
+        // alive until the next keepalive probe happened to write something.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("a parked writer is woken when its own write half closes")
+            .expect("the writer task joins");
+        assert_eq!(
+            result
+                .expect_err("a closed write half must refuse writes")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 }

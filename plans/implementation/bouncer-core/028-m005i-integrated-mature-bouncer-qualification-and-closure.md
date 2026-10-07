@@ -8,10 +8,13 @@ Blocker:
 
 Carried in from the Plan 027 closure, to resolve rather than merely re-measure:
 
-- A generation teardown takes about 120 s to be noticed. Plan 027 recorded this as a
+- A generation teardown took about 120 s to be noticed. Plan 027 recorded this as a
   pre-existing finding after measuring 120.9 s with no registration actions configured at
-  all, against a CONNECT_TIMEOUT of 120 s: the owner does not begin a new generation until
-  roughly that long after the upstream stream ends, rather than reacting to the end of it.
+  all, against a CONNECT_TIMEOUT of 120 s. **Resolved during this plan's execution:** the
+  measurement was sound and the conclusion was not. The bouncer ends a generation on
+  end-of-stream immediately; the 120 s was `LIVENESS_DEADLINE` firing in a test whose
+  `drop_generation` had silently done nothing. See "Post-closure annotation" in
+  plans/closure/bouncer-core/027-status.md and this record's resolution section.
 
 Research authority:
 

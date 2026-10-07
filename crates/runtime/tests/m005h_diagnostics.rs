@@ -70,10 +70,10 @@ impl Provider {
         Self(provider)
     }
 
-    async fn plain_peer(&self) -> ScriptedStream {
+    async fn plain_peer(&self) -> (ScriptedStream, i2pr_irc_testkit::FaultController) {
         let peer = self.0.take_peer().await;
-        self.0.take_controller().await;
-        peer
+        let controller = self.0.take_controller().await;
+        (peer, controller)
     }
 
     /// Takes the next upstream peer *and* the controller that can end it.
@@ -258,16 +258,33 @@ impl Runtime {
 
     /// Ends one generation's upstream, which is what makes the owner reconnect.
     ///
-    /// Closing the far side's write is what the owner observes as a disconnect. Dropping
-    /// the local end would instead leave the owner waiting on a fixture whose other half is
-    /// gone, which is a hang rather than a reconnect.
+    /// Closing the *peer's* write half is what the owner observes as a disconnect: the
+    /// owner's read then returns end-of-file, which ends the generation immediately.
+    /// Dropping the local end would instead leave the owner waiting on a fixture whose
+    /// other half is gone, which is a hang rather than a reconnect.
     async fn drop_generation(&mut self, peer: usize) {
-        if let Some(controller) = self.upstreams_closable[peer].take() {
-            // Side 0 is the upstream end the test holds; closing *its* write is what makes
-            // the owner's read (side 1) return end-of-file. Closing side 1 instead ends the
-            // test's own reads and leaves the owner waiting on a live connection.
-            controller.close_write(0);
-        }
+        let controller = self
+            .upstreams_closable
+            .get_mut(peer)
+            .and_then(|slot| slot.take())
+            .unwrap_or_else(|| {
+                panic!(
+                    "generation {peer} has no controller, so ending it would be a no-op \
+                     and the test would go on to measure whatever eventually tore the \
+                     generation down instead"
+                )
+            });
+        // `connect()` hands side 0 to the *owner* and the peer on side 1 to the test.
+        // The upstream server is side 1, so `close_write(1)` is "the server hung up":
+        // side 0's read sees end-of-file and the generation ends at once.
+        //
+        // This is deliberately *not* `close_write(0)`, which would close the owner's own
+        // write half. That models "our writes broke", which a bouncer cannot detect
+        // until it next writes -- and since an idle bouncer writes only its keepalive
+        // probe, the generation would survive until `LIVENESS_DEADLINE`. It is a real
+        // condition with a real detection limit, but it is not "the upstream ended",
+        // and a test that calls it that would be measuring the keepalive timer.
+        controller.close_write(1);
     }
 
     async fn upstream(&mut self, peer: usize) -> &mut ScriptedStream {
@@ -304,7 +321,7 @@ impl Runtime {
         own_join: &str,
         extra_names: &str,
     ) -> usize {
-        let mut upstream = self.provider.plain_peer().await;
+        let (mut upstream, controller) = self.provider.plain_peer().await;
         read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         let ack = cap_ls
             .split_whitespace()
@@ -387,7 +404,11 @@ impl Runtime {
         }
         let peer = self.upstreams.len();
         self.upstreams.push(upstream);
-        self.upstreams_closable.push(None);
+        // The controller is retained for *every* generation, not only the ones a test
+        // expects to end. A peer registered as `None` here is a peer no test can drop, and
+        // a test that then calls `drop_generation` on it waits -- silently, and for a full
+        // liveness interval -- for a generation that was never actually ended.
+        self.upstreams_closable.push(Some(controller));
         // Liveness alone is not enough. The advertisement is published just after upstream
         // negotiation finishes, and a client that registers in between would be answered
         // against the fallback list -- which is a real ordering this test must not race.
@@ -1208,12 +1229,20 @@ async fn an_identify_line_with_a_space_replays_whole() {
     runtime.stop().await;
 }
 
-/// Takes about two minutes of wall clock, and not because of anything this module does:
-/// the bouncer does not begin a new generation until roughly `CONNECT_TIMEOUT` after the
-/// upstream stream ends, which predates Plan 027 and is recorded as a finding in
-/// `plans/closure/bouncer-core/027-status.md`. The test is kept despite the cost because a
-/// replay on reconnect is a claim that only a real reconnect can establish -- asserting it
-/// against a simulated generation would be asserting the fixture, not the bouncer.
+/// A reconnect replays the whole action sequence, from the beginning.
+///
+/// This test used to take about two minutes, and the reason it recorded was wrong. It
+/// claimed the bouncer does not begin a new generation until roughly `CONNECT_TIMEOUT`
+/// after the upstream stream ends. The bouncer does not have that behaviour: an upstream
+/// server that hangs up produces end-of-file on the owner's read, which ends the
+/// generation at once. What actually happened is that this module registered the first
+/// generation with no fault controller, so `drop_generation` was a silent no-op, the
+/// generation was never ended, and the test simply waited for `LIVENESS_DEADLINE` to end
+/// it -- and then asserted its real subject against that accidental reconnect.
+///
+/// That distinction is the whole point of the test. A replay on reconnect is a claim that
+/// only a *deliberately caused* reconnect can establish; measured against a keepalive
+/// timeout it was asserting the timer, not the bouncer.
 #[tokio::test]
 async fn a_reconnect_replays_the_action_sequence_intentionally() {
     // The plan's explicit semantics: these are per-generation setup, not an ambiguous user
