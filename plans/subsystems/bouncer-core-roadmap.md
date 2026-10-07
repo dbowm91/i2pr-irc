@@ -132,7 +132,7 @@ Research 005 decomposed M004 and promoted the unresolved response-routing findin
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
-Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. Plans 020-025 are closed and Plan 026 is the only dependency-ready step.
+Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. Plans 020-026 are closed and Plan 027 is the only dependency-ready step.
 
 ## 5. Target architecture
 
@@ -254,11 +254,11 @@ Corrective 019      M005-A / 020
                  IRCv3 protocol polish
                         |
                         v
-                   M005-G / 026 (ready)
+                   M005-G / 026 (closed)
                  richer IRCv3 state
                         |
                         v
-                   M005-H / 027
+                   M005-H / 027 (ready)
              diagnostics/config/actions
                         |
                         v
@@ -530,8 +530,8 @@ Implementation decomposition:
 4. M005-D / Plan 023 — bouncer-networks and local IRC administration. **Closed**, no open findings.
 5. M005-E / Plan 024 — indexed history search and CHATHISTORY completion. **Closed**, no open findings. Landed the `soju.im/search` adapter, schema 6's FTS5 side index whose rowid is the `HistoryEventId`, the `effective_time` rule with a single shared definition, indexed `msgid` and `timestamp` reference lookups, the `HistoryPosition` model for out-of-window references, and a two-seek `AROUND`. Removed `reference_candidates`, the window scan every reference used to go through.
 6. M005-F / Plan 025 — downstream IRCv3 protocol polish. **Closed**, no open findings. Landed the `server-time`, `standard-replies`, `cap-notify` and `draft/no-implicit-names` promotions, `echo-message` as a conditional capability, a three-state per-session tag surface, a per-session refusal form, and one live advertisement shared by the owner and the session reader. Upstream `CAP` lines are consumed rather than fanned out.
-7. M005-G / Plan 026 — richer IRCv3 member-state mediation. **Ready**.
-8. M005-H / Plan 027 — operator diagnostics, configuration snapshots and constrained registration actions. **Blocked on Plan 026 closure**.
+7. M005-G / Plan 026 — richer IRCv3 member-state mediation. **Closed**.
+8. M005-H / Plan 027 — operator diagnostics, configuration snapshots and constrained registration actions. **Ready**.
 9. M005-I / Plan 028 — integrated mature-bouncer qualification and M005 closure. **Blocked on Plan 027 closure**.
 
 Only the earliest dependency-ready plan is executable at a time. Research 006 and ADR-0003 are the architecture authority for the control-session line.
@@ -685,6 +685,6 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M005-D / Plan 023 | closed | plans/implementation/bouncer-core/023-m005d-bouncer-networks-and-local-irc-administration.md | plans/closure/bouncer-core/023-status.md | Plan 022 closure |
 | M005-E / Plan 024 | closed | plans/implementation/bouncer-core/024-m005e-indexed-history-search-and-chathistory-completion.md | plans/closure/bouncer-core/024-status.md | Plan 023 closure |
 | M005-F / Plan 025 | closed | plans/implementation/bouncer-core/025-m005f-downstream-ircv3-protocol-polish.md | plans/closure/bouncer-core/025-status.md | Plan 024 closure |
-| M005-G / Plan 026 | ready | plans/implementation/bouncer-core/026-m005g-richer-ircv3-member-state-mediation.md | future plans/closure/bouncer-core/026-status.md | Plan 025 closure |
-| M005-H / Plan 027 | blocked | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | future plans/closure/bouncer-core/027-status.md | Plan 026 closure |
+| M005-G / Plan 026 | closed | plans/implementation/bouncer-core/026-m005g-richer-ircv3-member-state-mediation.md | plans/closure/bouncer-core/026-status.md | Plan 025 closure |
+| M005-H / Plan 027 | ready | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | future plans/closure/bouncer-core/027-status.md | Plan 026 closure |
 | M005-I / Plan 028 | blocked | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | future plans/closure/bouncer-core/028-status.md | Plan 027 closure |
