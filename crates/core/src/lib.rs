@@ -561,6 +561,50 @@ mod tests {
         }
     }
 
+    /// A real router's Destination is longer and uses a different alphabet than base64url.
+    ///
+    /// Found by qualifying against i2pd 2.61.0, which returns a **908-character** I2P
+    /// base64 Destination: `-` and `~` where RFC 4648 uses `+` and `/`, with trailing `=`.
+    /// A base64url-only rule would have rejected every one of them, which is why the
+    /// alphabet is the union recorded in Plan 029's closure.
+    ///
+    /// The value below is synthetic and shaped like the live one rather than captured from
+    /// it. A real Destination is key material and does not belong in a repository, even a
+    /// transient one; what has to be preserved is the shape.
+    #[test]
+    fn endpoint_accepts_a_live_router_i2p_base64_destination() {
+        let mut destination = String::with_capacity(908);
+        // Interleave the two characters standard base64url would reject.
+        while destination.len() + 4 <= 906 {
+            destination.push_str("A~-B");
+        }
+        while destination.len() < 906 {
+            destination.push('A');
+        }
+        // Padded, as the live observation was.
+        destination.push_str("==");
+        assert_eq!(destination.len(), 908, "the live observation's length");
+
+        let parsed =
+            I2pEndpoint::parse(&destination).expect("a real i2pd Destination must be accepted");
+        assert_eq!(parsed.kind(), I2pEndpointKind::Destination);
+        // A destination keeps its own case: it is opaque key material, not a name.
+        assert_eq!(parsed.as_str(), destination);
+        assert_eq!(
+            format!("{:?}", parsed),
+            "I2pEndpoint([redacted])",
+            "908 characters of key material must never reach a log line"
+        );
+
+        // The same token is still not a `.b32.i2p` name. A b32 label is 52 or 56-63
+        // characters, so mistaking a Destination for an address would mean accepting a
+        // 908-character hostname, which the guard exists to refuse.
+        assert!(
+            I2pEndpoint::parse(&format!("{destination}.b32.i2p")).is_err(),
+            "a Destination-length token must not pass the name guard"
+        );
+    }
+
     /// The name forms keep their own tighter bounds even though the endpoint ceiling rose.
     ///
     /// Raising the ceiling for Destinations must not have loosened hostnames: a 4000-byte

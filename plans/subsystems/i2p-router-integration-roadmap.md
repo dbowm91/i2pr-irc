@@ -1,6 +1,6 @@
 # I2P Router Integration Roadmap
 
-Status: active — R001-A, R001-B, and R001-C closed; R001-D ready; R002/R003 gated on external contracts
+Status: conditionally closed — R001-A through R001-D closed; R001 portability evidence-blocked; R002/R003 gated on external contracts
 
 Long-term references:
 
@@ -87,7 +87,7 @@ Official SAM guidance supports the selected baseline: 3.1 is stable/recommended,
 
 The i2pr repository has substantial closed SAM 3.1 localhost/server evidence and is a high-value qualification target, but i2pr private crates are not a bouncer dependency. The separate SAM library effort is likewise a future conformance/backend candidate rather than an R001 blocker.
 
-R001 implementation handoffs are registered as Plans 029-032. Plan 032 is the only dependency-ready handoff; R001-A / Plan 029, R001-B / Plan 030, and R001-C / Plan 031 are closed.
+R001 implementation handoffs are registered as Plans 029-032, and all four are closed. R001 itself is **conditionally closed**: implementation is complete and i2pd 2.61.0 confirmed the handshake, session creation, stream establishment, and session reuse, but application bytes were never observed traversing a live I2P stream, and Java I2P and i2pr were unavailable. Portability is evidence-blocked, not passed.
 
 ## 5. Target architecture
 
@@ -190,7 +190,7 @@ Implementation decomposition:
 1. R001-A / Plan 029 — provider scope, lifecycle, and endpoint foundation. **Closed**; plans/closure/router-integration/029-status.md.
 2. R001-B / Plan 030 — owned SAM 3.1 wire/client foundation. **Closed**; plans/closure/router-integration/030-status.md.
 3. R001-C / Plan 031 — per-Network SAM provider integration. **Closed**; its hard dependency on 030 was satisfied and its own closure records five fixed defects plus the connect-budget reconciliation.
-4. R001-D / Plan 032 — cross-router qualification and R001 closure. **Ready**: hard dependency met, with live-router evidence still to be gathered, or its absence recorded as not-run.
+4. R001-D / Plan 032 — cross-router qualification and R001 closure. **Closed.** i2pd 2.61.0 qualified to the stream-establishment stage; the byte-exchange and Java I2P/i2pr rows are recorded as not-run, and R001 closes conditionally rather than as a portable-SAM pass.
 
 Required behavior:
 
@@ -350,10 +350,10 @@ Proposal 170 is not required for completion unless a later canonical product req
 
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
-| R001 | active / in progress | Plans 029-032 | future plans/closure/router-integration/032-status.md | Plans 029-031 closed; Plan 032 ready pending live-router evidence |
+| R001 | conditionally closed | Plans 029-032 | plans/closure/router-integration/032-status.md | Implementation complete; live stream byte delivery and Java I2P/i2pr portability still unproven |
 | R001-A / Plan 029 | closed | plans/implementation/router-integration/029-r001a-provider-scope-lifecycle-and-endpoint-foundation.md | plans/closure/router-integration/029-status.md | none |
 | R001-B / Plan 030 | closed | plans/implementation/router-integration/030-r001b-owned-sam31-wire-client-foundation.md | plans/closure/router-integration/030-status.md | none |
 | R001-C / Plan 031 | closed | plans/implementation/router-integration/031-r001c-per-network-sam-provider-integration.md | plans/closure/router-integration/031-status.md | none |
-| R001-D / Plan 032 | ready | plans/implementation/router-integration/032-r001d-sam-cross-router-qualification-and-closure.md | future plans/closure/router-integration/032-status.md | Plan 031 closure met; operational live-router evidence still outstanding |
+| R001-D / Plan 032 | closed | plans/implementation/router-integration/032-r001d-sam-cross-router-qualification-and-closure.md | plans/closure/router-integration/032-status.md | none |
 | R002 | blocked | future | future | R001 closure + stable i2pr app stream/listener/lifecycle contracts |
 | R003 | research-blocked | future only if justified | future | concrete product need + stable scoped control contract |

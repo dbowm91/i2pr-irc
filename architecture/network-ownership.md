@@ -1,5 +1,18 @@
 # Network and session ownership
 
+## The same rule one layer down: one router scope per Network
+
+Ownership does not stop at the IRC layer. Below the runtime, `SamProvider` holds exactly one
+long-lived SAM session per durable `NetworkId`, and that session survives any number of IRC
+connection generations. The two layers therefore agree on which Network a resource belongs
+to: the owner is the only writer of IRC state, and the provider scope is the only holder of
+that Network's router identity.
+
+An IRC reconnect never releases the scope, because the identity belongs to the Network rather
+than to a generation. Deleting the Network, or shutting down, releases it exactly once and only
+after the owner has been joined. This is what stops two Networks from ever sharing a router
+identity, and therefore what stops an observer at the bridge from correlating them.
+
 ## One live owner per Network
 
 Each upstream Network has exactly one live owner. `NetworkOwner` holds that Network's `NetworkState` as a plain local value — never behind a shared lock — and is the only thing that may mutate it.

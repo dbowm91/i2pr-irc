@@ -1,0 +1,22 @@
+bridge: 127.0.0.1:7656
+  HELLO: PASS
+  peer SESSION ok in 24.0s id_echoed=False destlen=908
+  SESSION CREATE (independent peer): PASS — 24.0s
+  control SESSION ok in 30.0s id_echoed=False destlen=908
+  SESSION CREATE (owned topology): PASS — 30.0s
+  STREAM CONNECT: PASS — 0.6s, STREAM STATUS RESULT=OK
+  binary fixture reaches the peer: NOT RUN — 0 of 31 bytes
+  reply reaches the client: NOT RUN — 0 of 13 bytes
+  second stream reuses the session: PASS — STREAM STATUS RESULT=OK
+
+--- summary ---
+PASS     HELLO
+PASS     SESSION CREATE (independent peer) (24.0s)
+PASS     SESSION CREATE (owned topology) (30.0s)
+PASS     STREAM CONNECT (0.6s, STREAM STATUS RESULT=OK)
+NOT RUN  binary fixture reaches the peer (0 of 31 bytes)
+NOT RUN  reply reaches the client (0 of 13 bytes)
+PASS     second stream reuses the session (STREAM STATUS RESULT=OK)
+
+5 passed, 0 failed, 2 not run
+NOT RUN steps are reported as evidence unavailable, never as passes.

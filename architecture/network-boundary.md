@@ -31,6 +31,27 @@ Release is explicit because a router scope outlives any single IRC connection. A
 - deleting a Network releases **after** the owner task has joined and **before** the durable row is forgotten, so a failed release leaves a Network that is configured but stopped and can be retried, and no release can race a connect still inside the provider;
 - shutdown releases every configured scope, including those with no live owner, and one failure does not prevent the remaining attempts.
 
+### The one permitted exception, and what it costs
+
+`crates/sam` is the only code in the workspace permitted to open a socket, and only to a
+numeric loopback address. The allowlist is two files — `src/client.rs` and `src/fake.rs` — and
+`SamProvider` is deliberately *not* on it: the provider holds no socket, so a third allowlisted
+file would be the signal that TCP authority had started spreading. The control-socket watcher
+that notices a dead session therefore lives in `client.rs`, where the socket already is.
+
+The exception is bounded in four ways that do not depend on a reviewer remembering them:
+
+- the endpoint type cannot represent a non-loopback address, so authority is a type rather
+  than a check;
+- no resolver call exists in the crate, and the scan fails on `ToSocketAddrs` even in the two
+  allowlisted files;
+- the request set is frozen — three request lines, nothing else can be sent;
+- every phase has a deadline and every collection has a ceiling.
+
+Qualification against i2pd 2.61.0 found that the router returns a 908-character I2P-base64
+Destination using `-` and `~`. The endpoint alphabet accepts that union for exactly this
+reason; a base64url-only rule would have rejected every real i2pd Destination.
+
 Releasing an unknown or already-released Network is a no-op, which is what makes a retry after a timeout converge rather than wedging a Network permanently undeletable. Release is bounded by `PROVIDER_RELEASE_TIMEOUT`, deliberately far below the connect budget because it runs where a caller is already blocked and shutdown has no timeout of its own.
 
 The network guard scans source, build scripts, and crate manifests for every first-party crate that could own network access — `core`, `wire`, `store`, `runtime`, `sam`, and `testkit` — plus each crate's normal, build, and dev dependency tree. The store is scanned because its SQLite dependency tree is third-party native code. Covering the runtime matters because it owns the upstream connection and the downstream client sockets. Positive controls exercise the same predicates and the same crate scoping against a synthetic fixture tree, including a dedicated store fixture, so a future coverage regression fails the guard instead of silently narrowing the boundary.

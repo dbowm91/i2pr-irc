@@ -153,10 +153,59 @@ Every exchange is a plain `async fn` with the socket held across its `await`. Th
 `tokio::spawn`, no cancellation channel, and no join: dropping a pending future drops its
 socket, which is the required property, reached without three extra places to be wrong.
 
+## Per-Network SAM identity
+
+`SamProvider` composes one long-lived session per durable `NetworkId`, so that composing
+lives in the adapter and the runtime never learns SAM syntax. One task per scope owns one
+session, one control socket, and one epoch; the map holds senders and join handles only, and
+never an `await` under its lock.
+
+The identity is transient and is not durable:
+
+- **Per-Network.** One durable Network presents one router-side identity for as long as that
+  session stays healthy. Two Networks never share one, so an observer at the bridge cannot
+  correlate their conversations by session identifier.
+- **Not persistent.** R001 supports no persistent Destination. Nothing on disk can be
+  re-presented later.
+- **It changes** when the provider or router recreates the session, and after a process
+  restart. Each change is a new I2P identity, and therefore a new linkability boundary.
+- **One tunnel pool per active Network.** This follows directly from one identity per
+  Network. The repository ceiling is 64 live scopes; live router limitations do not change
+  that ceiling.
+
+A peer-level failure — `CANT_REACH_PEER`, a stream timeout — does **not** end the session. Only
+an `INVALID_ID`, a control-socket end of stream, or a release does. Churning the identity on
+every IRC outage is exactly what the long-lived session exists to prevent.
+
+The scope ceiling and release deadline are constructor arguments rather than imports, because
+the runtime depends on this crate: importing its constants would be a cycle, and the number
+the runtime enforces has to be literally the runtime's.
+
+## Router-facing behaviour observed live
+
+Qualified against **i2pd 2.61.0** on loopback. These are properties of real router behaviour
+that the deterministic suites could not have told us:
+
+- i2pd answers `SESSION STATUS RESULT=OK` **without an `ID=` field**. A client that supplied
+  no identifier and waited for the router to name the session would hang. This adapter
+  supplies its own 128-bit ID and requires only `RESULT=`.
+- The Destination i2pd returns is **908 characters of I2P base64** — `-` and `~` where RFC
+  4648 uses `+` and `/`. It is not a `.b32.i2p` name and must not be treated as one.
+- `STREAM CONNECT` must go out on its **own** connection, naming the session established on
+  the control socket. Sending it on the session's own socket yields
+  `SESSION STATUS RESULT=I2P_ERROR MESSAGE="Socket already in use"`.
+- Establishing a stream as a peer requires a published LeaseSet, so a *peer* must be created
+  with `i2cp.dontPublishLeaseSet=false`. This adapter keeps `=true`, which is correct for a
+  client that never needs to be reachable.
+
+Carrying application bytes through a live I2P stream is **not** established; see
+`plans/closure/router-integration/032-status.md`.
+
 ## What this crate does not know
 
-A `NetworkId`. Session identity, framing, and deadlines are all router-neutral; composing one
-session per configured Network is Plan 031's work, behind `I2pStreamProvider`.
+A `NetworkId` below the provider boundary. Framing and deadlines are router-neutral; the
+identity is the one thing that is deliberately per-Network, and it lives in `SamProvider`
+rather than in the wire layer.
 
 Nothing private is retained. A successful transient `SESSION CREATE` makes the router return
 the private Destination it generated. `SessionReply` has no field for it, so it cannot be
