@@ -141,7 +141,7 @@ managed-app qualification/release
 
 Dependency classes:
 
-- R001 hard-depends on bouncer-core M005 by canonical phase order.
+- R001 hard-depends on bouncer-core M005 by canonical phase order. That dependency is satisfied by `plans/closure/bouncer-core/028-status.md`; R001 is now eligible for bounded implementation planning.
 - R002 hard-depends on R001's provider semantics and interface-depends on stable written i2pr app contracts for I2P streams/local accepted streams/lifecycle.
 - R003 has no automatic implementation eligibility; it hard-depends on a concrete product use case and interface-depends on a stable scoped i2pr/Proposal-170 contract.
 - Cross-router live fixtures are operational dependencies for portability claims.
@@ -316,6 +316,6 @@ Proposal 170 is not required for completion unless a later canonical product req
 
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
-| R001 | blocked | future | future | bouncer-core M005 |
+| R001 | planning-ready | future | future | none; M005 dependency discharged, bounded implementation handoff not yet authored |
 | R002 | blocked | future | future | R001 + stable i2pr app stream/listener/lifecycle contracts |
 | R003 | research-blocked | future only if justified | future | concrete product need + stable scoped control contract |
