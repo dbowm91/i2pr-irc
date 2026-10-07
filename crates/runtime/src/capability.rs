@@ -13,6 +13,7 @@
 //!
 //! Draft history capabilities are deliberately absent: they are M003-E, and this
 //! milestone must not advertise what it has not built.
+use i2pr_irc_wire::Message;
 use std::collections::BTreeSet;
 
 /// Upstream capabilities this bouncer requests when the server offers them.
@@ -38,9 +39,43 @@ pub const UPSTREAM_FOUNDATIONAL: [&str; 5] = [
 /// M004-A promotes the tag surface now that the client-tag mediator and
 /// `CLIENTTAGDENY` are live. `batch` is required alongside `labeled-response`: a client
 /// that could not read a batch could not tell a multipart answer from a truncated one.
-/// `server-time` stays withheld, so the mediated tag set is exactly what this build
-/// forwards.
-pub const DOWNSTREAM_FOUNDATIONAL: [&str; 3] = [MESSAGE_TAGS, BATCH, LABELED_RESPONSE];
+///
+/// M005-F promotes `server-time` and `standard-replies`. `server-time` is promoted
+/// because a `time` tag is already forwarded when upstream sent one and already
+/// synthesized for history replay, and the only thing withholding it was that the
+/// per-session filtering for it did not exist -- a client with `message-tags` but without
+/// `server-time` would have received a tag it never asked for. That filter now exists.
+/// `standard-replies` is promoted because `FAIL` is implemented across `CHATHISTORY`,
+/// `MARKREAD`, `BOUNCER`, and `SEARCH` rather than borrowed for a single failure format.
+pub const DOWNSTREAM_FOUNDATIONAL: [&str; 5] = [
+    MESSAGE_TAGS,
+    BATCH,
+    LABELED_RESPONSE,
+    SERVER_TIME,
+    STANDARD_REPLIES,
+];
+
+/// `server-time`: an upstream `time` tag is forwarded, and a history replay without one
+/// is stamped from the same single rule that indexes it. A live frame the upstream never
+/// stamped stays unstamped rather than gaining a fabricated time.
+pub const SERVER_TIME: &str = "server-time";
+
+/// `standard-replies`: every refusal this build serves is a `FAIL` with a standard
+/// numeric and a fixed reason, and no refusal echoes the request back.
+pub const STANDARD_REPLIES: &str = "standard-replies";
+
+/// `cap-notify`: the bouncer's downstream capability set is conditional on what upstream
+/// negotiated (`echo-message`), so a client that negotiated only the initial `CAP LS`
+/// would otherwise have no way to learn that a capability appeared or disappeared.
+pub const CAP_NOTIFY: &str = "cap-notify";
+
+/// `echo-message`: only serveable when upstream negotiated it, because the upstream echo
+/// is the confirmation event and the bouncer cannot invent one.
+pub const ECHO_MESSAGE: &str = "echo-message";
+
+/// `draft/no-implicit-names`: a client that negotiated it is not sent the membership
+/// block on JOIN and must ask for it.
+pub const NO_IMPLICIT_NAMES: &str = "draft/no-implicit-names";
 
 /// The pre-away draft this build serves.
 ///
@@ -65,14 +100,13 @@ pub const LABELED_RESPONSE: &str = "labeled-response";
 /// not served downstream, because confirming a message requires implementing the
 /// confirmation and nothing does yet.
 pub const DOWNSTREAM_DEFERRED_FOUNDATIONAL: [&str; 0] = [];
-/// `echo-message` is withheld: no confirmation path is implemented downstream.
-pub const DOWNSTREAM_DEFERRED_ECHO: [&str; 1] = ["echo-message"];
+/// Nothing is deferred here any more: M005-F promotes `echo-message` (conditionally, on
+/// upstream) and `server-time`. The empty array is kept so the "reviewed and deliberate"
+/// statement survives the next promotion.
+pub const DOWNSTREAM_DEFERRED_ECHO: [&str; 0] = [];
 
-/// `server-time` is withheld downstream.
-///
-/// It is a message-tag capability, and serving it would widen the mediated tag set beyond
-/// the one this build forwards deliberately.
-pub const DOWNSTREAM_DEFERRED_SERVER_TIME: [&str; 1] = ["server-time"];
+/// Nothing is deferred here any more: M005-F promotes `server-time`.
+pub const DOWNSTREAM_DEFERRED_SERVER_TIME: [&str; 0] = [];
 
 /// Draft history capabilities, delegated to the versioned adapter so no `draft/...`
 /// literal appears outside it.
@@ -90,6 +124,22 @@ pub const DOWNSTREAM_HISTORY: [&str; 2] = [
 /// Kept as a constant so that "not advertised yet" is a reviewable decision rather
 /// than an omission. M003-E promotes [`DOWNSTREAM_HISTORY`] into the advertisement.
 pub const DOWNSTREAM_DEFERRED_HISTORY: [&str; 2] = ["chathistory", "read-marker"];
+
+/// Ceiling on how many capability names one `CAP NEW`/`CAP DEL` may name.
+///
+/// A `CAP` line is bounded by the wire decoder, but the names inside it are what this
+/// bouncer would then act on: an unbounded announcement would be an unbounded fanout
+/// decision. Eight is above every capability set this build negotiates.
+pub const MAX_CAPABILITY_CHANGE_NAMES: usize = 8;
+
+/// Which direction a server capability announcement goes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapChange {
+    /// The server gained a capability it will honour.
+    New,
+    /// The server withdrew a capability it previously offered.
+    Del,
+}
 
 /// A validated IRCv3 capability name.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -151,6 +201,78 @@ impl UpstreamCapabilities {
             self.offered.insert(name.into_string());
         }
     }
+    /// Records a mid-generation `CAP NEW` from the server.
+    ///
+    /// A server may add a capability at any time. Treating that as protocol failure
+    /// would tear down a healthy generation over an advertisement, and ignoring it
+    /// would leave the bouncer requesting a capability the server now offers but this
+    /// connection never asked for. Neither is right: the offer is recorded, and what the
+    /// bouncer can actually *do* with it is decided by the bouncer's own code.
+    pub fn note_new(&mut self, token: &str) {
+        let name = token.split('=').next().unwrap_or(token);
+        if let Ok(name) = CapabilityName::parse(name) {
+            self.offered.insert(name.into_string());
+        }
+    }
+
+    /// Records a mid-generation `CAP DEL` from the server.
+    ///
+    /// The capability is removed from both the offered and the enabled set. Leaving it
+    /// enabled would have the bouncer rely on something the server has just withdrawn,
+    /// which is the one direction of drift that produces silent misbehaviour rather
+    /// than a visible failure.
+    pub fn note_deleted(&mut self, token: &str) {
+        let name = token.split('=').next().unwrap_or(token);
+        if let Ok(name) = CapabilityName::parse(name) {
+            let name = name.into_string();
+            self.offered.remove(&name);
+            self.enabled.remove(&name);
+        }
+    }
+
+    /// The change a server announced, if this line was one.
+    ///
+    /// Returns the subcommand and the capability names it names. Malformed lines are
+    /// reported as no change rather than as a protocol error: a `CAP` line the bouncer
+    /// cannot parse is not worth losing a generation over.
+    pub fn note_change(message: &Message) -> Option<(CapChange, Vec<String>)> {
+        // The nick is an optional first parameter, so the subcommand is found by
+        // position rather than assumed. Assuming `params[0]` is the subcommand would read
+        // a `CAP * NEW` as having no subcommand at all and silently ignore every
+        // announcement a server ever sends with its own nick attached.
+        // The nick is an optional first parameter, so the subcommand is found by
+        // position rather than assumed at a fixed index. Assuming `params[0]` is the
+        // subcommand reads a `CAP * NEW :x` as having none at all, which silently
+        // ignores every announcement a server sends with its own nick attached.
+        let at = message.params.iter().position(|param| {
+            let value = String::from_utf8_lossy(param).to_ascii_uppercase();
+            value == "NEW" || value == "DEL"
+        })?;
+        let change = match String::from_utf8_lossy(&message.params[at])
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "NEW" => CapChange::New,
+            _ => CapChange::Del,
+        };
+        let names: Vec<String> = message
+            .params
+            .iter()
+            .skip(at + 1)
+            .flat_map(|param| {
+                String::from_utf8_lossy(param)
+                    .into_owned()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|name| !name.is_empty())
+            .take(MAX_CAPABILITY_CHANGE_NAMES)
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        (!names.is_empty()).then_some((change, names))
+    }
+
     /// Records what the server acknowledged for `CAP REQ`.
     pub fn note_enabled(&mut self, token: &str) {
         let name = token.split('=').next().unwrap_or(token);
@@ -219,8 +341,10 @@ impl DownstreamCapabilities {
             .iter()
             .map(|name| (*name).to_owned())
             .collect();
+        advertised.push(CAP_NOTIFY.to_owned());
+        advertised.push(NO_IMPLICIT_NAMES.to_owned());
         if upstream.echo_available() {
-            advertised.push("echo-message".to_owned());
+            advertised.push(ECHO_MESSAGE.to_owned());
         }
         advertised.sort();
         advertised

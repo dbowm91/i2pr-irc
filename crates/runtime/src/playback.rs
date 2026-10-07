@@ -243,6 +243,11 @@ mod tests {
             bouncer_networks: false,
             bouncer_networks_notify: false,
             search: false,
+            server_time: false,
+            standard_replies: false,
+            cap_notify: false,
+            no_implicit_names: false,
+            echo_message: false,
         };
         assert!(
             !wants_backlog(explicit),
@@ -260,6 +265,11 @@ mod tests {
             bouncer_networks: false,
             bouncer_networks_notify: false,
             search: false,
+            server_time: false,
+            standard_replies: false,
+            cap_notify: false,
+            no_implicit_names: false,
+            echo_message: false,
         };
         assert!(
             wants_backlog(markers_only),

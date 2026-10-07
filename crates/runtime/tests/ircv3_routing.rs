@@ -812,10 +812,21 @@ fn capabilities_used_by_the_bouncer_are_the_reviewed_ones() {
     // Guards the advertised list against silent growth: adding a capability here is a
     // claim that its semantics are implemented.
     let advertised = DownstreamCapabilities::default().advertise(&UpstreamCapabilities::default());
+    // Every name here is a capability whose semantics this build implements. Adding one
+    // is a claim, so this list is the review record rather than a convenience.
     for name in &advertised {
         assert!(
-            ["batch", "labeled-response", "message-tags", "server-time"].contains(&name.as_str()),
-            "{name} is advertised but not a reviewed foundational capability"
+            [
+                "batch",
+                "labeled-response",
+                "message-tags",
+                "server-time",
+                "standard-replies",
+                "cap-notify",
+                "draft/no-implicit-names",
+            ]
+            .contains(&name.as_str()),
+            "{name} is advertised but not a reviewed capability"
         );
     }
     assert!(

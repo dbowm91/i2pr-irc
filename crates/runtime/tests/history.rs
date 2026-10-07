@@ -465,6 +465,11 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         bouncer_networks: false,
         bouncer_networks_notify: false,
         search: false,
+        server_time: false,
+        standard_replies: false,
+        cap_notify: false,
+        no_implicit_names: false,
+        echo_message: false,
     }));
     assert!(!playback::wants_backlog(SessionCapabilities {
         legacy_backlog: true,
@@ -475,6 +480,11 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         bouncer_networks: false,
         bouncer_networks_notify: false,
         search: false,
+        server_time: false,
+        standard_replies: false,
+        cap_notify: false,
+        no_implicit_names: false,
+        echo_message: false,
     }));
     // The drafts are independently negotiable, so a read-marker client that does not
     // manage its own history still receives the automatic backlog.
@@ -487,6 +497,11 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         bouncer_networks: false,
         bouncer_networks_notify: false,
         search: false,
+        server_time: false,
+        standard_replies: false,
+        cap_notify: false,
+        no_implicit_names: false,
+        echo_message: false,
     }));
 }
 

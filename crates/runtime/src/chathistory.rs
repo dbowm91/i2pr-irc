@@ -163,6 +163,23 @@ impl StandardError {
             Self::InvalidMsgRefType => "INVALID_MSGREFTYPE",
         }
     }
+
+    /// The numeric a client that never negotiated `standard-replies` receives.
+    ///
+    /// A real RFC 1459 numeric for each, so a client without the capability is reading
+    /// something its own parser already understands rather than a code invented here.
+    /// These are deliberately the coarse replies: without the capability there is no
+    /// command field to say which request failed, so the numeric is all the correlation
+    /// such a client gets.
+    pub fn numeric(self) -> &'static str {
+        match self {
+            // ERR_INPUT if the parameters are wrong, which is what every one of these
+            // refusals ultimately is to a client without the capability.
+            Self::InvalidParams | Self::InvalidMsgRefType => "461",
+            Self::InvalidTarget => "403",
+            Self::MessageError => "381",
+        }
+    }
 }
 
 /// Why a request was refused. Every refusal is deterministic and explicit.
@@ -527,6 +544,24 @@ pub async fn execute(
     buffer: BufferId,
     request: &HistoryQueryRequest,
 ) -> Result<HistoryReply, HistoryRefusal> {
+    execute_for(journal, buffer, request, true).await
+}
+
+/// [`execute`] for a session that may not want every tag.
+///
+/// `wants_time` is the requesting session's `server-time` negotiation.
+///
+/// It is per session rather than per bouncer because the replayed `time` tag is the one
+/// place this bouncer synthesizes a timestamp for a client, and a client that never
+/// negotiated `server-time` must not be handed a frame whose first bytes it has no way to
+/// read. It is a replay-only decision: a live frame the upstream never stamped stays
+/// unstamped, because there is no history convention to defer to.
+pub async fn execute_for(
+    journal: &HistoryJournal,
+    buffer: BufferId,
+    request: &HistoryQueryRequest,
+    wants_time: bool,
+) -> Result<HistoryReply, HistoryRefusal> {
     // `TARGETS` is not a message query at all: it lists buffers, so it never has a
     // single resolved buffer to page through. It is executed by its own path.
     if let HistoryQueryRequest::Targets { .. } = request {
@@ -640,7 +675,7 @@ pub async fn execute(
         }
         HistoryQueryRequest::Targets { .. } => unreachable!("handled above"),
     };
-    Ok(render(buffer, events, cap.bytes))
+    Ok(render_for(buffer, events, cap.bytes, wants_time))
 }
 
 /// The protocol timestamp for a local receive time.
@@ -756,13 +791,28 @@ fn position_key(position: HistoryPosition) -> HistoryEventId {
 }
 
 /// Renders resolved events as truthful replay lines.
-fn render(buffer: BufferId, events: Vec<HistoryEvent>, byte_budget: usize) -> HistoryReply {
+/// Renders replay lines for one session's tag surface.
+///
+/// `wants_time` is the session's `server-time` negotiation, not a bouncer-wide decision.
+/// A replayed `time` tag is the one place this bouncer synthesizes a timestamp for a
+/// client, and doing that unconditionally would put a tag in front of a session that
+/// never negotiated it -- a frame whose first bytes it has no way to read.
+///
+/// The synthesis is confined to replay. A live frame the upstream never stamped stays
+/// unstamped, because there is no history convention to defer to: a time on a live frame
+/// would be a claim about upstream delivery that the bouncer did not receive.
+fn render_for(
+    buffer: BufferId,
+    events: Vec<HistoryEvent>,
+    byte_budget: usize,
+    wants_time: bool,
+) -> HistoryReply {
     let mut lines = Vec::with_capacity(events.len());
     let mut bytes = 0usize;
     let mut newest = None;
     let mut skipped = 0usize;
     for event in events {
-        match render_one(&event, byte_budget - bytes) {
+        match render_one(&event, byte_budget - bytes, wants_time) {
             Some(line) => {
                 bytes += line.len();
                 newest = Some(event.event);
@@ -783,9 +833,9 @@ fn render(buffer: BufferId, events: Vec<HistoryEvent>, byte_budget: usize) -> Hi
 /// Emits one event with an honest `server-time` and a msgid only when one is valid.
 ///
 /// The stored payload already carries no terminator, so this adds exactly one CRLF.
-/// `server-time` is always present: it is metadata the client can rely on, and it
-/// never participates in ordering, which remains `HistoryEventId`.
-fn render_one(event: &HistoryEvent, remaining_bytes: usize) -> Option<Vec<u8>> {
+/// `server-time` is present when the session negotiated it: it is metadata the client can
+/// rely on, and it never participates in ordering, which remains `HistoryEventId`.
+fn render_one(event: &HistoryEvent, remaining_bytes: usize, wants_time: bool) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(&event.payload).ok()?;
     if text.is_empty() || text.contains(['\r', '\n']) {
         return None;
@@ -799,20 +849,27 @@ fn render_one(event: &HistoryEvent, remaining_bytes: usize) -> Option<Vec<u8>> {
     message.tags.clear();
     // Replay the upstream timestamp verbatim. When the upstream never sent one, a
     // valid local millisecond timestamp is synthesized rather than leaving the tag
-    // absent, so a client that relies on `server-time` always has a well-formed
+    // absent, so a client that negotiated `server-time` always has a well-formed
     // value. Either way this is metadata: ordering stays `HistoryEventId`.
-    let time = event.server_time.or_else(|| {
-        IrcTimestamp::from_unix_millis(
-            event
-                .received_at
-                .unix_seconds()
-                .checked_mul(1_000)
-                .unwrap_or_default(),
-        )
-    })?;
-    message
-        .tags
-        .insert(TIME_TAG.to_vec(), Some(time.to_string().into_bytes()));
+    //
+    // A session that did not negotiate `server-time` gets the message with no tags at
+    // all. The tag is not merely suppressed for that client because that is what
+    // `render_for` decided on its behalf; the point is that a `time` the client never
+    // asked for is a frame form it may not parse at all.
+    if wants_time {
+        let time = event.server_time.or_else(|| {
+            IrcTimestamp::from_unix_millis(
+                event
+                    .received_at
+                    .unix_seconds()
+                    .checked_mul(1_000)
+                    .unwrap_or_default(),
+            )
+        })?;
+        message
+            .tags
+            .insert(TIME_TAG.to_vec(), Some(time.to_string().into_bytes()));
+    }
     // A msgid is emitted only when one was genuinely preserved upstream. Inventing a
     // local id here would expose a durable identity under an upstream meaning.
     if let Some(msgid) = event.msgid.as_deref()
@@ -925,6 +982,41 @@ fn tag_with_batch(line: &[u8], id: &str) -> Result<Vec<u8>, HistoryRefusal> {
 
 fn cr_lf(text: &str) -> Vec<u8> {
     let mut bytes = text.as_bytes().to_vec();
+    bytes.extend_from_slice(b"\r\n");
+    bytes
+}
+
+/// Renders a refusal in whichever form one session actually understands.
+///
+/// `standard-replies` is negotiated per session, so a client that never asked for it must
+/// keep receiving the numeric it has always understood. Sending it `FAIL` regardless would
+/// put an unrequested frame on its wire and, for a client that has never heard of the
+/// capability, an unparsable one.
+///
+/// Both forms carry the same information. The numeric is the older contract every IRC
+/// client already parses; the `FAIL` line is the one a client that negotiated the
+/// capability asked for, and it additionally names the failing command and subcommand so
+/// a failure is not a bare number the Operator has to correlate by hand.
+pub fn render_refusal_for(
+    capabilities: &crate::session::SessionCapabilities,
+    refusal: HistoryRefusal,
+    command: &str,
+    target: Option<&str>,
+) -> Vec<u8> {
+    if capabilities.negotiated_standard_replies() {
+        return render_failure(refusal, command, target);
+    }
+    let mut line = format!(
+        ":bouncer {} <target> :{}",
+        refusal.error().numeric(),
+        refusal
+    );
+    if let Some(target) = target
+        && !target.is_empty()
+    {
+        line = line.replace("<target>", target);
+    }
+    let mut bytes = line.into_bytes();
     bytes.extend_from_slice(b"\r\n");
     bytes
 }
@@ -1425,7 +1517,7 @@ mod tests {
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
         };
-        let line = render_one(&event, 4096).expect("renders");
+        let line = render_one(&event, 4096, true).expect("renders");
         let parsed = Message::parse(&line).expect("parses");
         // The real upstream value is preferred over the local receive time, and is
         // replayed as canonical text with its milliseconds intact.
@@ -1452,7 +1544,7 @@ mod tests {
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
         };
-        let line = render_one(&event, 4096).expect("renders");
+        let line = render_one(&event, 4096, true).expect("renders");
         let parsed = Message::parse(&line).expect("parses");
         assert_eq!(
             parsed.server_time().map(|time| time.to_string()),
@@ -1475,7 +1567,7 @@ mod tests {
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
         };
-        let line = render_one(&event, 4096).expect("renders");
+        let line = render_one(&event, 4096, true).expect("renders");
         let parsed = Message::parse(&line).expect("parses");
         assert_eq!(
             parsed.server_time().map(|time| time.to_string()),
@@ -1496,7 +1588,7 @@ mod tests {
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
         };
-        let line = render_one(&event, 4096).expect("renders");
+        let line = render_one(&event, 4096, true).expect("renders");
         let rendered = String::from_utf8_lossy(&line).into_owned();
         assert!(
             !rendered.contains("9999"),
@@ -1517,7 +1609,7 @@ mod tests {
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
         };
-        assert!(render_one(&event, 4).is_none());
+        assert!(render_one(&event, 4, true).is_none());
     }
 
     #[test]

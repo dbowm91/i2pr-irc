@@ -17,17 +17,43 @@ Requesting everything a server offers would be the same error in the other direc
 
 ## Advertise only what you implement
 
-Current downstream advertisement covers message-tags, batch and labeled-response, plus the implemented draft/chathistory and draft/read-marker adapters. server-time and echo-message are deliberately withheld at the M004 closure baseline and are M005 protocol-polish work.
+The downstream advertisement is a function of the upstream negotiation, not a static
+list: `message-tags`, `batch`, `labeled-response`, `server-time`, `standard-replies`,
+`cap-notify` and `draft/no-implicit-names`, plus the implemented `draft/chathistory`,
+`draft/read-marker`, `draft/pre-away`, `soju.im/search` and `soju.im/bouncer-networks`
+adapters. `echo-message` is the one conditional member — see below.
+
+One cell holds it, shared by the owner and the session reader, so `CAP LS`, `CAP REQ` and
+the `005` welcome cannot answer from different sets. The full contract, including the
+per-session refusals and the `cap-notify` rules, is in
+[downstream-protocol.md](downstream-protocol.md).
 
 `chathistory` and `read-marker` are advertised only to the extent they are actually served, and the advertised surface is enumerated in [chathistory.md](chathistory.md). Deferring a capability is a reviewable decision; omitting it by accident is not, and neither is advertising an extension that is only half implemented.
 
 `CAP REQ` is all-or-nothing. A request naming one unavailable capability is NAKed as a whole, so a client is never left guessing which half of its request took effect.
 
+A `CAP` line from upstream is consumed by the bouncer and never fanned out. Relaying it
+would show a local client the upstream's capability negotiation under the upstream's own
+prefix, which the client reads as the server addressing it — and it discloses the upstream
+connection's shape to every attached Operator.
+
 ## echo-message is conditional, because confirmation is real
 
 The bouncer confirms a message only once the **server** has echoed it. A local socket write is not evidence of upstream delivery.
 
-echo-message is requested upstream when offered but is not yet advertised downstream. M005 may promote it only after downstream confirmation/fanout semantics are implemented. Without an upstream echo, advertising it would promise confirmation the bouncer cannot deliver.
+`echo-message` is requested upstream when offered and advertised downstream only once it
+is enabled — without an upstream echo, advertising it would promise confirmation the
+bouncer cannot deliver.
+
+M005-F made that promise real. The upstream echo is the confirmation event and the only
+point at which a local message enters history, and it is recorded once as `Outbound`. The
+initiator receives the echo as an ordinary frame from the server, not as a synthetic local
+one. A `time` tag is required for the direction judgement: without one there is no
+evidence the frame is an echo rather than a late conversation line, and guessing would put
+someone else's words in the Operator's own outbound history.
+
+If a server withdraws `echo-message` with `CAP DEL`, the capability is removed from the
+downstream advertisement and every session that negotiated `cap-notify` is told.
 
 ## Labels are translated, never forwarded
 

@@ -136,6 +136,11 @@ pub struct HistoryJournal {
     backlog: BacklogCap,
     retention: RetentionPolicy,
     health: JournalHealth,
+    /// The nickname this bouncer owns, once registration has established one.
+    ///
+    /// Set by the owner rather than configured, because it is a property of the
+    /// registration that just completed rather than of the journal.
+    own_nick: Option<String>,
 }
 
 impl HistoryJournal {
@@ -154,7 +159,34 @@ impl HistoryJournal {
             backlog: BacklogCap::DEFAULT,
             retention: RetentionPolicy::default(),
             health: JournalHealth::default(),
+            own_nick: None,
         }
+    }
+
+    /// Records which nickname this bouncer owns on its Network.
+    ///
+    /// This is what makes an upstream echo recognizable. A `PRIVMSG` or `NOTICE` that
+    /// arrives *from the server* carrying this Network's own nick is the server echoing
+    /// something a local client sent: it is confirmation, not conversation.
+    ///
+    /// The judgement needs no content matching. A message from our own nick arriving
+    /// from upstream, in a channel we are in or in a query we opened, can only be the
+    /// server's echo -- nobody else can speak as us, and a message from upstream
+    /// claiming to be us is the server confirming what it accepted. Matching on the body
+    /// instead would need a bounded pending-message set whose full contents would have to
+    /// be compared, and a server that echoes with a `batch` reference or reformats the
+    /// text would defeat it. The prefix is both sufficient and unbounded.
+    ///
+    /// `None` means the Network has not registered a nickname yet, and every event is
+    /// then recorded as inbound. That is the conservative direction: it can mislabel one
+    /// outgoing message, but it cannot label someone else's as ours.
+    pub fn set_own_nick(&mut self, nick: Option<&str>) {
+        self.own_nick = nick.map(str::to_owned);
+    }
+
+    /// The nickname this journal currently treats as its own, for change detection.
+    pub fn own_nick(&self) -> Option<&str> {
+        self.own_nick.as_deref()
     }
 
     pub fn with_limits(mut self, backlog: BacklogCap, retention: RetentionPolicy) -> Self {
@@ -256,7 +288,7 @@ impl HistoryJournal {
             // it is never invented from local time.
             server_time: message.server_time(),
             msgid: message.msgid().map(str::to_owned),
-            direction: EventDirection::Inbound,
+            direction: self.direction_of(message),
             event_class: command,
             payload: bounded_payload(message)?,
             // Derived here, from the message this function already decoded, rather than
@@ -267,6 +299,44 @@ impl HistoryJournal {
             search: Some(search_fields(message)),
         };
         self.append(vec![event]).await
+    }
+
+    /// The direction one ingested message belongs to.
+    ///
+    /// `Outgoing` means the upstream echoed a message a local client sent: it is the
+    /// `echo-message` confirmation event, and the *only* point at which a local message
+    /// becomes history. A local socket write is not evidence of upstream delivery -- the
+    /// queue accepted the bytes, which says nothing about whether the server received or
+    /// accepted them. Recording on the write would put a message in history that may never
+    /// have reached anybody.
+    ///
+    /// The judgement needs no content matching. A message from our own nick arriving *from
+    /// the server* can only be the server echoing what it accepted: nobody else can speak as
+    /// us, and a server that echoes under our prefix is confirming delivery, not relaying a
+    /// third party's words. Matching on the body instead would need a bounded set of pending
+    /// message bodies to compare against, which is unbounded work and which a server that
+    /// echoes with a `batch` reference or reformats the text would defeat anyway.
+    ///
+    /// A message the upstream never stamped stays inbound even when it carries our prefix.
+    /// Without a `time` there is no ordering evidence that this is an echo rather than a
+    /// late conversation line, and guessing wrong would put someone else's words in the
+    /// Operator's own history.
+    fn direction_of(&self, message: &Message) -> EventDirection {
+        let Some(own) = self.own_nick.as_deref() else {
+            return EventDirection::Inbound;
+        };
+        let Some(nick) = message.prefix_nick() else {
+            return EventDirection::Inbound;
+        };
+        // Casemapped, because a nickname is casefolded by the protocol and the upstream
+        // may echo a differently-cased spelling than the one registration used.
+        let folded = self.casemapping.fold(nick.as_bytes());
+        let expected = self.casemapping.fold(own.as_bytes());
+        if folded == expected && message.server_time().is_some() {
+            EventDirection::Outbound
+        } else {
+            EventDirection::Inbound
+        }
     }
 
     /// Appends a bounded batch as one transaction, assigning canonical order.
@@ -589,19 +659,7 @@ impl HistoryJournal {
 /// cannot filter by sender at all.
 fn search_fields(message: &Message) -> i2pr_irc_store::SearchFields {
     i2pr_irc_store::SearchFields {
-        sender: message
-            .prefix
-            .as_deref()
-            .map(|prefix| {
-                String::from_utf8_lossy(
-                    prefix
-                        .split(|byte| *byte == b'!' || *byte == b'@')
-                        .next()
-                        .unwrap_or(prefix),
-                )
-                .into_owned()
-            })
-            .unwrap_or_default(),
+        sender: message.prefix_nick().map(str::to_owned).unwrap_or_default(),
         target: message
             .params
             .first()

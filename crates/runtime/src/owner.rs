@@ -30,6 +30,7 @@ use crate::{
     },
     session::{
         SESSION_EVENT_QUEUE_CAPACITY, SessionEvent, SessionHandle, SessionIntent, SessionTask,
+        TagSurface,
     },
     state::{LineOutcome, NetworkState},
 };
@@ -38,7 +39,11 @@ use i2pr_irc_core::{
 };
 use i2pr_irc_store::{BufferId, BufferKind, CommitState, NetworkRecord, StoreError, StoreHandle};
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::AsyncReadExt,
     sync::{mpsc, watch},
@@ -156,7 +161,7 @@ async fn answer_history_search(
 /// nothing has to guess whether to wait, and "finished, and there was nothing" is the
 /// only answer that ends the question.
 fn refuse_search(handle: &SessionHandle, reason: &'static str, batch: &mut u64) {
-    let failure = crate::search::render_refusal(reason);
+    let failure = crate::search::render_refusal_for(&handle.capabilities(), reason);
     let empty = crate::search::render_batch(&[], *batch);
     if handle.queue_normal(&frame(&failure)).is_err() {
         return;
@@ -194,7 +199,15 @@ async fn answer_history_query(
     let Some(message) = i2pr_irc_wire::Message::parse(wire).ok() else {
         return;
     };
-    let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
+    // The draft's `FAIL` form is `FAIL CHATHISTORY <code> <subcommand> <params>`, so the
+    // field echoed after the code is the *subcommand* the client typed -- `BEFORE`, not
+    // `CHATHISTORY`. Echoing the command name instead told the client its own command
+    // back twice and never told it which of the six subcommands failed.
+    let subcommand = message
+        .params
+        .first()
+        .map(|param| String::from_utf8_lossy(param).to_ascii_uppercase())
+        .unwrap_or_default();
     let first_param = message
         .params
         .get(1)
@@ -205,14 +218,16 @@ async fn answer_history_query(
         crate::chathistory::ParsedRequest::Refused(refusal) => {
             // A refusal is still a reply: the client needs to learn why nothing
             // arrived, or it will simply wait.
-            let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_refusal_for(
+                &handle.capabilities(),
                 refusal,
-                &command,
+                &subcommand,
                 first_param.as_deref(),
             )));
             return;
         }
     };
+    let command = subcommand;
 
     // `TARGETS` names buffers rather than messages, so it has no single buffer to
     // page. It is answered with its own batch type.
@@ -234,7 +249,8 @@ async fn answer_history_query(
         return;
     };
     let Some(buffer) = buffers.get(&target) else {
-        let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+        let _ = handle.queue_normal(&frame(crate::chathistory::render_refusal_for(
+            &handle.capabilities(),
             crate::chathistory::HistoryRefusal::NoSuchBuffer,
             &command,
             Some(&target),
@@ -243,10 +259,12 @@ async fn answer_history_query(
     };
     let buffer = *buffer;
 
-    let reply = match crate::chathistory::execute(journal, buffer, &request).await {
+    let wants_time = handle.capabilities().negotiated_server_time();
+    let reply = match crate::chathistory::execute_for(journal, buffer, &request, wants_time).await {
         Ok(reply) => reply,
         Err(refusal) => {
-            let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_refusal_for(
+                &handle.capabilities(),
                 refusal,
                 &command,
                 Some(&target),
@@ -265,7 +283,8 @@ async fn answer_history_query(
             }
         }
         Err(refusal) => {
-            let _ = handle.queue_normal(&frame(crate::chathistory::render_failure(
+            let _ = handle.queue_normal(&frame(crate::chathistory::render_refusal_for(
+                &handle.capabilities(),
                 refusal,
                 &command,
                 Some(&target),
@@ -658,6 +677,13 @@ pub struct NetworkSnapshot {
     pub phase: Option<Phase>,
     pub generation: Option<ConnectionGeneration>,
     pub nick: Option<String>,
+    /// What this bouncer currently advertises to an attached client.
+    ///
+    /// Derived from the upstream negotiation, so it is a function of what the server
+    /// agreed rather than a static list. Published here because it is also the answer a
+    /// diagnostic reader needs: "why did my client not get `echo-message`" is answered by
+    /// this field, not by a guess.
+    pub advertisement: Vec<String>,
     /// Observed membership only.
     pub channels: Vec<String>,
     /// Observed membership the bouncer holds but does not present downstream.
@@ -1528,6 +1554,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // Batch identifiers are generation-local, exactly like response routes: a
         // batch id from an earlier connection must never be referencable later.
         let mut batches = crate::ircv3::BatchTracker::default();
+        // What this generation currently advertises downstream, so a capability change
+        // can be reported as a difference rather than as a bare announcement. Seeded
+        // from the registration result: `echo-message` was decided there.
+        let mut advertised_downstream: BTreeSet<String> =
+            crate::capability::DownstreamCapabilities::advertisement(&upstream_caps)
+                .into_iter()
+                .collect();
+        let listing: Vec<String> = advertised_downstream.iter().cloned().collect();
+        self.snapshot
+            .send_modify(|snapshot| snapshot.advertisement = listing.clone());
         // Search replies are framed in their own batch type, so they need their own
         // identifier space. It is generation-local for the same reason `batches` is: an
         // id from an earlier connection must not be referencable by a client that
@@ -1547,6 +1583,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 &session_tx,
                 &mut sessions,
                 &self.snapshot,
+                listing.clone(),
             );
             presence_of.insert(session, SessionPresence::DEFAULT);
         }
@@ -1622,7 +1659,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &mut journal,
                             &buffers,
                             &mut reconcile,
-                        ).await;
+                            advertised_downstream.iter().cloned().collect(),
+                        )
+                        .await;
                     }
                 }
                 event = session_event => {
@@ -1687,6 +1726,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             }
                         }
                         for item in batch {
+                            // The journal learns this Network's identity so it can
+                            // tell an upstream echo from somebody else's message.
+                            // Assigned each turn rather than once so a nick change
+                            // mid-generation is picked up; it is two bounded strings.
+                            let live_nick = Some(state.nick.as_str());
+                            if journal.own_nick() != live_nick {
+                                journal.set_own_nick(live_nick);
+                            }
                             match journal.ingest(item.buffer, &item.message).await {
                                 Ok(IngestOutcome::Recorded { .. }) => self.snapshot
                                     .send_modify(|snapshot| {
@@ -1811,6 +1858,109 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                     awaiting_pong = None;
                                 }
                                 _ => { failure = Some(RuntimeError::Protocol); break; }
+                            }
+                        }
+                        // A server may add or withdraw a capability at any time. The
+                        // announcement is recorded before the line reaches ordinary
+                        // handling, because the downstream advertisement is a function of
+                        // the upstream set and a client that asked for change
+                        // notifications must be told before the next frame it depends on.
+                        let announced =
+                            crate::capability::UpstreamCapabilities::note_change(&message);
+                        let acknowledged = message.command.eq_ignore_ascii_case(b"CAP")
+                            && message
+                                .params
+                                .iter()
+                                .any(|param| param.eq_ignore_ascii_case(b"ACK"));
+                        if let Some((change, names)) = announced.filter(|_| {
+                            !acknowledged
+                        }) {
+                            for name in &names {
+                                match change {
+                                    crate::capability::CapChange::New => {
+                                        upstream_caps.note_new(name)
+                                    }
+                                    crate::capability::CapChange::Del => {
+                                        upstream_caps.note_deleted(name)
+                                    }
+                                }
+                            }
+                            if matches!(change, crate::capability::CapChange::New) {
+                                // The server now offers a capability. If the bouncer
+                                // serves it downstream and has not enabled it, the only
+                                // way it can ever be served is to ask. The request is
+                                // bounded by this one announcement's names and skips
+                                // anything already enabled, so a server repeating `NEW`
+                                // cannot make this grow.
+                                let wanted: Vec<String> = names
+                                    .iter()
+                                    .filter(|name| !upstream_caps.is_enabled(name))
+                                    .filter(|name| {
+                                        crate::capability::UPSTREAM_FOUNDATIONAL
+                                            .contains(&name.as_str())
+                                    })
+                                    .cloned()
+                                    .collect();
+                                if !wanted.is_empty() {
+                                    queue_control(
+                                        &control_tx,
+                                        &format!("CAP REQ :{}\r\n", wanted.join(" ")),
+                                    )?;
+                                }
+                            }
+                            let _ = change;
+                            let now: BTreeSet<String> =
+                                crate::capability::DownstreamCapabilities::advertisement(
+                                    &upstream_caps,
+                                )
+                                .into_iter()
+                                .collect();
+                            if now != advertised_downstream {
+                                let listing: Vec<String> = now.iter().cloned().collect();
+                                for task in sessions.values() {
+                                    task.handle().set_advertised(listing.clone());
+                                }
+                                self.snapshot
+                                    .send_modify(|snapshot| snapshot.advertisement = listing.clone());
+                                self.publish_capability_change(
+                                    &advertised_downstream,
+                                    &upstream_caps,
+                                    &sessions,
+                                );
+                                advertised_downstream = now;
+                            }
+                        } else if acknowledged {
+                            // An `ACK` is what actually *enables* a capability. Without
+                            // this the request sent above would be answered and then
+                            // forgotten, and the capability could never become serviceable.
+                            for param in message.params.iter().skip(1) {
+                                for name in String::from_utf8_lossy(param)
+                                    .split_whitespace()
+                                    .map(str::to_owned)
+                                    .collect::<Vec<_>>()
+                                {
+                                    upstream_caps.note_enabled(&name);
+                                }
+                            }
+                            let now: BTreeSet<String> =
+                                crate::capability::DownstreamCapabilities::advertisement(
+                                    &upstream_caps,
+                                )
+                                .into_iter()
+                                .collect();
+                            if now != advertised_downstream {
+                                let listing: Vec<String> = now.iter().cloned().collect();
+                                for task in sessions.values() {
+                                    task.handle().set_advertised(listing.clone());
+                                }
+                                self.snapshot
+                                    .send_modify(|snapshot| snapshot.advertisement = listing.clone());
+                                self.publish_capability_change(
+                                    &advertised_downstream,
+                                    &upstream_caps,
+                                    &sessions,
+                                );
+                                advertised_downstream = now;
                             }
                         }
                         match self.apply_upstream_line(
@@ -1963,6 +2113,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         journal: &mut crate::journal::HistoryJournal,
         buffers: &BTreeMap<String, BufferId>,
         reconcile: &mut DesiredReconcile,
+        // What this generation advertises, for a session attaching right now. Passed in
+        // rather than read from the snapshot: `watch` shares one lock between reads and
+        // writes, and attaching writes to that same snapshot, so a borrow held across the
+        // attach would deadlock on itself.
+        advertised: Vec<String>,
     ) {
         match command {
             SupervisorCommand::Attach {
@@ -1982,6 +2137,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         session_tx,
                         sessions,
                         &self.snapshot,
+                        // Whatever this generation advertises right now, read from the
+                        // snapshot the owner already publishes rather than recomputed, so
+                        // there is one answer rather than two that can differ.
+                        //
+                        // Bound and dropped first. `watch` shares one lock between reads
+                        // and writes, and `attach_session` writes to the snapshot, so a
+                        // borrow held across the call would deadlock on itself.
+                        advertised.clone(),
                     );
                     // A newly attached session starts active. Classification is a fact
                     // about the session, not a counter, so the entry is added here and
@@ -2063,6 +2226,62 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     /// Observed membership is never overwritten from storage: only DesiredState is
     /// restored, and an authoritative network event remains the only way membership
     /// changes.
+    /// Recomputes the downstream advertisement and tells listening sessions what moved.
+    ///
+    /// `cap-notify` exists because the downstream set is conditional on what upstream
+    /// negotiated, and because the upstream may change that mid-generation. A client that
+    /// negotiated the capability and is told nothing is in exactly the position
+    /// `cap-notify` was supposed to fix.
+    ///
+    /// What is reported is the change in what *this bouncer* can serve, not what the
+    /// server announced. Those differ: a server may newly offer a capability the bouncer
+    /// does not implement, and telling a client about it would advertise something no
+    /// client could ever get. Diffing the advertisement also makes the report idempotent:
+    /// re-announcing the same thing changes nothing, and so says nothing.
+    ///
+    /// Both directions are emitted because both can happen. `echo-message` disappears
+    /// when a `CAP DEL` withdraws it upstream, and appears once the bouncer holds it.
+    ///
+    /// Only sessions that negotiated `cap-notify` are addressed. Sending `CAP NEW` to a
+    /// client that never asked would be unsolicited, and a client that does not
+    /// understand `cap-notify` is entitled to treat the line as an unknown command.
+    fn publish_capability_change(
+        &self,
+        previous: &BTreeSet<String>,
+        upstream: &UpstreamCapabilities,
+        sessions: &BTreeMap<SessionId, SessionTask>,
+    ) {
+        let now: BTreeSet<String> =
+            crate::capability::DownstreamCapabilities::advertisement(upstream)
+                .into_iter()
+                .collect();
+        if now == *previous {
+            return;
+        }
+        let added: Vec<String> = now.difference(previous).cloned().collect();
+        let removed: Vec<String> = previous.difference(&now).cloned().collect();
+        for (subcommand, names) in [("NEW", added), ("DEL", removed)] {
+            if names.is_empty() {
+                continue;
+            }
+            let line = format!(":bouncer CAP * {subcommand} :{}\r\n", names.join(" "));
+            for task in sessions.values() {
+                if !task.handle().capabilities().negotiated_cap_notify() {
+                    continue;
+                }
+                if task.handle().queue_control(&line).is_err() {
+                    // A session whose queue refuses the notification has already fallen
+                    // behind; the ordinary detach path decides what happens to it. This
+                    // owner never awaits a client, so one full queue cannot reach the
+                    // Network or any other attachment.
+                    self.snapshot.send_modify(|snapshot| {
+                        snapshot.fanout_dropped = snapshot.fanout_dropped.saturating_add(1)
+                    });
+                }
+            }
+        }
+    }
+
     async fn reconcile(&self, state: &NetworkState) -> Result<(), RuntimeError> {
         let records = self
             .store
@@ -2167,6 +2386,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     .send_modify(|snapshot| snapshot.response_routes = router.open_routes());
             }
         }
+        // A `CAP` line is the bouncer's negotiation with the *server*, never traffic. It
+        // is consumed here and never fanned out: relaying it would show a local client the
+        // upstream's capability negotiation under the upstream's own prefix, which the
+        // client would read as the server addressing it -- and which discloses the
+        // upstream connection's shape to every attached Operator.
+        //
+        // The line still reached `state.apply_line` above, so membership and network state
+        // are unaffected; a `CAP` line carries neither.
+        if message.command.eq_ignore_ascii_case(b"CAP") {
+            fans_out = false;
+        }
         if fans_out {
             // CTCP is classified before it reaches any client. Only an ACTION is chat;
             // a PING query is answered by the bouncer itself rather than handed to a
@@ -2185,7 +2415,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // Tags are delivered per session, because the tag surface is negotiated per
             // session. A client that negotiated `message-tags` can parse them; a client
             // that did not must never receive one, since it has no way to read a frame
-            // whose first bytes are a tag.
+            // whose first bytes are a tag. A third form exists for `server-time`: a
+            // session that negotiated the tag prefix but not that particular tag gets
+            // every other tag and loses only `time`, because the others are exactly what
+            // it asked for.
             let untagged = if message.tags.is_empty() {
                 None
             } else {
@@ -2193,6 +2426,18 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 bare.tags.clear();
                 Some(bare.encode().map_err(|_| RuntimeError::Protocol)?)
             };
+            let timed =
+                if message.tags.is_empty() || !message.tags.contains_key(i2pr_irc_wire::TIME_TAG) {
+                    None
+                } else {
+                    let mut without_time = message.clone();
+                    without_time.tags.remove(i2pr_irc_wire::TIME_TAG);
+                    if without_time.tags.is_empty() {
+                        untagged.clone()
+                    } else {
+                        Some(without_time.encode().map_err(|_| RuntimeError::Protocol)?)
+                    }
+                };
             let tagged = if message.tags.is_empty() {
                 None
             } else {
@@ -2206,14 +2451,30 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 DetachedFanout::Rewritten(line) => Some(line.clone()),
                 _ => None,
             };
+            // Every form is `Some` together or not at all: they are all derived from the
+            // same non-empty tag set. That invariant is what lets the choice be total
+            // without a fallback arm -- `tagged`, `untagged`, and `timed` are either all
+            // present or all absent, so the three cases below cover every state.
             for (id, task) in sessions {
-                let wants_tags = task.handle().capabilities().negotiated_tags();
-                let line = match (&rewritten, &tagged, &untagged) {
-                    (Some(line), _, _) => line.clone(),
-                    (None, Some(tagged), _) if wants_tags => tagged.clone(),
-                    (None, _, Some(untagged)) => untagged.clone(),
-                    (None, None, None) => raw.to_vec(),
-                    (None, Some(_), None) => raw.to_vec(),
+                let surface = task.handle().capabilities().tag_surface();
+                let line = match &rewritten {
+                    Some(line) => line.clone(),
+                    None => match (&tagged, &untagged, &timed) {
+                        (None, None, _) => raw.to_vec(),
+                        (Some(tagged), Some(untagged), timed) => match surface {
+                            TagSurface::All => tagged.clone(),
+                            TagSurface::WithoutTime => {
+                                timed.clone().unwrap_or_else(|| untagged.clone())
+                            }
+                            TagSurface::None => untagged.clone(),
+                        },
+                        // Unreachable while every form derives from the same tag set.
+                        // The arm is total rather than a panic because a future tag form
+                        // added without the invariant would otherwise take the whole
+                        // generation down, and a wrong frame is recoverable where a
+                        // disconnected Operator is not.
+                        _ => untagged.clone().unwrap_or_else(|| raw.to_vec()),
+                    },
                 };
                 if task.handle().fanout(line).is_err() {
                     // Bounded fanout: the owner never awaits the session, so a stalled
@@ -3581,6 +3842,7 @@ fn is_channel_target(target: &str) -> bool {
 }
 
 /// Spawns one session task and records it under its ephemeral identity.
+#[allow(clippy::too_many_arguments)]
 fn attach_session<D: ByteStream + 'static>(
     session: SessionId,
     client: ClientId,
@@ -3589,8 +3851,12 @@ fn attach_session<D: ByteStream + 'static>(
     session_tx: &mpsc::Sender<SessionEvent>,
     sessions: &mut BTreeMap<SessionId, SessionTask>,
     snapshot: &watch::Sender<NetworkSnapshot>,
+    advertisement: Vec<String>,
 ) {
     let task = SessionTask::spawn(session, client, nick.to_owned(), stream, session_tx.clone());
+    // Set before the client can ask anything, so its very first `CAP LS` and the `005`
+    // welcome come from one set rather than from the static default.
+    task.handle().set_advertised(advertisement.clone());
     sessions.insert(session, task);
     snapshot.send_modify(|state| {
         state.sessions_accepted = state.sessions_accepted.saturating_add(1);
@@ -3651,6 +3917,16 @@ fn adopt_prepared_session(
     }
     prepared.publish_negotiated();
     let task = SessionTask::resume(prepared.into_wiring(), session_tx.clone());
+    // The transferred reader answers `CAP LS` and `REQ` from the cell it was seeded with
+    // during admission, which is the unconditional surface: at admit time this Network's
+    // upstream negotiation was not known. Replacing it here is what lets the very first
+    // `CAP LS` a bound client sends name `echo-message`.
+    //
+    // Bound and dropped before anything else writes to the snapshot. `watch` shares one
+    // lock between reads and writes, and this function writes below, so a borrow held
+    // into that write would deadlock on itself.
+    let advertised = snapshot.borrow().advertisement.clone();
+    task.handle().set_advertised(advertised);
     sessions.insert(session, task);
     // The projection runs on the ordinary intent path. See the note above.
     let _ = session_tx.try_send(SessionEvent::Intent {

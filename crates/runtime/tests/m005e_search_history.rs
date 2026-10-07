@@ -543,7 +543,13 @@ async fn a_client_that_did_not_negotiate_search_is_refused_rather_than_answered(
 async fn a_refused_search_says_why_and_still_closes_its_batch() {
     let mut runtime = Runtime::start().await;
     runtime.bring_online(1, &["#room"]).await;
-    let mut client = register(&runtime, NetworkId(1), SessionId(1), "soju.im/search").await;
+    let mut client = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(1),
+        "soju.im/search standard-replies",
+    )
+    .await;
 
     for hostile in [
         "colour=red",
@@ -803,7 +809,13 @@ async fn a_search_never_becomes_an_expression_evaluator() {
         .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut client = register(&runtime, NetworkId(1), SessionId(1), "soju.im/search").await;
+    let mut client = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(1),
+        "soju.im/search standard-replies",
+    )
+    .await;
     // Drain the live fan-out first. The upstream messages above are still reaching this
     // socket, and asserting against a buffer that still contains them would test what
     // the client was fanned rather than what it was told.
@@ -1079,7 +1091,7 @@ async fn msgid_and_timestamp_references_resolve_through_the_index() {
         &runtime,
         NetworkId(1),
         SessionId(1),
-        "draft/chathistory batch",
+        "draft/chathistory batch standard-replies",
     )
     .await;
 

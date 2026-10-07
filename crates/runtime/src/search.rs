@@ -329,6 +329,25 @@ pub fn render_batch(results: &[SearchHit], batch: u64) -> Vec<Vec<u8>> {
     lines
 }
 
+/// Renders a refusal in whichever form one session actually understands.
+///
+/// `standard-replies` is negotiated per session, so a client that never asked for it
+/// keeps receiving a numeric it has always parsed. Sending it `FAIL` regardless would put
+/// an unrequested frame on its wire and, for a client that has never heard of the
+/// capability, an unparsable one.
+pub fn render_refusal_for(
+    capabilities: &crate::session::SessionCapabilities,
+    reason: &'static str,
+) -> Vec<u8> {
+    if capabilities.negotiated_standard_replies() {
+        return render_refusal(reason);
+    }
+    // ERR_INPUT. A numeric answering a client-supplied command carries no target, so the
+    // conventional `*` is used; without the capability there is no command field to
+    // correlate against, so the numeric and the reason are all such a client gets.
+    format!(":bouncer 461 * :{reason}\r\n").into_bytes()
+}
+
 /// Renders a refusal as a standard-reply line.
 ///
 /// `reason` is the fixed string from [`SearchRefusal::reason`], never the offending

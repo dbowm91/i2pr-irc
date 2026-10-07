@@ -37,6 +37,10 @@ Advertising `draft/chathistory` promises a specific server-side contract, and an
 
 `AROUND` is implemented rather than refused. Refusing part of an advertised extension is the same class of lie as not advertising it at all: its budget splits as `before = (limit - 1) / 2`, `after = limit - 1 - before`, with the selector itself counting as one slot. Since Plan 024 that bracket is two indexed seeks rather than a window read, so it works for a selector anywhere in the retained history rather than only inside `LATEST` window.
 
+Replay is stamped only for a session that negotiated `server-time`; one that negotiated
+`draft/chathistory` without it receives the message with no tags at all. See
+[downstream IRCv3 protocol polish](downstream-protocol.md).
+
 The `MSGREFTYPES=timestamp,msgid` claim is reviewed against what is actually served in
 `crates/runtime/tests/m005e_search_history.rs`: both reference kinds resolve for every
 subcommand including `AROUND`, at every window edge, and both refusal dispositions are

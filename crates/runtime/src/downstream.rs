@@ -31,6 +31,19 @@ pub const DOWNSTREAM_ADVERTISED: &[&str] = &[
     crate::capability::MESSAGE_TAGS,
     crate::capability::BATCH,
     crate::capability::LABELED_RESPONSE,
+    // M005-F promotes these three. `server-time` because a `time` tag is already
+    // forwarded when upstream sent one and already synthesized for history replay, and
+    // the per-session filter that makes it truthful now exists. `standard-replies`
+    // because every refusal this build serves is a `FAIL` with a fixed reason.
+    // `draft/no-implicit-names` because projection can now omit the membership block
+    // for a client that asked for that.
+    crate::capability::SERVER_TIME,
+    crate::capability::STANDARD_REPLIES,
+    crate::capability::NO_IMPLICIT_NAMES,
+    // The downstream set is conditional on what upstream negotiated, so a client that
+    // negotiated only the initial `CAP LS` would have no way to learn that
+    // `echo-message` appeared or disappeared across a reconnect.
+    crate::capability::CAP_NOTIFY,
     crate::presence::PRE_AWAY_CAPABILITY,
     // The control plane is advertised because both halves are live: the initial
     // `LISTNETWORKS` batch and the revision-derived change notifications. Advertising

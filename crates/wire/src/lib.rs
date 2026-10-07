@@ -10,6 +10,31 @@ pub const MAX_LINE_BYTES: usize = 512;
 /// Maximum tag prefix, including `@` and the separating space (IRCv3 message-tags).
 pub const MAX_TAG_PREFIX_BYTES: usize = 8191;
 /// Maximum complete tagged line: tag prefix plus ordinary message remainder.
+/// The nick portion of a wire prefix, if it names one.
+///
+/// A prefix is `nick!user@host`, any part of which may be absent, so the nick is whatever
+/// precedes the first `!` or `@`. Returns `None` for a prefix that is not valid UTF-8
+/// rather than substituting a lossy string: a caller comparing this against a known
+/// nickname must not be told it matched a nick that merely decoded to the same bytes
+/// after replacement characters were substituted.
+///
+/// This lives here rather than in each consumer because three subsystems need it -- the
+/// journal's sender field, the echo-message direction judgement, and the store's
+/// migration backfill -- and three copies of "the nick is the part before the first
+/// separator" is how they come to disagree about the same frame.
+pub fn prefix_nick(prefix: &[u8]) -> Option<&str> {
+    let nick = prefix
+        .split(|byte| *byte == b'!' || *byte == b'@')
+        .next()
+        .unwrap_or(prefix);
+    // An empty nick is not a nick: `!user@host` has none, and returning an empty string
+    // would compare equal to a bouncer whose nickname is empty.
+    if nick.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(nick).ok()
+}
+
 pub const MAX_TAGGED_LINE_BYTES: usize = MAX_TAG_PREFIX_BYTES + MAX_LINE_BYTES;
 /// Maximum opaque tag data from one origin, excluding separators.
 pub const MAX_TAG_DATA_BYTES: usize = 4094;
@@ -239,6 +264,14 @@ impl Message {
         std::str::from_utf8(value)
             .ok()
             .filter(|text| !text.is_empty())
+    }
+
+    /// The nick this message's prefix names, if it names one.
+    ///
+    /// See [`prefix_nick`] for the rule and for why it lives here rather than in each
+    /// consumer.
+    pub fn prefix_nick(&self) -> Option<&str> {
+        prefix_nick(self.prefix.as_deref()?)
     }
 
     pub fn validate_tag_budget(&self, direction: TagDirection) -> Result<(), WireError> {

@@ -95,8 +95,17 @@ pub fn project_channel(
                 handle.queue_normal(&line)?;
             }
         }
-        // Membership is projected only when it is known to be complete.
-        if channel_state.names_seen && channel_state.members_complete {
+        // Membership is projected only when it is known to be complete, and only when
+        // this session did not ask us not to send it. A client that negotiated
+        // `draft/no-implicit-names` asked to fetch membership itself -- it wants to
+        // decide when to pay for the bytes, which for a large channel can be the whole
+        // burst it receives. Sending the block anyway would be sending the very thing
+        // it declined, and there is no way for it to opt back in.
+        //
+        // The suppression is per session, not per bouncer: one client declining says
+        // nothing about what another client on the same connection wants.
+        let implicit_names = !handle.capabilities().negotiated_no_implicit_names();
+        if implicit_names && channel_state.names_seen && channel_state.members_complete {
             let mut names: Vec<String> = channel_state
                 .members
                 .iter()

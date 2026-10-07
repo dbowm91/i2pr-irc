@@ -1416,7 +1416,7 @@ async fn a_negotiated_client_really_receives_history_through_the_live_path() {
 
     // Negotiate, then register.
     client
-        .write_all(b"CAP REQ :draft/chathistory\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+        .write_all(b"CAP REQ :draft/chathistory server-time standard-replies\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
         .await
         .expect("client writable");
     let welcome = client_read_until(&mut client, b"001 ").await;
@@ -1448,7 +1448,10 @@ async fn a_negotiated_client_really_receives_history_through_the_live_path() {
         reply.contains("batch="),
         "each message must be tagged into the batch: {reply}"
     );
-    // The replayed timestamp is canonical text, never an integer epoch.
+    // The replayed timestamp is canonical text, never an integer epoch -- but only
+    // because this client negotiated `server-time`. A client that negotiated the tag
+    // surface without it gets the message with no tags, which is asserted in
+    // `m005f_protocol_polish`.
     assert!(
         reply.contains("2023-11-14T22:13:20.620Z"),
         "the upstream timestamp must round-trip with its milliseconds: {reply}"
@@ -1478,7 +1481,7 @@ async fn a_malformed_history_request_is_answered_not_silently_ignored() {
     owner.wait_phase(Phase::Online).await;
     let (_session, mut client) = owner.attach(ClientId(1)).await;
     client
-        .write_all(b"CAP REQ :draft/chathistory\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
+        .write_all(b"CAP REQ :draft/chathistory server-time standard-replies\r\nCAP END\r\nNICK bot\r\nUSER bot 0 * :phone\r\n")
         .await
         .expect("client writable");
     client_read_until(&mut client, b"001 ").await;
@@ -1710,15 +1713,30 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
         "advertisement: {advertised:?}"
     );
     // M004-A promoted the tag surface: the mediator and a truthful CLIENTTAGDENY now
-    // exist, so `message-tags`, `batch` and `labeled-response` are served. `server-time`
-    // and `echo-message` remain withheld, because neither has implemented downstream
-    // semantics.
+    // exist, so `message-tags`, `batch` and `labeled-response` are served.
     for served in ["message-tags", "batch", "labeled-response"] {
         assert!(advertised.contains(&served.to_owned()), "{served}");
     }
-    for withheld in ["server-time", "echo-message"] {
-        assert!(!advertised.contains(&withheld.to_owned()), "{withheld}");
+    // M005-F promotes the rest, each for a stated reason: `server-time` because the
+    // per-session `time` filter now exists, `standard-replies` because `FAIL` is
+    // implemented across four command families, `cap-notify` because the downstream set
+    // is conditional on upstream, and `draft/no-implicit-names` because projection can
+    // omit the membership block.
+    for served in [
+        i2pr_irc_runtime::capability::SERVER_TIME,
+        i2pr_irc_runtime::capability::STANDARD_REPLIES,
+        i2pr_irc_runtime::capability::CAP_NOTIFY,
+        i2pr_irc_runtime::capability::NO_IMPLICIT_NAMES,
+    ] {
+        assert!(advertised.contains(&served.to_owned()), "{served}");
     }
+    // `echo-message` is the one capability that stays conditional, and this upstream
+    // negotiated nothing: the bouncer confirms a message only once the server has echoed
+    // it, so advertising it here would promise confirmation it cannot deliver.
+    assert!(
+        !advertised.contains(&i2pr_irc_runtime::capability::ECHO_MESSAGE.to_owned()),
+        "echo-message is withheld when upstream did not negotiate it"
+    );
     let history = i2pr_irc_runtime::chathistory::capability_advertisement(false);
     assert_eq!(
         history,
@@ -1764,6 +1782,12 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
             // reply batching are all complete; the assertion lives here so a capability
             // cannot be added to the greeting without this test naming it.
             i2pr_irc_runtime::search::SEARCH_CAPABILITY,
+            // M005-F's four promotions, asserted by name so a capability cannot reach the
+            // greeting without this test naming it.
+            i2pr_irc_runtime::capability::SERVER_TIME,
+            i2pr_irc_runtime::capability::STANDARD_REPLIES,
+            i2pr_irc_runtime::capability::CAP_NOTIFY,
+            i2pr_irc_runtime::capability::NO_IMPLICIT_NAMES,
         ]
         .iter()
         .map(|name| (*name).to_owned()),

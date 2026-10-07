@@ -239,6 +239,35 @@ pub struct SessionCapabilities {
     /// exists; a client that negotiated the initial batch but never receives an update
     /// has no way to distinguish an idle bouncer from a broken one.
     pub bouncer_networks_notify: bool,
+    /// This session negotiated `server-time`, so it may receive a `time` tag.
+    ///
+    /// Tracked separately from `message_tags` because the two capabilities are not the
+    /// same permission. `message-tags` says "a frame may begin with a tag prefix this
+    /// client can parse"; `server-time` says "and that prefix may carry this particular
+    /// tag". A client that negotiated only the former must have `time` removed rather
+    /// than the whole tag set, because the remaining tags are exactly what it asked for.
+    pub server_time: bool,
+    /// This session negotiated `standard-replies`, so refusals may be sent as `FAIL`.
+    ///
+    /// Per session, and conservative when false: a client that never asked for the
+    /// capability keeps receiving the numeric form it has always understood, so the
+    /// promotion cannot silently change the failure format of an established session.
+    pub standard_replies: bool,
+    /// This session negotiated `cap-notify`, so it receives `CAP NEW`/`CAP DEL`.
+    ///
+    /// The downstream capability set is conditional on what upstream negotiated, so a
+    /// client that negotiated only the initial `CAP LS` would otherwise have no way to
+    /// learn that `echo-message` appeared or disappeared across a reconnect.
+    pub cap_notify: bool,
+    /// This session negotiated `draft/no-implicit-names`, so projection omits the
+    /// membership block and the client must ask for it.
+    pub no_implicit_names: bool,
+    /// This session negotiated `echo-message`, so it receives the upstream echo of its
+    /// own message.
+    ///
+    /// Advertised only when upstream negotiated it, so a session that holds this flag is
+    /// one the upstream will actually echo to.
+    pub echo_message: bool,
 }
 impl Default for SessionCapabilities {
     fn default() -> Self {
@@ -251,6 +280,11 @@ impl Default for SessionCapabilities {
             search: false,
             bouncer_networks: false,
             bouncer_networks_notify: false,
+            server_time: false,
+            standard_replies: false,
+            cap_notify: false,
+            no_implicit_names: false,
+            echo_message: false,
         }
     }
 }
@@ -302,6 +336,45 @@ impl SessionCapabilities {
         self.bouncer_networks_notify
     }
 
+    /// True when this session may receive a `time` tag.
+    pub fn negotiated_server_time(&self) -> bool {
+        self.server_time
+    }
+
+    /// True when this session asked for `standard-replies`.
+    pub fn negotiated_standard_replies(&self) -> bool {
+        self.standard_replies
+    }
+
+    /// True when this session asked for `CAP NEW`/`CAP DEL`.
+    pub fn negotiated_cap_notify(&self) -> bool {
+        self.cap_notify
+    }
+
+    /// True when this session must not be sent an unsolicited membership block.
+    pub fn negotiated_no_implicit_names(&self) -> bool {
+        self.no_implicit_names
+    }
+
+    /// True when this session expects the upstream echo of its own message.
+    pub fn negotiated_echo_message(&self) -> bool {
+        self.echo_message
+    }
+
+    /// The `time` tag must be removed unless this session asked for it.
+    ///
+    /// This is a *third* tag state, not a smaller version of the second: a session with
+    /// `message-tags` and without `server-time` still receives every other tag, because
+    /// those are the tags it asked for. Collapsing the two states would either strip
+    /// tags the client requested or deliver one it did not.
+    pub fn tag_surface(&self) -> TagSurface {
+        match (self.message_tags, self.server_time) {
+            (false, _) => TagSurface::None,
+            (true, true) => TagSurface::All,
+            (true, false) => TagSurface::WithoutTime,
+        }
+    }
+
     /// Applies a client's successful `CAP REQ`, recording that it manages history.
     pub fn with_negotiated(&self, enabled: &std::collections::BTreeSet<String>) -> Self {
         Self {
@@ -329,8 +402,42 @@ impl SessionCapabilities {
                 || enabled
                     .iter()
                     .any(|name| name == crate::bouncer_networks::BOUNCER_NETWORKS_NOTIFY),
+            server_time: self.server_time
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::SERVER_TIME),
+            standard_replies: self.standard_replies
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::STANDARD_REPLIES),
+            cap_notify: self.cap_notify
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::CAP_NOTIFY),
+            no_implicit_names: self.no_implicit_names
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::NO_IMPLICIT_NAMES),
+            echo_message: self.echo_message
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::ECHO_MESSAGE),
         }
     }
+}
+
+/// How much of a message's tag surface one session may receive.
+///
+/// Three states rather than a boolean, because `message-tags` and `server-time` are
+/// separate permissions and the difference between them is one tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagSurface {
+    /// No tags at all: the client cannot parse a frame that begins with a tag prefix.
+    None,
+    /// Every tag, including `time`.
+    All,
+    /// Every tag except `time`, which this session never negotiated.
+    WithoutTime,
 }
 
 /// Handle the owner uses to reach one session.
@@ -344,12 +451,22 @@ pub struct SessionHandle {
     normal_tx: mpsc::Sender<crate::downstream::QueuedFrame>,
     /// Negotiated-capability view, shared with the owner across the session.
     capabilities: std::sync::Arc<std::sync::Mutex<SessionCapabilities>>,
+    /// What this bouncer currently advertises to this session.
+    ///
+    /// Shared rather than computed, because the owner is what knows what the upstream
+    /// negotiated: `echo-message` is serveable only when the server will echo. A reader
+    /// that answered `CAP LS` from a static list would advertise a capability the client
+    /// could then never negotiate -- or refuse one the client saw in the `005` welcome --
+    /// and both are contradictions the client has no way to detect.
+    ///
+    /// Bounded by the advertisement size, which is itself a reviewed constant list.
+    advertised: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Clone for SessionHandle {
-    /// Clones the routing handles; the negotiated-capability view is shared, not
-    /// copied, so the owner and the session reader never disagree about what a
-    /// client negotiated.
+    /// Clones the routing handles; the negotiated-capability and advertisement views are
+    /// shared, not copied, so the owner and the session reader never disagree about what a
+    /// client negotiated or about what this bouncer currently offers it.
     fn clone(&self) -> Self {
         Self {
             session: self.session,
@@ -357,6 +474,7 @@ impl Clone for SessionHandle {
             control_tx: self.control_tx.clone(),
             normal_tx: self.normal_tx.clone(),
             capabilities: self.capabilities.clone(),
+            advertised: self.advertised.clone(),
         }
     }
 }
@@ -406,6 +524,25 @@ impl SessionHandle {
             .map_err(|_| RuntimeError::QueueOverloaded)
     }
     /// This attachment's negotiated capabilities.
+    /// What this bouncer currently advertises to this session.
+    pub fn advertised(&self) -> Vec<String> {
+        self.advertised
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replaces what this bouncer advertises to this session.
+    ///
+    /// Called by the owner when the upstream negotiation changes what can be served.
+    /// Only the cell moves: a client that already negotiated a capability keeps it, and
+    /// one whose capability is withdrawn is told separately through `cap-notify`.
+    pub fn set_advertised(&self, advertised: Vec<String>) {
+        if let Ok(mut current) = self.advertised.lock() {
+            *current = advertised;
+        }
+    }
+
     pub fn capabilities(&self) -> SessionCapabilities {
         self.capabilities
             .lock()
@@ -536,6 +673,15 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
     ) -> Self {
         let (read, write) = tokio::io::split(stream);
         let (control_tx, normal_tx, writer) = crate::downstream::spawn_session_writer(write);
+        // The reader and the handle share one advertisement cell: the reader answers
+        // `CAP LS`/`CAP REQ` from it, and the owner replaces it as the upstream
+        // negotiation changes. They cannot disagree because there is only one.
+        let advertised = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::downstream::downstream_supported()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+        ));
         let handle = SessionHandle {
             session,
             client,
@@ -544,9 +690,17 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
             capabilities: std::sync::Arc::new(
                 std::sync::Mutex::new(SessionCapabilities::default()),
             ),
+            advertised: advertised.clone(),
         };
         Self {
-            reader: SessionReader::new(session, read, handle.clone(), expected_nick, bindable),
+            reader: SessionReader::new(
+                session,
+                read,
+                handle.clone(),
+                expected_nick,
+                bindable,
+                advertised,
+            ),
             handle,
             writer,
         }
@@ -763,6 +917,11 @@ struct SessionReader<D: ByteStream> {
     /// Bounded by [`crate::downstream::MAX_NEGOTIATED_CAPABILITIES`]. A client cannot
     /// grow this set without limit by repeating `CAP REQ`.
     negotiated: std::collections::BTreeSet<String>,
+    /// What this bouncer currently advertises to this session.
+    ///
+    /// The same cell the owner writes and this reader reads, so `CAP LS` can never answer
+    /// from one set while the `005` welcome came from another.
+    advertised: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ready: bool,
     /// Complete client lines already decoded but not yet translated.
     ///
@@ -804,11 +963,13 @@ impl<D: ByteStream> SessionReader<D> {
         handle: SessionHandle,
         expected_nick: Option<String>,
         bindable: std::collections::BTreeSet<NetworkId>,
+        advertised: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> Self {
         Self {
             session,
             read,
             handle,
+            advertised,
             expected_nick,
             decoder: LineDecoder::default(),
             registered_nick: None,
@@ -1407,10 +1568,19 @@ impl<D: ByteStream> SessionReader<D> {
                     // bouncer genuinely serves. A partial ACK would be a promise the
                     // session cannot keep.
                     let requested = crate::downstream::requested_capabilities(message);
+                    // Answered from the *live* advertisement rather than a static list,
+                    // so a capability the `005` welcome mentioned is also acknowledgeable
+                    // and one that is not in the advertisement is refused rather than
+                    // acknowledged.
+                    let offered = self
+                        .advertised
+                        .lock()
+                        .map(|set| set.clone())
+                        .unwrap_or_default();
                     let supported = !requested.is_empty()
-                        && requested.iter().all(|name| {
-                            crate::downstream::downstream_supported().contains(&name.as_str())
-                        });
+                        && requested
+                            .iter()
+                            .all(|name| offered.iter().any(|served| served == name));
                     if !supported {
                         return self.handle.queue_normal(&format!(
                             ":bouncer CAP {target} NAK :Unsupported capabilities\r\n"
@@ -1429,10 +1599,13 @@ impl<D: ByteStream> SessionReader<D> {
                         requested.join(" ")
                     ));
                 }
-                self.handle.queue_normal(&format!(
-                    ":bouncer CAP {target} LS :{}\r\n",
-                    crate::downstream::downstream_supported().join(" ")
-                ))
+                let offered = self
+                    .advertised
+                    .lock()
+                    .map(|set| set.join(" "))
+                    .unwrap_or_default();
+                self.handle
+                    .queue_normal(&format!(":bouncer CAP {target} LS :{offered}\r\n"))
             }
             "END" => {
                 if !self.ready {

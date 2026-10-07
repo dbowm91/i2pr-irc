@@ -767,7 +767,13 @@ fn a_notice_never_becomes_an_actionable_query() {
     );
 }
 
-/// The capability set served downstream is exactly the history drafts plus tags.
+/// The capability set served downstream is exactly the reviewed list, no more.
+///
+/// This is a *privacy* test, not a completeness one: every capability here widens what a
+/// client may learn about timing, direction, or membership, so the served set is stated
+/// exhaustively rather than by example. A capability added to the advertisement without
+/// appearing here fails, which is the point -- adding one is a privacy decision, not a
+/// feature flag.
 #[test]
 fn the_advertised_set_is_the_served_set() {
     let served: BTreeSet<&str> = i2pr_irc_runtime::downstream::downstream_supported()
@@ -778,12 +784,18 @@ fn the_advertised_set_is_the_served_set() {
         "message-tags",
         "batch",
         "labeled-response",
+        "server-time",
+        "standard-replies",
+        "cap-notify",
+        "draft/no-implicit-names",
         "draft/chathistory",
         "draft/read-marker",
     ] {
         assert!(served.contains(capability), "{capability} must be served");
     }
-    for withheld in ["server-time", "echo-message", "away-notify", "sasl"] {
+    // `echo-message` is conditional on upstream and is therefore absent from the
+    // unconditional set; the privacy consequence is checked where it is granted.
+    for withheld in ["echo-message", "away-notify", "sasl", "account-notify"] {
         assert!(
             !served.contains(withheld),
             "{withheld} must not be advertised"

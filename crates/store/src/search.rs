@@ -178,14 +178,15 @@ pub fn delete_search_row(tx: &rusqlite::Transaction<'_>, event: i64) -> Result<(
 }
 
 /// The nick portion of a message prefix, without the user and host.
+/// The nick a stored prefix names, or an empty string when it names none.
+///
+/// Delegates to the wire decoder so the migration backfill and the ingestion path read a
+/// prefix identically. Two copies of "the nick is the part before the first separator"
+/// would be two answers to the same question about the same frame.
 fn lossy_nick(prefix: &[u8]) -> String {
-    String::from_utf8_lossy(
-        prefix
-            .split(|byte| *byte == b'!' || *byte == b'@')
-            .next()
-            .unwrap_or(prefix),
-    )
-    .into_owned()
+    i2pr_irc_wire::prefix_nick(prefix)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Clamps one derived field to the searchable ceiling on a character boundary.
