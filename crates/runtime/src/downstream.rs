@@ -36,6 +36,7 @@ pub const DOWNSTREAM_ADVERTISED: &[&str] = &[
     // `LISTNETWORKS` batch and the revision-derived change notifications. Advertising
     // only the first would leave a client unable to tell an idle bouncer from a broken
     // one, so both are gated on the same complete implementation.
+    crate::search::SEARCH_CAPABILITY,
     crate::bouncer_networks::BOUNCER_NETWORKS,
     crate::bouncer_networks::BOUNCER_NETWORKS_NOTIFY,
 ];

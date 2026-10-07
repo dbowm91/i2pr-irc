@@ -25,12 +25,16 @@ use std::{
 /// The table *set* has been identical across every schema version so far; only the
 /// representation of `history_events.server_time` and `networks.display_name` changed,
 /// and only `desired_channels` gained a column.
-pub const EXPECTED_TABLES: [&str; 8] = [
+pub const EXPECTED_TABLES: [&str; 9] = [
     "buffers",
     "client_cursors",
     "clients",
     "desired_channels",
     "history_events",
+    // The FTS5 search side index. Its shadow tables are SQLite's own storage and are
+    // excluded by `table_names`, so listing them here would tie the promised schema to a
+    // SQLite build detail.
+    "history_search",
     "network_secrets",
     "networks",
     "read_markers",
@@ -108,6 +112,50 @@ pub fn create_v4_database(path: &Path) -> Connection {
     connection
 }
 
+/// Creates a database at schema version 5 and returns a raw connection to it.
+///
+/// Used to build the fixture the v5 -> v6 migration must handle. Search events are seeded
+/// so the migration's bounded backfill has something to copy: a backfill that is only ever
+/// exercised against an empty journal proves nothing about the batch loop.
+pub fn create_v5_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v5())
+        .expect("schema 5 applies");
+    seed_history_for_backfill(&connection);
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 5)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Seeds one Network, one Buffer, and three retained messages.
+fn seed_history_for_backfill(connection: &Connection) {
+    connection
+        .execute_batch(
+            "INSERT INTO networks
+                (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+             VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p', 1,
+                     'bot', 'user', 'bouncer', 'lab');
+             INSERT INTO buffers (buffer_id, network_id, kind, target, canonical_key)
+             VALUES (1, 1, 0, '#room', x'23726f6f6d');
+             INSERT INTO history_events
+                (event_id, network_id, buffer_id, received_at, server_time, msgid,
+                 direction, event_class, payload)
+             VALUES
+                (1, 1, 1, 1000, '2026-01-01T00:00:00.000Z', 'm1', 0, 'PRIVMSG',
+                 CAST(':alice!a@h PRIVMSG #room :hello there' AS BLOB)),
+                (2, 1, 1, 1001, '2026-01-01T00:00:01.000Z', 'm2', 0, 'PRIVMSG',
+                 CAST(':bob!b@h PRIVMSG #room :goodbye now' AS BLOB)),
+                (3, 1, 1, 1002, '2026-01-01T00:00:02.000Z', 'm3', 0, 'JOIN',
+                 CAST(':carol!c@h JOIN #room' AS BLOB));",
+        )
+        .expect("history fixture is insertable");
+}
+
 /// A temporary directory owned by one test, removed when the guard is dropped.
 #[derive(Debug)]
 pub struct TempDir(PathBuf);
@@ -180,7 +228,11 @@ pub fn classify(path: &Path) -> Result<OpenDisposition, StoreError> {
 pub fn tables(path: &Path) -> Vec<String> {
     raw(path)
         .prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            // FTS5 shadow tables are excluded for the same reason `schema::table_names`
+            // excludes them: they are SQLite's own storage, not promised schema.
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'history_search_%'
+             ORDER BY name",
         )
         .and_then(|mut statement| {
             statement

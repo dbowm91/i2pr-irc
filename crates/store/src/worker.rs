@@ -10,6 +10,7 @@ use crate::{
     ops, schema,
 };
 use i2pr_irc_core::{BufferId, ClientId, HistoryEventId, NetworkId};
+use i2pr_irc_wire::IrcTimestamp;
 use rusqlite::Connection;
 use std::{
     sync::{
@@ -75,8 +76,27 @@ enum Request {
         events: Vec<NewHistoryEvent>,
         reply: Reply<Result<HistoryAppendResult, StoreError>>,
     },
+    ResolveMsgId {
+        network: NetworkId,
+        msgid: String,
+        reply: oneshot::Sender<Result<MsgidLookup, StoreError>>,
+    },
+    NearestEvent {
+        buffer: BufferId,
+        reference: IrcTimestamp,
+        reply: oneshot::Sender<Result<NearestEvent, StoreError>>,
+    },
+    Search {
+        query: Box<SearchQuery>,
+        reply: oneshot::Sender<Result<Vec<SearchHit>, StoreError>>,
+    },
     QueryHistory {
         query: Box<HistoryQuery>,
+        reply: Reply<Result<Vec<HistoryEvent>, StoreError>>,
+    },
+    /// One bounded window centred on an anchor, for `AROUND`.
+    HistoryAround {
+        request: Box<HistoryAround>,
         reply: Reply<Result<Vec<HistoryEvent>, StoreError>>,
     },
     GetCursor {
@@ -106,8 +126,12 @@ enum Request {
     /// Buffers with retained history inside a time window, for `TARGETS`.
     RecentTargets {
         network: NetworkId,
-        lower_unix_millis: i64,
-        upper_unix_millis: i64,
+        /// Canonical protocol timestamps, matching what the `server_time` column holds.
+        ///
+        /// Named for the column, not for a unit: the value is text, and an i64 here would
+        /// be compared against text by SQLite type order rather than by time.
+        lower_unix_millis: IrcTimestamp,
+        upper_unix_millis: IrcTimestamp,
         limit: usize,
         reply: Reply<Result<Vec<RecentTarget>, StoreError>>,
     },
@@ -261,6 +285,43 @@ impl StoreHandle {
         })
         .await
     }
+    /// Resolves a `msgid=` reference within one Network.
+    pub async fn resolve_msgid(
+        &self,
+        network: NetworkId,
+        msgid: &str,
+    ) -> Result<MsgidLookup, StoreError> {
+        self.submit(|reply| Request::ResolveMsgId {
+            network,
+            msgid: msgid.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Finds the events bracketing one canonical protocol timestamp in one buffer.
+    pub async fn nearest_event(
+        &self,
+        buffer: BufferId,
+        reference: IrcTimestamp,
+    ) -> Result<NearestEvent, StoreError> {
+        self.submit(|reply| Request::NearestEvent {
+            buffer,
+            reference,
+            reply,
+        })
+        .await
+    }
+
+    /// Runs one bounded search over one Network's retained history.
+    pub async fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, StoreError> {
+        self.submit(|reply| Request::Search {
+            query: Box::new(query.clone()),
+            reply,
+        })
+        .await
+    }
+
     pub async fn query_history(
         &self,
         query: &HistoryQuery,
@@ -271,18 +332,30 @@ impl StoreHandle {
         })
         .await
     }
+
+    /// A bounded window centred on one anchor event.
+    pub async fn history_around(
+        &self,
+        request: &HistoryAround,
+    ) -> Result<Vec<HistoryEvent>, StoreError> {
+        self.submit(|reply| Request::HistoryAround {
+            request: Box::new(*request),
+            reply,
+        })
+        .await
+    }
     /// Buffers whose newest retained event falls inside a time window.
     pub async fn recent_targets(
         &self,
         network: NetworkId,
-        lower_unix_millis: i64,
-        upper_unix_millis: i64,
+        lower: IrcTimestamp,
+        upper: IrcTimestamp,
         limit: usize,
     ) -> Result<Vec<RecentTarget>, StoreError> {
         self.submit(|reply| Request::RecentTargets {
             network,
-            lower_unix_millis,
-            upper_unix_millis,
+            lower_unix_millis: lower,
+            upper_unix_millis: upper,
             limit,
             reply,
         })
@@ -586,8 +659,28 @@ fn execute(connection: &mut Connection, request: Request) {
         Request::AppendHistory { events, reply } => {
             answer!(reply, ops::append_history(connection, &events))
         }
+        Request::ResolveMsgId {
+            network,
+            msgid,
+            reply,
+        } => {
+            answer!(reply, ops::resolve_msgid(connection, network, &msgid))
+        }
+        Request::NearestEvent {
+            buffer,
+            reference,
+            reply,
+        } => {
+            answer!(reply, ops::nearest_event(connection, buffer, &reference))
+        }
+        Request::Search { query, reply } => {
+            answer!(reply, ops::search(connection, query.as_ref()))
+        }
         Request::QueryHistory { query, reply } => {
             answer!(reply, ops::query_history(connection, &query))
+        }
+        Request::HistoryAround { request, reply } => {
+            answer!(reply, ops::history_around(connection, &request))
         }
         Request::GetCursor {
             client,
@@ -618,8 +711,8 @@ fn execute(connection: &mut Connection, request: Request) {
                 ops::recent_targets(
                     connection,
                     network,
-                    lower_unix_millis,
-                    upper_unix_millis,
+                    &lower_unix_millis,
+                    &upper_unix_millis,
                     limit
                 )
             )

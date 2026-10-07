@@ -85,6 +85,22 @@ The clamp rule has two halves, and both matter:
 ## A cursor needs a durable client lineage
 
 Playback state has to survive a restart, so it cannot hang off a locally invented client id. `ensure_client` resolves (or creates) the durable `ClientId` first; the store's foreign keys then guarantee no cursor can reference a lineage that does not exist.
+## History is searchable without re-parsing it
+
+Ingestion derives the bounded search fields — sender nick, target, body — from the message
+it has already decoded, and writes them alongside the retained event in one transaction.
+The store therefore never re-parses a stored line to answer a query, and never carries
+protocol knowledge on the hot write path.
+
+That derivation has exactly one exception: the schema 5 → 6 migration backfill, which must
+rebuild an index for events the store already holds and cannot ask the runtime about them.
+That is the single place the store decodes protocol, and it is bounded and one-off.
+
+Ingestion also stamps `effective_time` — the time an event occupies in history, whether or
+not the upstream ever sent a `server-time`. Every timestamp reference reads that column,
+so a buffer whose upstream stamps nothing is still positionable. See
+[history search and indexed references](history-search.md).
+
 ## Ingestion is not gated by what a client may see
 
 History ingestion and downstream presentation are separate decisions, and detaching separates them explicitly.

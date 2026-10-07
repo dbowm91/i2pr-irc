@@ -27,7 +27,7 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 5
+## Schema version 6
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
@@ -41,6 +41,12 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 | `history_events` | bounded durable history |
 | `client_cursors` | per-`(ClientId, BufferId)` playback position |
 | `read_markers` | per-`BufferId` operator read state |
+| `history_search` | FTS5 **side index** over searchable history; `history_events` remains the source of truth |
+
+`history_search` is a virtual table, so its `…_data`, `…_idx`, `…_docsize`, `…_content`
+and `…_config` shadow tables are excluded from the promised set: they are SQLite's own
+storage for the index, and listing them would make the promise depend on an implementation
+detail of the SQLite build in use.
 
 Every table is `STRICT`, so a value of the wrong storage class is rejected by SQLite rather than coerced into a row that later means something different. Foreign keys are enabled at open, and a removed Network cascades to its buffers, history, cursors, and markers so a reused identity cannot inherit orphaned rows.
 
@@ -94,6 +100,73 @@ A detached channel is still a desired channel. `detach` is a single `UPDATE`, no
 
 `NetworkRecord::validate` requires positions to be strictly increasing. Order is therefore total and a reloaded list means exactly what the saved one meant, without depending on how a list happened to be built. Gaps are allowed, because removing one channel must not renumber the others. Targets are casemap-unique under Rfc1459, matching the durable primary key, so a duplicate is reported before SQLite sees it.
 
+### What version 6 added, and why
+
+Version 6 adds three things, all of them for [history search and indexed
+references](history-search.md): the `history_search` FTS5 side index, the two relational
+indexes reference lookup needs, and `history_events.effective_time`.
+
+**The FTS rowid is the `HistoryEventId`.** That one decision makes retention exact —
+deleting a retained row and deleting its index entry are one statement each, in one
+transaction, by exact id, rather than a join that could half-succeed. An index row can
+never name an event that does not exist. The index is written inside the append
+transaction, so a message is retained-and-searchable or absent, never one without the
+other.
+
+**Two indexes replace scans.** `history_by_time` on
+`(buffer_id, effective_time, event_id)` positions a `timestamp=` reference with two seeks,
+and `history_by_msgid` on `(network_id, msgid)` resolves a `msgid=` without reading a
+buffer. `network_id` leads the msgid index because an upstream identifier is only
+meaningful within the Network that issued it.
+
+**`effective_time` is the time an event occupies in history**, not the time the upstream
+stamped it. An upstream that never sends `server-time` leaves every `server_time` NULL,
+so an index over that column alone is empty for the whole buffer and every timestamp
+reference fails against a buffer full of history. `effective_time` is the upstream stamp
+when there was one and the local receive time converted to the same canonical text
+otherwise.
+
+It is a separate column rather than a write into `server_time`. That column records what
+the upstream actually said, and inventing a value there would turn "the upstream sent no
+timestamp" into a false claim. The rule has one definition,
+`i2pr_irc_store::effective_time`, shared by the append path, the migration backfill, and
+the runtime's `time=` tag rendering — a second copy is how a replayed message and a
+timestamp reference would come to disagree about where a message sits.
+
+**Every comparison against it binds canonical text.** `effective_time` is `TEXT` holding
+fixed-width UTC, so lexicographic order is chronological order. Binding integer
+milliseconds instead compares TEXT against INTEGER, and SQLite orders every TEXT value
+after every INTEGER value regardless of the numbers involved — so the predicate matches
+either everything or nothing while still looking like a time comparison. `recent_targets`
+had exactly this bug and shipped it silently; `canonical_time` is now the only path by
+which a time bound reaches SQL.
+
+### Migrating version 5
+
+The v5 → v6 step is four statements in one transaction, in dependency order: add
+`effective_time`, create the two indexes over it, create the FTS table, then backfill.
+The order matters because the index is defined over the column.
+
+Both backfills are bounded at `MIGRATION_BATCH_ROWS` per step so a large retained journal
+is never materialized at once, and both run inside the single migration transaction. A
+partially backfilled index is worse than none, because it would answer searches with
+results that silently stop partway through.
+
+The search backfill decodes stored payloads with the same bounded decoder ingestion uses,
+which is the one place the store carries protocol knowledge. Refusing to decode would mean
+an upgraded database whose retained history was silently unsearchable. A payload that
+yields no text is still indexed, empty — dropping it would make the index row count
+disagree with the retained row count.
+
+The effective-time backfill is not optional bookkeeping. A row left at the empty default
+sorts *before* every real timestamp and becomes the oldest message in its buffer: a wrong
+answer that looks like a correct one.
+
+Open additionally refuses a database whose promised indexes are missing, and one whose
+index row count disagrees with its retained searchable rows. An index that exists but has
+lost rows would otherwise answer "no matches" — a degraded feature presented as a
+complete one.
+
 ### Migrating version 3
 
 The v3 → v4 step is a single `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT 0 CHECK (detached IN (0, 1))`, inside the same migration transaction as every other step. `ADD COLUMN` cannot rebuild the table, so the column is appended rather than inserted; SQLite permits `NOT NULL` on an added column exactly when the default is not `NULL`, which is what makes the one-statement migration sound.
@@ -112,7 +185,7 @@ Migration steps are applied in order, one version at a time, so a database sever
 
 ## Open policy
 
-Open validates before serving anything: application identity (`application_id`), schema version (`user_version`), that the promised tables actually exist, and that the bundled SQLite supports `STRICT` (3.37.0+). A database this build cannot serve is a startup failure — `ForeignDatabase`, `SchemaTooNew`, or `Corrupt` — never a condition the bouncer works around. Schema creation and migration each run in one transaction, so a partially migrated database is never accepted.
+Open validates before serving anything: application identity (`application_id`), schema version (`user_version`), that the promised tables and columns actually exist, that the bundled SQLite supports `STRICT` (3.37.0+) **and** FTS5, that the reference indexes are present, and that the search index agrees with retained history. A database this build cannot serve is a startup failure — `ForeignDatabase`, `SchemaTooNew`, or `Corrupt` — never a condition the bouncer works around. Schema creation and migration each run in one transaction, so a partially migrated database is never accepted.
 
 A version newer than `SCHEMA_VERSION` is refused at startup. A version between `MIN_SUPPORTED_SCHEMA_VERSION` and the current one is migrated forward; an older one is refused rather than guessed at.
 

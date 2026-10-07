@@ -35,7 +35,12 @@ Advertising `draft/chathistory` promises a specific server-side contract, and an
 - a bounded standard-reply `FAIL` is returned for a malformed request;
 - only PRIVMSG/NOTICE is replayed, because event-playback is not negotiated and is not offered.
 
-`AROUND` is implemented rather than refused. Refusing part of an advertised extension is the same class of lie as not advertising it at all: its budget splits as `before = (limit - 1) / 2`, `after = limit - 1 - before`, with the selector itself counting as one slot.
+`AROUND` is implemented rather than refused. Refusing part of an advertised extension is the same class of lie as not advertising it at all: its budget splits as `before = (limit - 1) / 2`, `after = limit - 1 - before`, with the selector itself counting as one slot. Since Plan 024 that bracket is two indexed seeks rather than a window read, so it works for a selector anywhere in the retained history rather than only inside `LATEST` window.
+
+The `MSGREFTYPES=timestamp,msgid` claim is reviewed against what is actually served in
+`crates/runtime/tests/m005e_search_history.rs`: both reference kinds resolve for every
+subcommand including `AROUND`, at every window edge, and both refusal dispositions are
+reachable over the wire. The token is truthful as written.
 
 Downstream CAP negotiation ACKs exactly the capabilities actually served — `draft/chathistory` and `draft/read-marker` — and refuses a partially supported request as a whole rather than half-acknowledging it.
 
@@ -46,7 +51,8 @@ Downstream CAP negotiation ACKs exactly the capabilities actually served — `dr
 | Events per query | ≤ 50 (`MAX_HISTORY_LIMIT`) |
 | Bytes per response | ≤ 256 KiB |
 | `LATEST` window scanned | ≤ 512 events |
-| Reference candidates | ≤ 512 events |
+| `AROUND` total events | ≤ `MAX_HISTORY_QUERY_EVENTS` (512) |
+| Ambiguous `msgid` matches reported | ≤ 8 |
 
 `LATEST` needs the *newest* page, so it takes the tail of a bounded retained window rather than the head. An early version returned the head, which would have silently given a client the beginning of a buffer when it asked for the end.
 
@@ -68,16 +74,40 @@ Results are ordered by `HistoryEventId`. A skewed `server-time` is metadata and 
 
 Only PRIVMSG/NOTICE is stored, so no JOIN/PART/NICK can appear in a replay. That is deliberate: it is what keeps a history payload truthful without implementing event-playback semantics. The adapter physically cannot offer what the store does not hold.
 
-## References resolve, or they are refused
+## References resolve through the index, or they are refused
 
-| Form | Rule | Tie-break |
+| Form | Lookup | Tie-break |
 |---|---|---|
-| `msgid=` | exact match in the buffer | — |
-| `timestamp=N` | newest event at or before N, comparing the canonical protocol timestamp | largest `HistoryEventId` |
+| `msgid=` | `history_by_msgid` on `(network_id, msgid)` | — |
+| `timestamp=N` | `history_by_time` on `(buffer_id, effective_time, event_id)` | largest `HistoryEventId` |
 
-Resolution is bounded and never guesses. A selector into history that was not retained, or that names no retained event at all, is refused — approximating with an adjacent event would misrepresent what the client asked for, which is worse than saying no.
+Neither lookup scans. Before Plan 024 both resolved by reading a bounded window of the
+buffer and filtering it in memory, so a reference older than that window simply failed —
+which is exactly the case bookmarks exist for. See `architecture/history-search.md`.
 
-Ties always resolve through local identity, never a timestamp comparison. An `AROUND` selector resolves the same way, so a bracketed window is centred on a real retained event.
+Resolution is bounded and never guesses, but the bounds are now seeks rather than a
+window, so a reference that lands outside the retained window is not an error:
+
+| Condition | Answer |
+|---|---|
+| resolves to a retained event | that event |
+| predates everything retained | `HistoryPosition::BeforeStart` |
+| `msgid=` carried by exactly one retained event | that event |
+| `msgid=` carried by more than one | `AmbiguousReference` |
+| `msgid=` carried by none | `UnknownReference` |
+
+`BeforeStart` is a position rather than a failure, and the directions are deliberately
+not symmetric: `AFTER` from before the beginning returns everything retained, while
+`BEFORE` returns nothing — no retained message is earlier than the start of retention.
+An earlier implementation anchored a too-old reference onto the oldest event, which
+silently dropped that oldest message from `AFTER`. Full table in `history-search.md`.
+
+`UnknownReference` is distinct from `HistoryUnavailable` on purpose: after retention ran
+successfully, the only true statement about a pruned id is that nothing carries it.
+
+Ties always resolve through local identity, never a timestamp comparison. An `AROUND`
+selector resolves the same way, so a bracketed window is centred on a real retained event
+— and it is centred on one even when that event is older than any bounded window.
 
 ## One client, one synchronization mode
 
@@ -116,7 +146,7 @@ A client that never negotiated the draft is never sent a `MARKREAD` at all, in a
 
 ## Refusals are typed
 
-`UnknownSubcommand`, `MissingParameters`, `TooManyParameters`, `InvalidTimestamp`, `InvalidReference`, `InvalidLimit`, `UnsupportedReferenceType`, `NoSuchBuffer`, `HistoryUnavailable`, and the MARKREAD set of `MissingParameters`, `TooManyParameters`, `InvalidTarget`, `InvalidTimestamp`, `NoSuchBuffer`, `Internal` — each renders a stable standard-reply code and never a payload.
+`UnknownSubcommand`, `MissingParameters`, `TooManyParameters`, `InvalidTimestamp`, `InvalidReference`, `InvalidLimit`, `UnsupportedReferenceType`, `NoSuchBuffer`, `UnknownReference`, `AmbiguousReference`, `HistoryUnavailable`, and the MARKREAD set of `MissingParameters`, `TooManyParameters`, `InvalidTarget`, `InvalidTimestamp`, `NoSuchBuffer`, `Internal` — each renders a stable standard-reply code and never a payload.
 
 `CHATHISTORY` and `MARKREAD` are answered locally and never forwarded upstream: the server has none of this history. A refusal is still a reply — a client learns why nothing arrived instead of waiting forever — and refusing a command is never grounds for ending the session.
 

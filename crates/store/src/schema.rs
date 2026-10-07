@@ -1,4 +1,4 @@
-//! Schema versions 1 through 4 and their transactional migration harness.
+//! Schema versions 1 through 6 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -15,8 +15,10 @@ use rusqlite::Connection;
 /// adds the bouncer-owned `detached` presentation flag on a desired channel; see
 /// [`DESIRED_CHANNELS_V3`] and [`migrate_3_to_4`]. Version 5 adds the two Operator
 /// presence policies, `auto_away` and `keep_nick`; see [`NETWORKS_V5`] and
-/// [`migrate_4_to_5`].
-pub const SCHEMA_VERSION: i64 = 5;
+/// [`migrate_4_to_5`]. Version 6 adds the search side index and the two relational
+/// indexes history reference lookup needs; see [`HISTORY_SEARCH_V6`],
+/// [`HISTORY_REFERENCE_INDEXES_V6`], and [`migrate_5_to_6`].
+pub const SCHEMA_VERSION: i64 = 6;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -311,7 +313,10 @@ pub(crate) fn schema_v4() -> String {
     )
 }
 
-/// The current schema, created directly when no database exists yet.
+/// Schema 5, used to build the fixture the schema 6 migration must handle.
+///
+/// Retained verbatim so the migration rebuilds exactly the representation it is
+/// replacing, rather than one reconstructed from a newer declaration.
 pub(crate) fn schema_v5() -> String {
     compose(
         DESIRED_CHANNELS_V4,
@@ -319,6 +324,92 @@ pub(crate) fn schema_v5() -> String {
         HISTORY_EVENTS_V2,
         SCHEMA_TAIL,
     )
+}
+
+/// The effective-time column schema 6 adds to `history_events`.
+///
+/// `server_time` alone cannot answer a timestamp reference: an upstream that never sends
+/// `server-time` leaves it NULL for every event, so an index over it would be empty for
+/// the whole buffer and every `timestamp=` reference would fail against a buffer full of
+/// history.
+///
+/// `effective_time` is the time the event *occupies* in history — the upstream's stamp
+/// when it sent one, and otherwise the local receive time converted to the same canonical
+/// text. It is derived once at append time and never recomputed, so the index and the
+/// replay path cannot disagree about where an event sits.
+///
+/// It is deliberately a separate column rather than a write into `server_time`: that
+/// column records what the upstream actually said, and inventing a value there would turn
+/// "the upstream sent no timestamp" into a false claim.
+///
+/// Added with a default rather than as a rebuild, so event ids, cursors and read markers
+/// keep pointing at exactly the rows they did before.
+const HISTORY_EFFECTIVE_TIME_V6: &str = r#"
+ALTER TABLE history_events ADD COLUMN effective_time TEXT NOT NULL DEFAULT '';
+"#;
+
+/// The relational indexes schema 6 adds.
+///
+/// Both exist to stop a reference lookup from being a scan. `effective_time` is indexed
+/// rather than `server_time` because it is the value every reference is compared against.
+/// `msgid` is indexed with `network_id` because an upstream id is only meaningful within
+/// the Network that issued it.
+const HISTORY_REFERENCE_INDEXES_V6: &str = r#"
+CREATE INDEX history_by_time ON history_events (buffer_id, effective_time, event_id);
+CREATE INDEX history_by_msgid ON history_events (network_id, msgid);
+"#;
+
+/// The FTS5 side index schema 6 adds.
+///
+/// This is an *index*, not a source of truth: `history_events` remains the only place a
+/// retained event lives, and this table is rebuilt from it whenever it is missing.
+///
+/// The rowid is the `HistoryEventId`, which is what makes retention exact. Deleting a
+/// retained row and deleting its index entry become one statement each rather than a join
+/// that could half-succeed, and an index row can never name an event that does not exist.
+const HISTORY_SEARCH_V6: &str = r#"
+CREATE VIRTUAL TABLE history_search USING fts5(
+    sender,
+    target,
+    body,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+"#;
+
+/// The current schema, created directly when no database exists yet.
+pub(crate) fn schema_v6() -> String {
+    format!(
+        "{}{}{}{}",
+        compose(
+            DESIRED_CHANNELS_V4,
+            NETWORKS_V5,
+            HISTORY_EVENTS_V2,
+            SCHEMA_TAIL,
+        ),
+        HISTORY_EFFECTIVE_TIME_V6,
+        HISTORY_REFERENCE_INDEXES_V6,
+        HISTORY_SEARCH_V6,
+    )
+}
+
+/// Every FTS5 feature this schema needs must be present in the linked SQLite.
+///
+/// Checked at migration and open time rather than assumed from the dependency list. A
+/// build without FTS5 would otherwise create a database that advertises a searchable
+/// history it cannot search, which is precisely the "silently return incomplete search as
+/// complete" failure the plan forbids.
+pub(crate) fn verify_search_support(connection: &Connection) -> Result<(), StoreError> {
+    let enabled: i64 = connection
+        .query_row(
+            "SELECT sqlite_compileoption_used('ENABLE_FTS5')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    if enabled != 1 {
+        return Err(StoreError::new(StoreErrorKind::Open));
+    }
+    Ok(())
 }
 
 /// Refuses a database this build must not serve before any migration runs.
@@ -446,6 +537,8 @@ pub(crate) fn open_and_migrate(
             // serving it would reinterpret durable meaning silently.
             verify_promised_tables(connection)?;
             verify_promised_columns(connection)?;
+            verify_search_support(connection)?;
+            verify_search_index(connection)?;
             Ok(OpenDisposition::Current)
         }
         OpenDisposition::Migrated { from } => {
@@ -455,6 +548,8 @@ pub(crate) fn open_and_migrate(
             migrate_forward(&transaction, from)?;
             verify_promised_tables(&transaction)?;
             verify_promised_columns(&transaction)?;
+            verify_search_support(&transaction)?;
+            verify_search_index(&transaction)?;
             transaction
                 .commit()
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
@@ -464,8 +559,9 @@ pub(crate) fn open_and_migrate(
             let transaction = connection
                 .unchecked_transaction()
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v5())
+                .execute_batch(&schema_v6())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -482,9 +578,18 @@ pub(crate) fn open_and_migrate(
 }
 
 /// Every user table present, used to verify the promised schema before serving.
+///
+/// An FTS5 virtual table is backed by several shadow tables (`…_data`, `…_idx`,
+/// `…_docsize`, `…_content`, `…_config`). They are SQLite's own storage for the index,
+/// not tables this schema promises, so they are excluded -- listing them would make the
+/// promised table set depend on an implementation detail of the SQLite build in use.
 pub(crate) fn table_names(connection: &Connection) -> Result<Vec<String>, rusqlite::Error> {
     let mut statement = connection.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name FROM sqlite_master
+         WHERE type='table'
+           AND name NOT LIKE 'sqlite_%'
+           AND name NOT LIKE 'history_search_%'
+         ORDER BY name",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut names = Vec::new();
@@ -519,7 +624,56 @@ const REQUIRED_TABLES: &[&str] = &[
     "client_cursors",
     "buffers",
     "read_markers",
+    // The FTS5 side index. It is a virtual table, so it appears in `sqlite_master`
+    // alongside ordinary tables and can be checked the same way.
+    "history_search",
 ];
+
+/// Indexes this build promises, beyond the presence of their table.
+///
+/// A missing search index is not a degraded feature; it is a database that would answer
+/// searches from nothing and report no matches. Detecting it at open time is what turns
+/// that into a refusal instead of a silent lie.
+const REQUIRED_INDEXES: &[&str] = &["history_by_time", "history_by_msgid"];
+
+/// Confirms the search index is present and consistent with retained history.
+///
+/// Presence alone is not enough: an index that exists but has lost rows would still
+/// answer "no matches". Comparing row counts is the cheapest check that distinguishes
+/// "searchable" from "silently empty", and a mismatch refuses the open rather than
+/// serving an incomplete result as complete.
+fn verify_search_index(connection: &Connection) -> Result<(), StoreError> {
+    for index in REQUIRED_INDEXES {
+        let present: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [index],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+        if present != 1 {
+            return Err(StoreError::new(StoreErrorKind::Corrupt(
+                "missing search index",
+            )));
+        }
+    }
+    let indexed: i64 = connection
+        .query_row("SELECT count(*) FROM history_search", [], |row| row.get(0))
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    let searchable: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM history_events WHERE event_class IN ('PRIVMSG','NOTICE')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    if indexed != searchable {
+        return Err(StoreError::new(StoreErrorKind::Corrupt(
+            "search index disagrees with retained history",
+        )));
+    }
+    Ok(())
+}
 
 /// Columns this build promises, beyond the mere presence of their table.
 ///
@@ -531,6 +685,9 @@ const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("desired_channels", "detached"),
     ("networks", "auto_away"),
     ("networks", "keep_nick"),
+    // Without this column every timestamp reference against a buffer whose upstream
+    // sends no `server-time` resolves against an empty index.
+    ("history_events", "effective_time"),
 ];
 
 /// Confirms every promised column is present on its table.
@@ -567,6 +724,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             2 => migrate_2_to_3(transaction)?,
             3 => migrate_3_to_4(transaction)?,
             4 => migrate_4_to_5(transaction)?,
+            5 => migrate_5_to_6(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -737,6 +895,125 @@ fn migrate_4_to_5(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     Ok(())
+}
+
+/// The schema 5 -> 6 step: effective history time, search indexes, and a bounded
+/// backfill of existing history.
+///
+/// Four steps in one transaction, in dependency order: the column first, because the
+/// index below is defined over it; then the indexes and the virtual table; then the
+/// backfill. The backfill copies at most `MIGRATION_BATCH_ROWS` rows per step so a large
+/// retained journal is never materialized at once, and the whole step is still one
+/// transaction: a partially backfilled index is worse than none, because it would answer
+/// searches with results that silently stop partway through.
+///
+/// Only `PRIVMSG` and `NOTICE` are indexed. That is the searchable surface this build
+/// offers, and indexing anything else would be work whose results could never be shown.
+fn migrate_5_to_6(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    verify_search_support(tx)?;
+    tx.execute_batch(HISTORY_EFFECTIVE_TIME_V6)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.execute_batch(HISTORY_REFERENCE_INDEXES_V6)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.execute_batch(HISTORY_SEARCH_V6)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    backfill_search_index(tx)?;
+    backfill_effective_time(tx)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// Fills `effective_time` for every retained row, in bounded batches.
+///
+/// Runs after the column is added and before the database is served, because a row left
+/// at the empty default would sort *before* every real timestamp and become the oldest
+/// message in its buffer — a wrong answer that looks like a correct one.
+fn backfill_effective_time(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let mut cursor: i64 = 0;
+    loop {
+        let rows: Vec<(i64, Option<String>, i64)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT event_id, server_time, received_at FROM history_events
+                     WHERE event_id > ?1
+                     ORDER BY event_id LIMIT ?2",
+                )
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            let mapped = statement
+                .query_map(rusqlite::params![cursor, MIGRATION_BATCH_ROWS], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.map_err(|_| StoreError::new(StoreErrorKind::Open))?);
+            }
+            collected
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (event_id, server_time, received_at) in &rows {
+            let effective = crate::search::stored_effective_time(
+                server_time.as_deref(),
+                i2pr_irc_core::WallTime(*received_at),
+            )
+            .ok_or_else(|| StoreError::new(StoreErrorKind::Corrupt("history timestamp")))?;
+            tx.execute(
+                "UPDATE history_events SET effective_time = ?1 WHERE event_id = ?2",
+                rusqlite::params![effective, *event_id],
+            )
+            .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+        }
+        cursor = rows
+            .last()
+            .map(|(event_id, ..)| *event_id)
+            .ok_or_else(|| StoreError::new(StoreErrorKind::Open))?;
+    }
+}
+
+/// Copies retained searchable events into the side index, in bounded batches.
+///
+/// Rows are selected in ascending `HistoryEventId` and the cursor advances past whatever
+/// was copied, so each batch is a range rather than a rescan. The search text is derived
+/// from the stored payload by the same bounded decoder ingestion uses; a payload that
+/// cannot yield text is indexed as empty rather than dropped, because dropping it would
+/// leave the index count disagreeing with the retained rows.
+fn backfill_search_index(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let mut cursor: i64 = 0;
+    loop {
+        let rows: Vec<(i64, Vec<u8>)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT event_id, payload FROM history_events
+                     WHERE event_id > ?1 AND event_class IN ('PRIVMSG','NOTICE')
+                     ORDER BY event_id LIMIT ?2",
+                )
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            let mapped = statement
+                .query_map(rusqlite::params![cursor, MIGRATION_BATCH_ROWS], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.map_err(|_| StoreError::new(StoreErrorKind::Open))?);
+            }
+            collected
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (event_id, payload) in &rows {
+            let (sender, target, body) = crate::search::derive_fields(payload)?;
+            crate::search::insert_search_row(tx, *event_id, sender, target, body)?;
+        }
+        cursor = rows
+            .last()
+            .map(|(event_id, ..)| *event_id)
+            .ok_or_else(|| StoreError::new(StoreErrorKind::Open))?;
+    }
 }
 
 /// Re-inserts one v1 row into the v2 staging table, converting its protocol

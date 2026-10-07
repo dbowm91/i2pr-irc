@@ -10,7 +10,23 @@ M002's runtime integration suite uses `FakeI2pStreamProvider` and `FakeLocalAcce
 
 The ownership campaign adds evidence for upstream registration and liveness with zero attached clients, client EOF and client `QUIT` ending only that client, a second client reattaching the same generation and seeing state learned while detached, 100 attach/detach cycles staying bounded within one generation, downstream protocol violation and queue overload ending only the client, a saturated client backlog still receiving an answered server PING, upstream failure with and without an attached client, a stale detached session not affecting the next client, and explicit stop being the only path that sends upstream `QUIT`. Provider fixtures also expose the fault controller for a connection so tests can assert on captured upstream writes. Tokio's paused clock drives reconnect, accept-retry, and online deadline tests without wall-clock waiting; paused-time scenarios settle pending work before arming a bounded reader so virtual time cannot outrun the owner.
 
-The M005 suites add, per plan: `m005a_controller_admission` (bounded controller, pre-bind admission, one-shot transfer, ambiguous-commit recovery), `m005b_detached_policy` (durable detach across restart, deferred reveal, fanout redaction), `m005c_presence_nick` (presence transition matrix, bounded deterministic fallback, both reclaim mechanisms, generation fencing), and `m005d_bouncer_networks` (discovery, selection, attribute refusal, notifications, and the administration surface).
+The M005 suites add, per plan: `m005a_controller_admission` (bounded controller, pre-bind admission, one-shot transfer, ambiguous-commit recovery), `m005b_detached_policy` (durable detach across restart, deferred reveal, fanout redaction), `m005c_presence_nick` (presence transition matrix, bounded deterministic fallback, both reclaim mechanisms, generation fencing), `m005d_bouncer_networks` (discovery, selection, attribute refusal, notifications, and the administration surface), and `m005e_search_history` (search framing, refusal, scoping, retention, restart identity, `AROUND` edges, and liveness under search load).
+
+Two harness rules this repo now depends on, both learned from suites that reported passes
+for the wrong reason:
+
+**A search or query assertion reads from a mark, not from the start of the buffer.** A
+client attached to a live Network is still being fanned the upstream traffic that the test
+just wrote upstream. Asserting against the whole buffer tests what the client was *fanned*
+rather than what it was *told*, and the fanned text is nearly always a superset of the
+answer — so a negative assertion passes vacuously and a positive one passes for the wrong
+reason. Drain first, then mark, then send the request.
+
+**Unit-test the parse path the wire actually takes.** `parse_selectors` was directly
+unit-tested and correct; `parse_search` — the function the owner calls — skipped the first
+parameter, silently discarding any `in=` scope. Every search still returned plausible
+results, scoped to the wrong set. The unit tests could not see it because they started
+past the bug, and only the end-to-end suite did.
 
 Two harness properties are load-bearing across those suites and are stated here because a suite that gets them wrong fails in a way that reads like a product bug. A test client buffers everything it has received rather than discarding what follows the frame it waited for: a scripted stream can deliver several frames in one read, and the discarded remainder is exactly the frame the next assertion is about. And an assertion inside a loop matches only what arrived *after* that iteration's request, or the second iteration passes on the first one's answer.
 

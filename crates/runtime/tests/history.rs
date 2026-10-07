@@ -381,6 +381,7 @@ async fn legacy_backlog_is_bounded_in_events_and_bytes() {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: format!(":a!b@c PRIVMSG #room :m{index}").into_bytes(),
+            search: None,
         })
         .collect();
     handle.append_history(&batch).await.expect("appends");
@@ -463,6 +464,7 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         pre_away: false,
         bouncer_networks: false,
         bouncer_networks_notify: false,
+        search: false,
     }));
     assert!(!playback::wants_backlog(SessionCapabilities {
         legacy_backlog: true,
@@ -472,6 +474,7 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         pre_away: false,
         bouncer_networks: false,
         bouncer_networks_notify: false,
+        search: false,
     }));
     // The drafts are independently negotiable, so a read-marker client that does not
     // manage its own history still receives the automatic backlog.
@@ -483,6 +486,7 @@ fn a_chathistory_capable_client_can_suppress_the_legacy_backlog() {
         pre_away: false,
         bouncer_networks: false,
         bouncer_networks_notify: false,
+        search: false,
     }));
 }
 
@@ -506,6 +510,7 @@ async fn retention_runs_in_bounded_chunks_and_reports_remaining_work() {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: format!(":a!b@c PRIVMSG #room :m{index}").into_bytes(),
+            search: None,
         })
         .collect();
     let appended = handle.append_history(&batch).await.expect("appends");
@@ -699,6 +704,7 @@ async fn an_unbounded_ingest_batch_is_refused_rather_than_partially_recorded() {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: b"PRIVMSG #room :x".to_vec(),
+            search: None,
         };
         i2pr_irc_store::MAX_HISTORY_BATCH + 1
     ];

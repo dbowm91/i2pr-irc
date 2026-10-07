@@ -120,6 +120,11 @@ pub enum SessionIntent {
         /// BouncerServ adapter.
         wire: Vec<u8>,
     },
+    /// The client asked the bouncer to search retained history.
+    HistorySearch {
+        /// The original framed command, re-parsed by the search adapter.
+        wire: Vec<u8>,
+    },
     /// The client completed registration and wants the current projection.
     RequestProjection,
     /// The client asked the bouncer itself for retained history.
@@ -221,6 +226,8 @@ pub struct SessionCapabilities {
     /// connection, and one client knowing the capability must not let another client's
     /// `PASSIVE` be accepted on its behalf.
     pub pre_away: bool,
+    /// This session negotiated the history-search capability.
+    pub search: bool,
     /// This session negotiated the bouncer control plane, so it may send `BOUNCER`.
     ///
     /// Per session for the same reason as every other flag: whether a client is allowed
@@ -241,6 +248,7 @@ impl Default for SessionCapabilities {
             read_markers: false,
             message_tags: false,
             pre_away: false,
+            search: false,
             bouncer_networks: false,
             bouncer_networks_notify: false,
         }
@@ -279,6 +287,11 @@ impl SessionCapabilities {
         self.pre_away
     }
 
+    /// True when this session may send `SEARCH`.
+    pub fn negotiated_search(&self) -> bool {
+        self.search
+    }
+
     /// True when this session may send `BOUNCER` control commands.
     pub fn negotiated_bouncer_networks(&self) -> bool {
         self.bouncer_networks
@@ -304,6 +317,10 @@ impl SessionCapabilities {
                 || enabled
                     .iter()
                     .any(|name| name == crate::presence::PRE_AWAY_CAPABILITY),
+            search: self.search
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::search::SEARCH_CAPABILITY),
             bouncer_networks: self.bouncer_networks
                 || enabled
                     .iter()
@@ -1334,6 +1351,19 @@ impl<D: ByteStream> SessionReader<D> {
                 let line = format!(":bouncer 421 {nick} {command} :Unsupported command\r\n");
                 self.handle.queue_normal(&line)?;
                 return Ok(None);
+            }
+            // The history-search adapter, gated on its own capability for the same
+            // reason CHATHISTORY is: a client that never negotiated it cannot read a
+            // tagged batch, and unsolicited frames are worse than no frames.
+            "SEARCH" => {
+                if !self.handle.capabilities().negotiated_search() {
+                    let nick = self.registered_nick.as_deref().unwrap_or("*");
+                    let line = format!(":bouncer 421 {nick} {command} :Unsupported command\r\n");
+                    self.handle.queue_normal(&line)?;
+                    return Ok(None);
+                }
+                let wire = message.encode().map_err(|_| RuntimeError::Protocol)?;
+                return Ok(Some(SessionIntent::HistorySearch { wire }));
             }
             "WHOIS" | "WHO" | "NAMES" | "LIST" => {
                 return Ok(Some(SessionIntent::Forward {

@@ -24,7 +24,7 @@
 //! not hold.
 use crate::journal::{BacklogCap, HistoryJournal};
 use i2pr_irc_core::{BufferId, HistoryEventId};
-use i2pr_irc_store::{HistoryEvent, RetentionRequest};
+use i2pr_irc_store::{HistoryEvent, MsgidLookup, RetentionRequest};
 use i2pr_irc_wire::{IrcTimestamp, MAX_LINE_BYTES, MSGID_TAG, Message, TIME_TAG};
 use std::collections::BTreeSet;
 
@@ -184,6 +184,10 @@ pub enum HistoryRefusal {
     UnsupportedReferenceType,
     /// The target names no buffer on this Network.
     NoSuchBuffer,
+    /// The reference is well formed and nothing retained carries it.
+    UnknownReference,
+    /// More than one retained message carries this `msgid=`.
+    AmbiguousReference,
     /// History could not be produced; the buffer itself is valid.
     HistoryUnavailable,
 }
@@ -200,7 +204,12 @@ impl HistoryRefusal {
             | Self::InvalidLimit => StandardError::InvalidParams,
             Self::UnsupportedReferenceType => StandardError::InvalidMsgRefType,
             Self::NoSuchBuffer => StandardError::InvalidTarget,
-            Self::HistoryUnavailable => StandardError::MessageError,
+            // `MESSAGE_ERROR` rather than `INVALID_MSGREFTYPE`: the reference type is one
+            // this build advertised and understands, so reporting a *type* problem would
+            // tell the client to stop sending something that is simply not present.
+            Self::UnknownReference | Self::AmbiguousReference | Self::HistoryUnavailable => {
+                StandardError::MessageError
+            }
         }
     }
 }
@@ -235,6 +244,8 @@ impl core::fmt::Display for HistoryRefusal {
             Self::InvalidLimit => "Invalid limit",
             Self::UnsupportedReferenceType => "msgid-based history requests are not supported",
             Self::NoSuchBuffer => "Messages could not be retrieved",
+            Self::UnknownReference => "No retained message carries that reference",
+            Self::AmbiguousReference => "More than one retained message carries that msgid",
             Self::HistoryUnavailable => "Messages could not be retrieved",
         };
         f.write_str(text)
@@ -542,43 +553,65 @@ pub async fn execute(
             // Newest events that are strictly after the selector, so the result is
             // the tail of the window filtered by the resolved position.
             let after = resolve(journal, buffer, reference).await?;
+            // Everything retained is after a reference that predates retention, so the
+            // answer collapses to `LATEST` rather than to a range that starts nowhere.
+            let lower = after.lower_bound();
             let window = read().await?;
             let matching: Vec<HistoryEvent> = window
                 .into_iter()
-                .filter(|event| event.event > after)
+                .filter(|event| lower.is_none_or(|lower| event.event > lower))
                 .collect();
             let start = matching.len().saturating_sub(*limit);
             matching[start..].to_vec()
         }
         HistoryQueryRequest::Before { reference, limit } => {
             let before = resolve(journal, buffer, reference).await?;
-            journal
-                .backlog_range(buffer, None, Some(before), *limit)
-                .await
-                .map_err(|_| HistoryRefusal::HistoryUnavailable)?
+            // Nothing is earlier than the beginning of retention. Answering with the
+            // oldest page instead would claim messages exist before the history starts,
+            // and `BEFORE` is exactly the direction where that claim is false.
+            if before.is_before_start() {
+                Vec::new()
+            } else {
+                journal
+                    .backlog_range(buffer, None, Some(before_event(before)), *limit)
+                    .await
+                    .map_err(|_| HistoryRefusal::HistoryUnavailable)?
+            }
         }
         HistoryQueryRequest::After { reference, limit } => {
             let after = resolve(journal, buffer, reference).await?;
             journal
-                .backlog_range(buffer, Some(after), None, *limit)
+                .backlog_range(buffer, after.lower_bound(), None, *limit)
                 .await
                 .map_err(|_| HistoryRefusal::HistoryUnavailable)?
         }
         HistoryQueryRequest::Around { reference, limit } => {
-            // Split the budget around the selector. The selector's own message
-            // occupies one of the `limit` slots, and the result is the contiguous run
-            // of events nearest to it, still in ascending local order.
             let anchor = resolve(journal, buffer, reference).await?;
-            let window = read().await?;
-            let position = window
-                .iter()
-                .position(|event| event.event == anchor)
-                .ok_or(HistoryRefusal::HistoryUnavailable)?;
-            let before_budget = limit.saturating_sub(1) / 2;
-            let after_budget = limit.saturating_sub(1).saturating_sub(before_budget);
-            let start = position.saturating_sub(before_budget);
-            let end = (position + 1 + after_budget).min(window.len());
-            window[start..end].to_vec()
+            match anchor {
+                // A reference before everything retained has nothing on one side, so the
+                // budget the caller gave to that side is spent where the messages are.
+                // The result is still bounded by the same ceiling as any other page.
+                HistoryPosition::BeforeStart => journal
+                    .backlog_range(buffer, None, None, *limit)
+                    .await
+                    .map_err(|_| HistoryRefusal::HistoryUnavailable)?,
+                HistoryPosition::Event(anchor) => {
+                    // Split the budget around the selector. The selector's own message
+                    // occupies one of the `limit` slots, and the result is the contiguous
+                    // run of events nearest to it, still in ascending local order.
+                    let before_budget = limit.saturating_sub(1) / 2;
+                    let after_budget = limit.saturating_sub(1).saturating_sub(before_budget);
+                    journal
+                        .history_around(&i2pr_irc_store::HistoryAround {
+                            buffer,
+                            anchor,
+                            before: before_budget,
+                            after: after_budget,
+                        })
+                        .await
+                        .map_err(|_| HistoryRefusal::HistoryUnavailable)?
+                }
+            }
         }
         HistoryQueryRequest::Between {
             first,
@@ -589,15 +622,21 @@ pub async fn execute(
             // positions are ordered by local identity rather than assumed.
             let left = resolve(journal, buffer, first).await?;
             let right = resolve(journal, buffer, second).await?;
-            let (after, before) = if left <= right {
-                (Some(left), Some(right))
+            // An upper bound before the beginning admits nothing, whatever the lower
+            // bound was.
+            if right.is_before_start() {
+                Vec::new()
             } else {
-                (Some(right), Some(left))
-            };
-            journal
-                .backlog_range(buffer, after, before, *limit)
-                .await
-                .map_err(|_| HistoryRefusal::HistoryUnavailable)?
+                let (after, before) = if position_key(left) <= position_key(right) {
+                    (left.lower_bound(), Some(before_event(right)))
+                } else {
+                    (right.lower_bound(), Some(before_event(left)))
+                };
+                journal
+                    .backlog_range(buffer, after, before, *limit)
+                    .await
+                    .map_err(|_| HistoryRefusal::HistoryUnavailable)?
+            }
         }
         HistoryQueryRequest::Targets { .. } => unreachable!("handled above"),
     };
@@ -606,52 +645,114 @@ pub async fn execute(
 
 /// The protocol timestamp for a local receive time.
 ///
-/// `WallTime` is bounded to a range that sits inside the four-digit year window the
-/// wire grammar uses, so this cannot fail for a valid stored row. The epoch fallback
-/// exists so a future bound change degrades to an obviously-wrong-but-well-formed
-/// value rather than panicking on the history read path.
+/// Delegates to the store's single rule for "the time this event occupies in history".
+/// That rule is what `history_events.effective_time` is indexed on, so a replayed `time=`
+/// tag and a timestamp reference can never disagree about where a message sits — which
+/// they would the moment a second copy of the rule existed here.
 pub fn local_timestamp(received_at: i2pr_irc_core::WallTime) -> IrcTimestamp {
-    IrcTimestamp::from_unix_millis(received_at.unix_seconds().saturating_mul(1_000))
+    IrcTimestamp::parse(i2pr_irc_store::effective_time(None, received_at).as_bytes())
         .unwrap_or(IrcTimestamp::EPOCH)
+}
+
+/// Where a message reference falls relative to the retained window.
+///
+/// A reference that predates retention is a real position, not a failure: the Operator
+/// kept that bookmark, and the messages that follow it are exactly what they want next.
+/// Collapsing it onto the oldest retained event instead would make `AFTER` drop that
+/// oldest message, so the out-of-window case gets its own value rather than being forced
+/// through the in-window one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryPosition {
+    /// At or inside the retained window.
+    Event(HistoryEventId),
+    /// Earlier than every retained event.
+    BeforeStart,
+}
+
+impl HistoryPosition {
+    /// The exclusive lower bound this position implies, if any.
+    ///
+    /// `None` means "from the oldest retained event", which is what `BeforeStart` means
+    /// going forwards.
+    fn lower_bound(self) -> Option<HistoryEventId> {
+        match self {
+            Self::Event(event) => Some(event),
+            Self::BeforeStart => None,
+        }
+    }
+
+    /// Whether this position sits before every retained event.
+    ///
+    /// Used as an *upper* bound this means the range is empty: nothing is earlier than
+    /// the beginning. That is why the two directions are not symmetric.
+    fn is_before_start(self) -> bool {
+        matches!(self, Self::BeforeStart)
+    }
 }
 
 /// Resolves a reference to a durable position.
 ///
-/// A reference to pruned history is refused rather than guessed: returning an
-/// adjacent event would silently misrepresent what the client asked for.
+/// Two indexed lookups, one per reference kind. Neither scans: a `msgid=` is an index
+/// seek on `(network_id, msgid)`, and a `timestamp=` is a pair of seeks on
+/// `(buffer_id, effective_time, event_id)`. That is the gap this plan closes -- before it,
+/// every reference resolved by reading a bounded window of the buffer and filtering it in
+/// memory, so a reference to a message older than that window simply failed.
 pub async fn resolve(
     journal: &HistoryJournal,
     buffer: BufferId,
     reference: &MessageReference,
-) -> Result<HistoryEventId, HistoryRefusal> {
-    let events = journal
-        .reference_candidates(buffer)
-        .await
-        .map_err(|_| HistoryRefusal::HistoryUnavailable)?;
-    let resolved = match reference {
-        MessageReference::MsgId(wanted) => events
-            .iter()
-            .find(|event| event.msgid.as_deref() == Some(wanted.as_str()))
-            .map(|event| event.event),
+) -> Result<HistoryPosition, HistoryRefusal> {
+    match reference {
+        MessageReference::MsgId(wanted) => match journal
+            .resolve_msgid(journal.network(), wanted)
+            .await
+            .map_err(|_| HistoryRefusal::HistoryUnavailable)?
+        {
+            MsgidLookup::Unique(event) => Ok(HistoryPosition::Event(event)),
+            // A duplicate upstream id is a real condition, not a bug in the lookup, and
+            // choosing the lowest local id would answer a question the client did not ask
+            // while looking authoritative. It gets its own disposition so the client can
+            // tell "many messages carry that id" from "no message does".
+            MsgidLookup::Ambiguous(_) => Err(HistoryRefusal::AmbiguousReference),
+            MsgidLookup::Missing => Err(HistoryRefusal::UnknownReference),
+        },
         MessageReference::Timestamp(wanted) => {
-            // Compare the canonical protocol timestamp, falling back to local receive
-            // time only for events the upstream never stamped. Ties resolve through
-            // local order: the newest event at or before the timestamp, and among
-            // equals the largest HistoryEventId.
-            let key = |event: &HistoryEvent| {
-                event
-                    .server_time
-                    .unwrap_or_else(|| local_timestamp(event.received_at))
-                    .unix_millis()
-            };
-            events
-                .iter()
-                .filter(|event| key(event) <= wanted.unix_millis())
-                .max_by_key(|event| (key(event), event.event.0))
-                .map(|event| event.event)
+            let nearest = journal
+                .nearest_event(buffer, *wanted)
+                .await
+                .map_err(|_| HistoryRefusal::HistoryUnavailable)?;
+            // No event at or before the reference means it predates everything retained.
+            // Anchoring it to the oldest event instead would be off by one in the one
+            // direction that matters: `AFTER` would silently drop that oldest message.
+            match nearest.before {
+                Some(event) => Ok(HistoryPosition::Event(event)),
+                // An empty buffer has no position either side of which anything lies, so
+                // both directions answer with nothing. `BeforeStart` says so explicitly
+                // rather than reporting a reference that cannot exist.
+                None => Ok(HistoryPosition::BeforeStart),
+            }
         }
-    };
-    resolved.ok_or(HistoryRefusal::HistoryUnavailable)
+    }
+}
+
+/// The in-window event a position anchors to.
+///
+/// Callers check [`HistoryPosition::is_before_start`] first, so this never has to invent
+/// a substitute for the out-of-window case — which is the point: there is no substitute.
+fn before_event(position: HistoryPosition) -> HistoryEventId {
+    match position {
+        HistoryPosition::Event(event) => event,
+        HistoryPosition::BeforeStart => HistoryEventId(0),
+    }
+}
+
+/// Orders two positions so `BETWEEN` can normalise its direction.
+///
+/// `BeforeStart` sorts below every event, which is what it means. `HistoryEventId(0)` is
+/// the identity that encodes it: event ids start at 1, so no retained event can compare
+/// equal to it and the ordering is total.
+fn position_key(position: HistoryPosition) -> HistoryEventId {
+    before_event(position)
 }
 
 /// Renders resolved events as truthful replay lines.

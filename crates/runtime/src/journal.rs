@@ -23,20 +23,15 @@
 //! re-resolution would map two existing durable targets onto the same identity, the
 //! journal fails closed with a diagnostic rather than merging two histories.
 use crate::{RuntimeError, catalog::classify};
-use i2pr_irc_core::{Casemapping, WallClock, WallTime};
+use i2pr_irc_core::{Casemapping, NetworkId, WallClock, WallTime};
 use i2pr_irc_store::{
     BufferId, BufferKind, EventDirection, HistoryEvent, HistoryEventId, HistoryQuery,
     HistoryQueryBound, MAX_HISTORY_BATCH, MAX_HISTORY_QUERY_BYTES, MAX_HISTORY_QUERY_EVENTS,
     NewHistoryEvent, RetentionReport, RetentionRequest, StoreHandle,
 };
+use i2pr_irc_wire::IrcTimestamp;
 use i2pr_irc_wire::Message;
 use std::collections::BTreeMap;
-
-/// Ceiling on how many retained events a reference lookup will consider.
-///
-/// Reference resolution must stay bounded: scanning an entire retained history to
-/// find one message would make a client command an unbounded amount of work.
-pub const MAX_REFERENCE_CANDIDATES: usize = 512;
 
 /// Bounded automatic backlog delivered to one legacy client, in events and bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +259,12 @@ impl HistoryJournal {
             direction: EventDirection::Inbound,
             event_class: command,
             payload: bounded_payload(message)?,
+            // Derived here, from the message this function already decoded, rather than
+            // left to the store to re-parse a stored line. The store could do it, and
+            // would have to carry protocol knowledge to; deriving it here means the
+            // search representation is produced exactly once, at the moment the message
+            // was understood.
+            search: Some(search_fields(message)),
         };
         self.append(vec![event]).await
     }
@@ -377,19 +378,6 @@ impl HistoryJournal {
             .map_err(|error| classify(error.kind()))
     }
 
-    /// Bounded reference candidates for one buffer, used to resolve a msgid or a
-    /// timestamp to a durable position.
-    ///
-    /// The window is explicitly bounded: resolving a reference must not be able to
-    /// scan an entire retained history.
-    pub async fn reference_candidates(
-        &self,
-        buffer: BufferId,
-    ) -> Result<Vec<HistoryEvent>, RuntimeError> {
-        self.backlog_range(buffer, None, None, MAX_REFERENCE_CANDIDATES)
-            .await
-    }
-
     /// Monotonically advances one client's playback cursor.
     pub async fn advance_cursor(
         &mut self,
@@ -437,14 +425,81 @@ impl HistoryJournal {
     /// index, so a `TARGETS` request cannot become a full scan.
     pub async fn recent_targets(
         &self,
-        lower_unix_millis: i64,
-        upper_unix_millis: i64,
+        lower: IrcTimestamp,
+        upper: IrcTimestamp,
         limit: usize,
     ) -> Result<Vec<i2pr_irc_store::RecentTarget>, RuntimeError> {
         self.store
-            .recent_targets(self.network, lower_unix_millis, upper_unix_millis, limit)
+            .recent_targets(self.network, lower, upper, limit)
             .await
             .map_err(|error| classify(error.kind()))
+    }
+
+    /// Resolves an upstream `msgid=` reference within this Network.
+    ///
+    /// Returns every match rather than the first, because a duplicate id is a real
+    /// condition and picking the lowest `HistoryEventId` would answer a question the
+    /// client did not ask while looking authoritative.
+    pub async fn resolve_msgid(
+        &self,
+        network: NetworkId,
+        msgid: &str,
+    ) -> Result<i2pr_irc_store::MsgidLookup, RuntimeError> {
+        self.store
+            .resolve_msgid(network, msgid)
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// Reads one bounded window centred on an anchor event, for `AROUND`.
+    ///
+    /// Two indexed seeks rather than a scan, so the cost of asking for "the messages
+    /// around this one" does not depend on how much history the buffer holds.
+    pub async fn history_around(
+        &self,
+        request: &i2pr_irc_store::HistoryAround,
+    ) -> Result<Vec<HistoryEvent>, RuntimeError> {
+        self.store
+            .history_around(request)
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// The events bracketing one canonical protocol timestamp in this buffer.
+    ///
+    /// An indexed seek rather than a scan. `AROUND` and every timestamp reference go
+    /// through here, so the cost of positioning in history does not depend on how much
+    /// history the bouncer holds.
+    pub async fn nearest_event(
+        &self,
+        buffer: BufferId,
+        reference: IrcTimestamp,
+    ) -> Result<i2pr_irc_store::NearestEvent, RuntimeError> {
+        self.store
+            .nearest_event(buffer, reference)
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// Runs one bounded search over this Network's retained history.
+    pub async fn store_search(
+        &self,
+        query: &i2pr_irc_store::SearchQuery,
+    ) -> Result<Vec<i2pr_irc_store::SearchHit>, RuntimeError> {
+        self.store
+            .search(query)
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// The Network this journal belongs to.
+    ///
+    /// Exposed so an owner can compile a search against the Network it owns rather than
+    /// against one named by the request. The scope is a property of the owner, and a
+    /// caller that could supply its own would be a caller that could search another
+    /// Network's history.
+    pub fn network(&self) -> NetworkId {
+        self.network
     }
 
     /// The canonical protocol timestamp for one retained event.
@@ -522,6 +577,41 @@ impl HistoryJournal {
     /// The receive timestamp used for events this journal accepts.
     pub fn now(&self) -> WallTime {
         self.wall.now()
+    }
+}
+
+/// Derives the bounded search fields from a decoded message.
+///
+/// Every field is clamped by the store before it is written, so this returns what the
+/// message said and lets the single clamping rule live in one place. A prefix the
+/// protocol does not give us yields an empty sender rather than a guessed one: a search
+/// that attributes a message to a nick nobody sent it from would be worse than one that
+/// cannot filter by sender at all.
+fn search_fields(message: &Message) -> i2pr_irc_store::SearchFields {
+    i2pr_irc_store::SearchFields {
+        sender: message
+            .prefix
+            .as_deref()
+            .map(|prefix| {
+                String::from_utf8_lossy(
+                    prefix
+                        .split(|byte| *byte == b'!' || *byte == b'@')
+                        .next()
+                        .unwrap_or(prefix),
+                )
+                .into_owned()
+            })
+            .unwrap_or_default(),
+        target: message
+            .params
+            .first()
+            .map(|param| String::from_utf8_lossy(param).into_owned())
+            .unwrap_or_default(),
+        body: message
+            .params
+            .get(1)
+            .map(|param| String::from_utf8_lossy(param).into_owned())
+            .unwrap_or_default(),
     }
 }
 

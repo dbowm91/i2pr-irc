@@ -94,10 +94,91 @@ pub const MAX_BACKLOG_BUFFERS: usize = 32;
 /// would either be larger than the state it reconciles or needlessly force a restart.
 pub const MAX_DESIRED_RECONCILE: usize = crate::state::MAX_CHANNELS;
 
-/// Delivers the bounded legacy backlog for every resolved buffer this session can see.
+/// Answers one `SEARCH` request from the owning generation.
 ///
-/// The whole set is capped in total events and bytes, so a client attached to many
-/// channels receives a bounded amount rather than one full backlog per buffer.
+/// Like every other history answer, the reply goes only to the session that asked and
+/// never crosses the upstream connection: retained history is the bouncer's own state,
+/// and a search is a lookup a client makes against itself.
+///
+/// The Network scope comes from the journal this owner already owns rather than from the
+/// request. That is the only thing standing between a typo and a cross-Network
+/// disclosure, so it is chosen where the ownership is.
+async fn answer_history_search(
+    journal: &crate::journal::HistoryJournal,
+    handle: &SessionHandle,
+    wire: &[u8],
+    buffers: &BTreeMap<String, BufferId>,
+    batch: &mut u64,
+) {
+    let Some(message) = i2pr_irc_wire::Message::parse(wire).ok() else {
+        return;
+    };
+    let request = match crate::search::parse_search(&message) {
+        crate::search::ParsedSearch::Accepted(request) => request,
+        crate::search::ParsedSearch::Refused(refusal) => {
+            return refuse_search(handle, refusal.reason(), batch);
+        }
+    };
+
+    // `in=` names this Network's buffers. An unresolvable name is refused rather than
+    // searched as an empty scope, because "no matches" for a channel that does not exist
+    // here is indistinguishable from a true statement about the journal.
+    let scope = match crate::search::resolve_buffer(&request.channels, buffers) {
+        Ok(scope) => scope,
+        Err(refusal) => return refuse_search(handle, refusal.reason(), batch),
+    };
+
+    let query = crate::search::compile(&request, journal.network(), scope);
+    let hits = match journal.store_search(&query).await {
+        Ok(hits) => hits,
+        Err(_) => {
+            return refuse_search(
+                handle,
+                crate::search::SearchRefusal::Unavailable.reason(),
+                batch,
+            );
+        }
+    };
+
+    for line in crate::search::render_batch(&hits, *batch) {
+        if handle.queue_normal(&frame(&line)).is_err() {
+            return;
+        }
+    }
+    *batch = next_batch_id(batch);
+}
+
+/// Refuses one search request: an explicit reason, then a complete empty batch.
+///
+/// Both halves are load-bearing. The reason is a fixed string, never the offending
+/// selector or its value, so a refusal cannot become a channel for echoing client text
+/// back into a frame. The empty batch is there because a client that asked and heard
+/// nothing has to guess whether to wait, and "finished, and there was nothing" is the
+/// only answer that ends the question.
+fn refuse_search(handle: &SessionHandle, reason: &'static str, batch: &mut u64) {
+    let failure = crate::search::render_refusal(reason);
+    let empty = crate::search::render_batch(&[], *batch);
+    if handle.queue_normal(&frame(&failure)).is_err() {
+        return;
+    }
+    for line in empty {
+        if handle.queue_normal(&frame(&line)).is_err() {
+            return;
+        }
+    }
+    *batch = next_batch_id(batch);
+}
+
+/// The next generation-local search batch identifier.
+///
+/// Wrapping back to 1 rather than 0 or saturating: zero is not a batch identifier, and
+/// reusing one would let a client correlate two unrelated result sets as if they were
+/// the same page.
+fn next_batch_id(batch: &mut u64) -> u64 {
+    *batch = batch.wrapping_add(1).max(1);
+    *batch
+}
+
 /// Answers one `CHATHISTORY` request from the owning generation.
 ///
 /// The reply goes only to the session that asked. History is the bouncer's own state,
@@ -213,7 +294,7 @@ async fn answer_targets(
     // The list is bounded and the window is inclusive of both endpoints, matching the
     // draft's "newer than / older than" wording.
     let targets = journal
-        .recent_targets(older.unix_millis(), newer.unix_millis(), limit)
+        .recent_targets(*older, *newer, limit)
         .await
         .unwrap_or_default();
     let _ = handle.queue_normal(&frame(format!(
@@ -295,7 +376,7 @@ async fn answer_marker_update(
             // monotonic: a client cannot name an arbitrary instant to skip ahead.
             let reference = crate::chathistory::MessageReference::Timestamp(timestamp);
             match crate::chathistory::resolve(journal, buffer, &reference).await {
-                Ok(event) => {
+                Ok(crate::chathistory::HistoryPosition::Event(event)) => {
                     match journal.set_read_marker(buffer, event).await {
                         Ok(applied) => {
                             // The draft requires the server to answer with the value
@@ -323,6 +404,22 @@ async fn answer_marker_update(
                             ));
                         }
                     }
+                }
+                // A read mark earlier than every retained message is the truthful state
+                // of a client that has read nothing in this buffer. It is answered with
+                // the marker that is already stored rather than being written as a
+                // position, because writing one would invent a point in history that does
+                // not exist and then broadcast it to every other session.
+                Ok(crate::chathistory::HistoryPosition::BeforeStart) => {
+                    let stored = match previous {
+                        Some(marker) => {
+                            journal.event_timestamp(buffer, marker).await.ok().flatten()
+                        }
+                        None => None,
+                    };
+                    let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_reply(
+                        &target, stored,
+                    )));
                 }
                 Err(_) => {
                     let _ = handle.queue_normal(&frame(crate::chathistory::render_marker_failure(
@@ -454,7 +551,11 @@ fn confirmed_self_channel(state: &NetworkState, message: &Message) -> Option<Str
 }
 
 /// Casemapped lookup key for a wire target.
-fn casemapped(target: &str) -> String {
+///
+/// Crate-visible because target resolution is not this module's invention: the search
+/// adapter has to fold a client's `in=` selector exactly the way the owner folded it when
+/// it created the buffer, or a channel could exist under two spellings.
+pub(crate) fn casemapped(target: &str) -> String {
     i2pr_irc_core::Casemapping::Rfc1459
         .fold(target.as_bytes())
         .into_iter()
@@ -1427,6 +1528,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // Batch identifiers are generation-local, exactly like response routes: a
         // batch id from an earlier connection must never be referencable later.
         let mut batches = crate::ircv3::BatchTracker::default();
+        // Search replies are framed in their own batch type, so they need their own
+        // identifier space. It is generation-local for the same reason `batches` is: an
+        // id from an earlier connection must not be referencable by a client that
+        // reconnects and asks the same question again.
+        let mut search_batch: u64 = 1;
         // Desired membership this generation could not hand to the upstream queue.
         // Generation-local like every other piece of live bookkeeping: a new
         // generation rebuilds desired membership from durable storage anyway.
@@ -1534,6 +1640,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &buffers,
                         &mut router,
                         &mut batches,
+                        &mut search_batch,
                         &mut reconcile,
                         &upstream_caps,
                         &mut presence,
@@ -2186,6 +2293,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         buffers: &BTreeMap<String, BufferId>,
         router: &mut ResponseRouter,
         batches: &mut crate::ircv3::BatchTracker,
+        search_batch: &mut u64,
         reconcile: &mut DesiredReconcile,
         upstream_caps: &UpstreamCapabilities,
         presence: &mut PresenceState,
@@ -2306,6 +2414,18 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     SessionIntent::MarkerUpdate { wire } => {
                         answer_marker_update(journal, sessions, session, &wire, buffers).await;
+                    }
+                    SessionIntent::HistorySearch { wire } => {
+                        if let Some(task) = sessions.get(&session) {
+                            answer_history_search(
+                                journal,
+                                task.handle(),
+                                &wire,
+                                buffers,
+                                search_batch,
+                            )
+                            .await;
+                        }
                     }
                     SessionIntent::Forward { wire, class } => {
                         let class_label = class.as_str();

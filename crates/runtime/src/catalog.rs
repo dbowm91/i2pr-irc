@@ -430,6 +430,7 @@ pub fn intent_class(intent: &SessionIntent) -> &'static str {
         SessionIntent::Active => "active",
         SessionIntent::Away { .. } => "away",
         SessionIntent::Control { .. } => "control",
+        SessionIntent::HistorySearch { .. } => "search",
         SessionIntent::RequestProjection => "projection",
         SessionIntent::HistoryQuery { .. } => "history-query",
         SessionIntent::MarkerUpdate { .. } => "marker-update",

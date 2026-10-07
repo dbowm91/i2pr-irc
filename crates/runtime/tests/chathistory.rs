@@ -324,7 +324,10 @@ async fn a_stale_reference_fails_deterministically() {
         .expect("buffer");
     record(&mut journal, buffer, 2).await;
 
-    // A reference to history that was never retained is refused, not approximated.
+    // A `msgid=` that nothing retained carries is *unknown*, not merely unavailable.
+    // The two are different answers for a client: one means "no such message", the
+    // other means "ask again later", and collapsing them would make a stale bookmark
+    // look like a transient failure.
     let outcome = chathistory::execute(
         &journal,
         buffer,
@@ -334,9 +337,10 @@ async fn a_stale_reference_fails_deterministically() {
         },
     )
     .await;
-    assert_eq!(outcome.err(), Some(HistoryRefusal::HistoryUnavailable));
+    assert_eq!(outcome.err(), Some(HistoryRefusal::UnknownReference));
 
-    // A timestamp beyond everything retained resolves to the newest event.
+    // A timestamp beyond everything retained resolves to the newest event: "after the
+    // end" is a position, not an error.
     let resolved = chathistory::resolve(
         &journal,
         buffer,
@@ -346,7 +350,147 @@ async fn a_stale_reference_fails_deterministically() {
     )
     .await
     .expect("resolves");
-    assert!(resolved.0 > 0);
+    assert!(
+        matches!(resolved, chathistory::HistoryPosition::Event(event) if event.0 > 0),
+        "a reference past the end anchors to the newest retained event: {resolved:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reference_before_the_retained_window_is_its_own_position() {
+    let (_store, handle) = store();
+    let mut journal = journal_for(&handle).await;
+    let buffer = journal
+        .resolve_buffer(BufferKind::Channel, "#room")
+        .await
+        .expect("buffer");
+    record(&mut journal, buffer, 2).await;
+    let earliest = "1970-01-01T00:00:00.000Z";
+
+    // A bookmark older than retention is "before the beginning". Anchoring it onto the
+    // oldest retained event instead would be off by one in the one direction the client
+    // cannot check: `AFTER` would silently skip the oldest message and the client would
+    // have no way to notice.
+    assert_eq!(
+        chathistory::resolve(
+            &journal,
+            buffer,
+            &MessageReference::Timestamp(
+                i2pr_irc_wire::IrcTimestamp::parse_str(earliest).expect("parses"),
+            ),
+        )
+        .await
+        .expect("a reference before everything retained still has a position"),
+        chathistory::HistoryPosition::BeforeStart,
+    );
+
+    let after = chathistory::execute(
+        &journal,
+        buffer,
+        &HistoryQueryRequest::After {
+            reference: MessageReference::Timestamp(
+                i2pr_irc_wire::IrcTimestamp::parse_str(earliest).expect("parses"),
+            ),
+            limit: 10,
+        },
+    )
+    .await
+    .expect("the page is delivered rather than refused");
+    assert_eq!(
+        after.lines.len(),
+        2,
+        "every retained event follows the beginning: {:?}",
+        after.lines
+    );
+
+    // `BEFORE` from before the beginning is empty, and that is the truthful answer: no
+    // retained message is earlier than the start of retention. Handing back the oldest
+    // page would claim messages exist that do not.
+    let before = chathistory::execute(
+        &journal,
+        buffer,
+        &HistoryQueryRequest::Before {
+            reference: MessageReference::Timestamp(
+                i2pr_irc_wire::IrcTimestamp::parse_str(earliest).expect("parses"),
+            ),
+            limit: 10,
+        },
+    )
+    .await
+    .expect("an empty page, not a refusal");
+    assert!(
+        before.lines.is_empty(),
+        "nothing precedes the beginning of retention: {:?}",
+        before.lines
+    );
+
+    // `AROUND` from before the beginning spends the whole budget where the messages are.
+    let around = chathistory::execute(
+        &journal,
+        buffer,
+        &HistoryQueryRequest::Around {
+            reference: MessageReference::Timestamp(
+                i2pr_irc_wire::IrcTimestamp::parse_str(earliest).expect("parses"),
+            ),
+            limit: 10,
+        },
+    )
+    .await
+    .expect("delivered");
+    assert_eq!(around.lines.len(), 2, "{:?}", around.lines);
+}
+
+#[tokio::test]
+async fn a_duplicate_msgid_is_reported_as_ambiguous_rather_than_resolved() {
+    let (_store, handle) = store();
+    let mut journal = journal_for(&handle).await;
+    let buffer = journal
+        .resolve_buffer(BufferKind::Channel, "#room")
+        .await
+        .expect("buffer");
+    // Two retained messages carrying the same upstream id. The draft does not forbid it,
+    // and an upstream that reuses an id after a restart is an ordinary event.
+    for body in ["first", "second"] {
+        journal
+            .append(vec![i2pr_irc_store::NewHistoryEvent {
+                network: journal.network(),
+                buffer,
+                received_at: i2pr_irc_core::WallTime(1),
+                server_time: None,
+                msgid: Some("reused".to_owned()),
+                direction: i2pr_irc_store::EventDirection::Inbound,
+                event_class: "PRIVMSG".to_owned(),
+                payload: format!(":alice!a@h PRIVMSG #room :{body}").into_bytes(),
+                search: None,
+            }])
+            .await
+            .expect("append succeeds");
+    }
+
+    // Picking the lowest event id would answer a question the client did not ask while
+    // looking authoritative. "Two messages carry that id" is the truthful answer, and the
+    // client can decide which one it meant.
+    assert_eq!(
+        chathistory::resolve(
+            &journal,
+            buffer,
+            &MessageReference::MsgId("reused".to_owned()),
+        )
+        .await
+        .err(),
+        Some(HistoryRefusal::AmbiguousReference)
+    );
+
+    let outcome = chathistory::execute(
+        &journal,
+        buffer,
+        &HistoryQueryRequest::Before {
+            reference: MessageReference::MsgId("reused".to_owned()),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(outcome.err(), Some(HistoryRefusal::AmbiguousReference));
 }
 
 // ------------------------------------------------------------ truthful output
@@ -433,9 +577,16 @@ async fn a_read_marker_moves_only_forward_and_is_shared_per_buffer() {
         timestamp,
         i2pr_irc_wire::IrcTimestamp::parse_str(&stamp(1_700_000_002)).expect("parses")
     );
-    let resolved = chathistory::resolve(&journal, buffer, &MessageReference::Timestamp(timestamp))
-        .await
-        .expect("resolves");
+    let resolved =
+        match chathistory::resolve(&journal, buffer, &MessageReference::Timestamp(timestamp))
+            .await
+            .expect("resolves")
+        {
+            chathistory::HistoryPosition::Event(event) => event,
+            chathistory::HistoryPosition::BeforeStart => {
+                panic!("a stamp inside the retained window resolves to an event")
+            }
+        };
     assert_eq!(
         journal
             .set_read_marker(buffer, resolved)

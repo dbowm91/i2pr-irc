@@ -29,6 +29,9 @@ pub const MAX_HISTORY_PAYLOAD_BYTES: usize = 4096;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512 * 1024;
 /// Maximum events removed by one retention operation.
 pub const MAX_RETENTION_DELETE: usize = 4096;
+
+/// Ceiling on one retained upstream `msgid`.
+pub const MAX_HISTORY_MSGID_BYTES: usize = 64;
 /// Maximum channel/query/peer identity bytes.
 pub const MAX_TARGET_BYTES: usize = 200;
 /// Maximum configured identity field bytes.
@@ -423,9 +426,18 @@ pub struct NewHistoryEvent {
     /// Rejecting embedded CR, LF, and NUL is what stops a stored payload from being
     /// split into extra lines by whatever downstream later writes it.
     pub payload: Vec<u8>,
+    /// The bounded normalized fields the search side index stores for this event.
+    ///
+    /// Derived by the caller from the message it had already decoded, and written inside
+    /// the append transaction. `None` means the event is not searchable, which is a
+    /// statement about the event rather than a failed index write.
+    pub search: Option<SearchFields>,
 }
 impl NewHistoryEvent {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(fields) = &self.search {
+            fields.validate()?;
+        }
         if self.payload.is_empty() || self.payload.len() > MAX_HISTORY_PAYLOAD_BYTES {
             return Err("history payload size");
         }
@@ -473,6 +485,41 @@ impl HistoryQueryBound {
 pub struct HistoryQuery {
     pub buffer: BufferId,
     pub bound: HistoryQueryBound,
+}
+
+/// One bounded history window centred on an anchor event.
+///
+/// Two separate budgets rather than one, because the two sides are not
+/// interchangeable: the caller knows how many events it wants on each side of the anchor,
+/// and a single `limit` would force it to guess a split and then silently lose half of
+/// what it asked for.
+///
+/// The anchor itself is always included when it is retained. A caller that did not get it
+/// would have to reconstruct the page from two requests whose join is not guaranteed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryAround {
+    pub buffer: BufferId,
+    pub anchor: HistoryEventId,
+    /// Events wanted strictly before the anchor.
+    pub before: usize,
+    /// Events wanted strictly after the anchor.
+    pub after: usize,
+}
+
+impl HistoryAround {
+    /// Rejects a window larger than the query ceiling, anchor included.
+    ///
+    /// The bound is on the *total*, not on each side: two halves each at the ceiling would
+    /// be twice the work one `MAX_HISTORY_QUERY_EVENTS` answer is allowed to represent.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.before + self.after + 1 > MAX_HISTORY_QUERY_EVENTS {
+            return Err("history around window");
+        }
+        if self.before > MAX_HISTORY_QUERY_EVENTS || self.after > MAX_HISTORY_QUERY_EVENTS {
+            return Err("history around window");
+        }
+        Ok(())
+    }
 }
 
 /// Append outcome. The store reports what it durably accepted so history loss is
@@ -660,6 +707,7 @@ mod tests {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :hi".to_vec(),
+            search: None,
         };
         assert_eq!(event.validate(), Ok(()));
         event.payload = vec![b'x'; MAX_HISTORY_PAYLOAD_BYTES + 1];
@@ -752,4 +800,236 @@ mod tests {
             BufferRecord::lookup_key(BufferKind::Channel, Casemapping::Rfc1459, "#ROOM")
         );
     }
+}
+
+// ------------------------------------------------------------------- search
+
+/// Ceiling on results one search returns.
+///
+/// A search is an Operator-initiated request against one Network, so this is generous but
+/// finite: a caller can allocate against it without reading the database.
+pub const MAX_SEARCH_RESULTS: usize = 256;
+
+/// Ceiling on terms in one search.
+///
+/// Every term is ANDed, so this is also the ceiling on execution work per query: a search
+/// cannot express "any of these fifty thousand words".
+pub const MAX_SEARCH_TERMS: usize = 8;
+
+/// Ceiling on one search term, in bytes.
+pub const MAX_SEARCH_TERM_BYTES: usize = 64;
+
+/// Ceiling on buffers one search may span.
+///
+/// A search spans one Network's buffers. This bounds how many it may name before the
+/// caller is told the request was too broad, which is what stops a search from becoming
+/// an unbounded cross-buffer scan.
+pub const MAX_SEARCH_BUFFERS: usize = 16;
+
+/// Ceiling on bytes one search term may carry back in a result.
+pub const MAX_SEARCH_FIELD_BYTES: usize = 1024;
+
+/// The bounded, normalized fields the side index stores for one searchable event.
+///
+/// Derived at ingestion from the decoded event, never re-parsed from a stored raw line at
+/// query time: a search representation that only existed as opaque bytes would be exactly
+/// the thing the plan forbids, because a raw line is protocol, not text.
+///
+/// Only stored `PRIVMSG`/`NOTICE` events carry these. `None` means the event is not
+/// searchable, which is a statement about the event and not a failed index write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchFields {
+    /// Sender nickname, when the event carried a usable prefix.
+    pub sender: String,
+    /// The channel or target the event was addressed to.
+    pub target: String,
+    /// The message text.
+    pub body: String,
+}
+
+impl SearchFields {
+    /// Rejects anything oversized or carrying a NUL.
+    ///
+    /// CR and LF are rejected too: these fields reach a downstream frame, and a newline in
+    /// stored search text would let a stored message become an extra line of protocol.
+    fn validate(&self) -> Result<(), &'static str> {
+        for field in [&self.sender, &self.target, &self.body] {
+            if field.len() > MAX_SEARCH_FIELD_BYTES {
+                return Err("search field size");
+            }
+            if field.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
+                return Err("search field content");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One validated search term.
+///
+/// A term is a bounded run of word characters and nothing else. That restriction is the
+/// whole of the injection defence: with no quotes, no operator characters, and no
+/// punctuation that FTS5 treats as syntax, there is nothing for client text to *be*.
+///
+/// The alternative — escaping a raw expression — would make every future FTS5 operator a
+/// potential escape, because the escaping would have to be re-derived rather than
+/// prevented.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchTerm(String);
+
+impl SearchTerm {
+    /// Accepts a term only if every character is a word character.
+    ///
+    /// Unicode letters and digits are allowed because the index is tokenized with
+    /// `unicode61`; everything else — including `_` and `-`, which FTS5 tokenizes away —
+    /// is refused rather than quietly altered into something else.
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        if raw.is_empty() || raw.len() > MAX_SEARCH_TERM_BYTES {
+            return Err("search term size");
+        }
+        if !raw.chars().all(char::is_alphanumeric) {
+            return Err("search term content");
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The term as stored and as matched.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The FTS5 literal form.
+    ///
+    /// A term is already known to contain no quote and no operator, so the quoting is a
+    /// belt-and-braces wrapper rather than the thing making it safe.
+    pub fn as_fts_literal(&self) -> String {
+        format!("\"{}\"", self.0)
+    }
+}
+
+/// One bounded search over one Network's retained history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchQuery {
+    /// The only Network this search may read.
+    pub network: NetworkId,
+    /// Buffers to search, empty meaning every retained buffer on the Network.
+    pub buffers: Vec<BufferId>,
+    /// Restrict to one sender nickname.
+    pub sender: Option<String>,
+    /// At or after this canonical server-time.
+    ///
+    /// A timestamp rather than an event id, because that is what a client can express. An
+    /// event-id bound would have to be derived from a seek, which makes the boundary mean
+    /// "the nearest event" rather than "this instant" — two different questions.
+    pub after: Option<IrcTimestamp>,
+    /// Strictly before this canonical server-time.
+    ///
+    /// The window is half-open, `[after, before)`, so a whole-millisecond timestamp can
+    /// never fall in both halves or in neither.
+    pub before: Option<IrcTimestamp>,
+    /// Terms, ANDed.
+    pub terms: Vec<SearchTerm>,
+    pub limit: usize,
+}
+
+impl SearchQuery {
+    /// Rejects an over-broad or unbounded request before any database work happens.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.limit == 0 || self.limit > MAX_SEARCH_RESULTS {
+            return Err("search limit");
+        }
+        if self.buffers.len() > MAX_SEARCH_BUFFERS {
+            return Err("search buffer count");
+        }
+        if self.terms.len() > MAX_SEARCH_TERMS {
+            return Err("search term count");
+        }
+        if let (Some(after), Some(before)) = (self.after, self.before)
+            && after >= before
+        {
+            return Err("search range");
+        }
+        if let Some(sender) = &self.sender
+            && (sender.is_empty() || sender.len() > MAX_SEARCH_FIELD_BYTES)
+        {
+            return Err("search sender");
+        }
+        Ok(())
+    }
+
+    /// The FTS5 `MATCH` expression this query compiles to.
+    ///
+    /// Every term is quoted and joined with `AND`. Nothing a client typed is ever
+    /// concatenated as syntax, so there is no expression to inject into.
+    pub fn match_expression(&self) -> Option<String> {
+        (!self.terms.is_empty()).then(|| {
+            self.terms
+                .iter()
+                .map(SearchTerm::as_fts_literal)
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        })
+    }
+}
+
+/// One search result: the event's identity plus its indexed text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchHit {
+    pub event: HistoryEventId,
+    pub buffer: BufferId,
+    pub sender: String,
+    pub target: String,
+    pub body: String,
+}
+
+/// How a `msgid=` reference resolved.
+///
+/// Explicit rather than "first match wins", because a duplicate `msgid` is a real
+/// condition — a bouncer can legitimately hold the same upstream id in two buffers — and
+/// silently picking one would answer a question the client did not ask.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MsgidLookup {
+    /// Exactly one retained event carries this id.
+    Unique(HistoryEventId),
+    /// More than one does, ordered by `HistoryEventId` ascending.
+    Ambiguous(Vec<HistoryEventId>),
+    /// None does.
+    Missing,
+}
+
+impl MsgidLookup {
+    /// The resolved event, if there is exactly one.
+    pub fn unique(self) -> Option<HistoryEventId> {
+        match self {
+            Self::Unique(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    /// Whether this lookup found something but could not choose.
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Ambiguous(_))
+    }
+}
+
+/// Ceiling on how many matches one `msgid=` reference reports when it is ambiguous.
+///
+/// Bounded so a pathological duplicate cannot make one reference read the whole journal.
+/// A result at the ceiling is still reported as ambiguous, so truncation never turns
+/// "ambiguous" into a false "unique".
+pub const MAX_MSGID_AMBIGUOUS: usize = 8;
+
+/// Where a reference fell relative to the retained window.
+///
+/// A `timestamp=` reference older than everything retained is not an error: it means
+/// "before the beginning", and a client asking for history before that wants the oldest
+/// page rather than an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NearestEvent {
+    /// The newest event at or before the reference.
+    pub before: Option<HistoryEventId>,
+    /// The oldest event after the reference.
+    pub after: Option<HistoryEventId>,
+    /// The reference itself resolved to an event, rather than falling between two.
+    pub exact: bool,
 }

@@ -4,13 +4,16 @@
 //! the public typed surface exactly as M003-B and later plans will, and they read the
 //! raw database through [`i2pr_irc_store::testing`] so migration and restart evidence
 //! never depends on the same API that is under test.
-use i2pr_irc_core::{I2pEndpoint, WallTime};
+use i2pr_irc_core::{BufferId, I2pEndpoint, WallTime};
 use i2pr_irc_store::{
-    BufferKind, EventDirection, HistoryEventId, MAX_DISPLAY_NAME_BYTES, NetworkId, NetworkRecord,
-    NewHistoryEvent, RetentionRequest, SCHEMA_VERSION, STORE_QUEUE_CAPACITY, Store, StoreErrorKind,
-    StoreHealth, StorePath, StoredSecret, attached_channels, fallback_display_name,
+    BufferKind, EventDirection, HistoryAround, HistoryEventId, MAX_DISPLAY_NAME_BYTES,
+    MAX_HISTORY_QUERY_EVENTS, MAX_SEARCH_BUFFERS, MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS,
+    MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent, RetentionRequest, SCHEMA_VERSION,
+    STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm, Store, StoreErrorKind,
+    StoreHandle, StoreHealth, StorePath, StoredSecret, attached_channels, fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
+use i2pr_irc_wire::IrcTimestamp;
 
 fn store_at(path: &std::path::Path) -> Store {
     Store::open(&StorePath::File(path.to_path_buf())).expect("store opens")
@@ -46,7 +49,7 @@ fn fresh_database_creates_exactly_schema_version_two() {
     assert_eq!(
         testing::tables(&path),
         EXPECTED_TABLES.to_vec(),
-        "the table set is unchanged from schema 1"
+        "schema 6 adds exactly one user table: the search side index"
     );
     assert_eq!(
         testing::identity(&path),
@@ -306,6 +309,7 @@ async fn migration_keeps_autoincrement_monotonic_so_a_cursor_cannot_alias() {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: b":a!b@c PRIVMSG #room :after-migration".to_vec(),
+            search: None,
         }])
         .await
         .expect("append succeeds")
@@ -769,6 +773,7 @@ async fn history_event_identity_is_never_reused_after_deletion() {
         direction: EventDirection::Inbound,
         event_class: "PRIVMSG".into(),
         payload: b":a!b@c PRIVMSG #room :one".to_vec(),
+        search: None,
     };
     let first = store
         .handle()
@@ -834,6 +839,7 @@ async fn canonical_order_is_local_identity_not_wall_time() {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: format!(":a!b@c PRIVMSG #room :m{index}").into_bytes(),
+            search: None,
         })
         .collect();
     store.handle().append_history(&batch).await.expect("append");
@@ -1243,6 +1249,7 @@ async fn retention_clamps_positions_that_point_into_the_removed_range() {
                 direction: EventDirection::Inbound,
                 event_class: "PRIVMSG".into(),
                 payload: format!(":a!b@c PRIVMSG #room :m{index}").into_bytes(),
+                search: None,
             }])
             .await
             .expect("append")
@@ -1321,6 +1328,7 @@ async fn retention_is_bounded_per_pass_and_reports_pending_work() {
             direction: EventDirection::Inbound,
             event_class: "PRIVMSG".into(),
             payload: format!(":a!b@c PRIVMSG #room :m{index}").into_bytes(),
+            search: None,
         })
         .collect();
     let appended = store.handle().append_history(&batch).await.expect("append");
@@ -1728,5 +1736,729 @@ async fn a_malformed_detach_target_is_refused_before_anything_is_written() {
             .expect("networks load")[0]
             .desired_channels,
         attached_channels(&["#alpha"])
+    );
+}
+
+// ------------------------------------------------------- search side index
+
+/// Builds a Network with one Buffer and returns the open store plus its handle.
+///
+/// `BufferId(1)` is the Channel buffer the Network's own desired channel resolves to, so
+/// these tests search the same buffer a client would.
+async fn searchable_store(tag: &str) -> (Store, StoreHandle, BufferId) {
+    let dir = testing::temp_dir(tag);
+    let path = dir.db("search.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, &["#room"]))
+        .await
+        .expect("network saved");
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    (store, handle, buffer)
+}
+
+/// Parses a canonical protocol timestamp for use as a search bound.
+fn stamp(text: &str) -> IrcTimestamp {
+    IrcTimestamp::parse(text.as_bytes()).expect("fixture timestamp parses")
+}
+
+/// Renders one canonical protocol timestamp from unix seconds.
+fn stamp_text(seconds: i64) -> String {
+    IrcTimestamp::from_unix_millis(seconds.saturating_mul(1_000))
+        .expect("fixture timestamp is representable")
+        .to_string()
+}
+
+/// Appends one searchable message and returns its event id.
+async fn say(
+    handle: &StoreHandle,
+    buffer: BufferId,
+    sender: &str,
+    body: &str,
+    server_time: &str,
+) -> HistoryEventId {
+    let payload = format!(":{sender}!u@h PRIVMSG #room :{body}");
+    let result = handle
+        .append_history(&[NewHistoryEvent {
+            network: NetworkId(1),
+            buffer,
+            received_at: WallTime(1),
+            server_time: Some(
+                IrcTimestamp::parse(server_time.as_bytes()).expect("timestamp parses"),
+            ),
+            // A msgid is a single protocol token: the body carries spaces, and a
+            // msgid that carried one would be refused for the right reason at the
+            // wrong moment.
+            msgid: Some(format!("m{}", body.replace(' ', "-"))),
+            direction: EventDirection::Inbound,
+            event_class: "PRIVMSG".to_owned(),
+            payload: payload.into_bytes(),
+            search: Some(SearchFields {
+                sender: sender.to_owned(),
+                target: "#room".to_owned(),
+                body: body.to_owned(),
+            }),
+        }])
+        .await
+        .expect("append succeeds");
+    result.last.expect("an event was appended")
+}
+
+#[tokio::test]
+async fn a_search_finds_only_messages_that_were_retained_and_indexed() {
+    let (store, handle, buffer) = searchable_store("search-hit").await;
+    say(
+        &handle,
+        buffer,
+        "alice",
+        "hello there",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await;
+    say(
+        &handle,
+        buffer,
+        "bob",
+        "goodbye now",
+        "2026-01-01T00:00:01.000Z",
+    )
+    .await;
+
+    let hits = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: Vec::new(),
+            sender: None,
+            after: None,
+            before: None,
+            terms: vec![SearchTerm::parse("hello").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the matching message is returned: {hits:?}"
+    );
+    assert_eq!(hits[0].body, "hello there");
+    assert_eq!(hits[0].sender, "alice");
+    assert_eq!(hits[0].target, "#room");
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_time_window_is_a_half_open_interval_over_canonical_timestamps() {
+    let (store, handle, buffer) = searchable_store("search-window").await;
+    let first = say(&handle, buffer, "alice", "word", "2026-01-01T00:00:00.000Z").await;
+    let middle = say(&handle, buffer, "alice", "word", "2026-01-01T00:00:05.000Z").await;
+    let last = say(&handle, buffer, "alice", "word", "2026-01-01T00:00:10.000Z").await;
+
+    // This is the property that a TEXT server_time column actually breaks when the bound
+    // is bound as a number: SQLite orders every TEXT after every INTEGER, so an integer
+    // bound matches either all of history or none of it. What this proves is that the
+    // window is half-open -- `after` keeps the event sitting exactly on it, `before`
+    // drops the event sitting exactly on it -- and that both endpoints are really
+    // timestamps rather than numbers that happen to look like them.
+    let inside = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: Vec::new(),
+            sender: None,
+            after: Some(stamp("2026-01-01T00:00:00.000Z")),
+            before: Some(stamp("2026-01-01T00:00:10.000Z")),
+            terms: vec![SearchTerm::parse("word").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+    assert_eq!(
+        inside.iter().map(|hit| hit.event).collect::<Vec<_>>(),
+        vec![first, middle],
+        "the lower endpoint is inside the window and the upper endpoint is not"
+    );
+    let _ = last;
+
+    // Both endpoints reachable from outside the window: a whole day, and a single
+    // millisecond that no event carries.
+    let whole_day = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: Vec::new(),
+            sender: None,
+            after: Some(stamp("2026-01-01T00:00:00.000Z")),
+            before: Some(stamp("2026-01-02T00:00:00.000Z")),
+            terms: vec![SearchTerm::parse("word").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+    assert_eq!(
+        whole_day.iter().map(|hit| hit.event).collect::<Vec<_>>(),
+        vec![first, middle, last],
+        "a window wider than the data returns all of it"
+    );
+
+    let narrow = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: Vec::new(),
+            sender: None,
+            after: Some(stamp("2026-01-01T00:00:01.000Z")),
+            before: Some(stamp("2026-01-01T00:00:02.000Z")),
+            terms: vec![SearchTerm::parse("word").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+    assert!(
+        narrow.is_empty(),
+        "a window between two events returns nothing rather than everything: {narrow:?}"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn search_terms_cannot_inject_fts_operators_or_sql() {
+    let (store, handle, buffer) = searchable_store("search-injection").await;
+    say(
+        &handle,
+        buffer,
+        "alice",
+        "hello there",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await;
+
+    // Every one of these is either refused as a term or, if it parsed, could not have
+    // changed the shape of the statement. The store's compiled expression is the only
+    // SQL text that reaches SQLite, and it is built only from validated terms.
+    for hostile in [
+        "hello\" OR 1=1 --",
+        "NEAR(a b)",
+        "hello*",
+        "col:val",
+        "-hello",
+        "\"",
+        "a AND b",
+    ] {
+        assert!(
+            SearchTerm::parse(hostile).is_err(),
+            "{hostile:?} must never become a search term"
+        );
+    }
+    let expression = SearchQuery {
+        network: NetworkId(1),
+        buffers: Vec::new(),
+        sender: None,
+        after: None,
+        before: None,
+        terms: vec![SearchTerm::parse("hello").expect("term parses")],
+        limit: 16,
+    }
+    .match_expression()
+    .expect("a term list compiles");
+    assert_eq!(
+        expression, "\"hello\"",
+        "terms are quoted literals, not syntax"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_search_never_reads_another_networks_history() {
+    let (store, handle, buffer) = searchable_store("search-scope").await;
+    say(
+        &handle,
+        buffer,
+        "alice",
+        "shared word",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await;
+    handle
+        .save_network(&record(2, &["#other"]))
+        .await
+        .expect("second network saved");
+
+    let hits = handle
+        .search(&SearchQuery {
+            network: NetworkId(2),
+            buffers: Vec::new(),
+            sender: None,
+            after: None,
+            before: None,
+            terms: vec![SearchTerm::parse("shared").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+    assert!(
+        hits.is_empty(),
+        "a Network that does not hold the message cannot see it: {hits:?}"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn retention_leaves_no_index_row_behind() {
+    let (store, handle, buffer) = searchable_store("search-retain").await;
+    let first = say(
+        &handle,
+        buffer,
+        "alice",
+        "forgettable words",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await;
+    say(
+        &handle,
+        buffer,
+        "bob",
+        "kept words",
+        "2026-01-01T00:00:01.000Z",
+    )
+    .await;
+
+    handle
+        .retain(&RetentionRequest {
+            network: NetworkId(1),
+            before: HistoryEventId(first.0 + 1),
+            max_delete: 16,
+        })
+        .await
+        .expect("retention succeeds");
+
+    let hits = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: Vec::new(),
+            sender: None,
+            after: None,
+            before: None,
+            terms: vec![SearchTerm::parse("forgettable").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+    assert!(
+        hits.is_empty(),
+        "a deleted message cannot still be found by search: {hits:?}"
+    );
+
+    let remaining = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: Vec::new(),
+            sender: None,
+            after: None,
+            before: None,
+            terms: vec![SearchTerm::parse("kept").expect("term parses")],
+            limit: 16,
+        })
+        .await
+        .expect("search succeeds");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "the retained message is still searchable"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_timestamp_reference_resolves_through_the_index_without_a_scan() {
+    let (store, handle, buffer) = searchable_store("search-reference").await;
+    let first = say(&handle, buffer, "alice", "one", "2026-01-01T00:00:00.000Z").await;
+    let middle = say(&handle, buffer, "alice", "two", "2026-01-01T00:00:05.000Z").await;
+    let last = say(
+        &handle,
+        buffer,
+        "alice",
+        "three",
+        "2026-01-01T00:00:10.000Z",
+    )
+    .await;
+
+    let at = handle
+        .nearest_event(
+            buffer,
+            IrcTimestamp::parse(b"2026-01-01T00:00:05.000Z").expect("timestamp parses"),
+        )
+        .await
+        .expect("lookup succeeds");
+    assert_eq!(at.before, Some(middle), "the nearest event is found");
+    assert!(at.exact, "a reference that lands on an event is exact");
+    assert_eq!(at.after, Some(last));
+
+    let between = handle
+        .nearest_event(
+            buffer,
+            IrcTimestamp::parse(b"2026-01-01T00:00:07.000Z").expect("timestamp parses"),
+        )
+        .await
+        .expect("lookup succeeds");
+    assert_eq!(between.before, Some(middle));
+    assert_eq!(between.after, Some(last));
+    assert!(
+        !between.exact,
+        "a reference between two events is not exact"
+    );
+
+    let before_all = handle
+        .nearest_event(
+            buffer,
+            IrcTimestamp::from_unix_millis(0).expect("timestamp in range"),
+        )
+        .await
+        .expect("lookup succeeds");
+    assert_eq!(before_all.before, None);
+    assert_eq!(before_all.after, Some(first));
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn several_events_sharing_a_timestamp_resolve_deterministically() {
+    let (store, handle, buffer) = searchable_store("search-ties").await;
+    // Three events, one millisecond. Local order is the only thing that can break the tie,
+    // and it must break it the same way every time.
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        ids.push(
+            say(
+                &handle,
+                buffer,
+                "alice",
+                &format!("tie{index}"),
+                "2026-01-01T00:00:00.000Z",
+            )
+            .await,
+        );
+    }
+    let resolved = handle
+        .nearest_event(
+            buffer,
+            IrcTimestamp::parse(b"2026-01-01T00:00:00.000Z").expect("timestamp parses"),
+        )
+        .await
+        .expect("lookup succeeds");
+    assert_eq!(
+        resolved.before,
+        Some(*ids.last().expect("ids were appended")),
+        "a tie resolves to the newest local id, deterministically"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_duplicate_msgid_is_reported_as_ambiguous_rather_than_resolved() {
+    let (store, handle, buffer) = searchable_store("search-msgid").await;
+    let payload = |sender: &str, body: &str| NewHistoryEvent {
+        network: NetworkId(1),
+        buffer,
+        received_at: WallTime(1),
+        server_time: None,
+        msgid: Some("duplicate-id".to_owned()),
+        direction: EventDirection::Inbound,
+        event_class: "PRIVMSG".to_owned(),
+        payload: format!(":{sender}!u@h PRIVMSG #room :{body}").into_bytes(),
+        search: Some(SearchFields {
+            sender: sender.to_owned(),
+            target: "#room".to_owned(),
+            body: body.to_owned(),
+        }),
+    };
+    let result = handle
+        .append_history(&[payload("alice", "first"), payload("bob", "second")])
+        .await
+        .expect("append succeeds");
+
+    let lookup = handle
+        .resolve_msgid(NetworkId(1), "duplicate-id")
+        .await
+        .expect("lookup succeeds");
+    assert!(
+        lookup.is_ambiguous(),
+        "a duplicate upstream id is never silently resolved to one of them: {lookup:?}"
+    );
+    assert_eq!(
+        lookup,
+        MsgidLookup::Ambiguous(vec![
+            result.first.expect("first"),
+            result.last.expect("last")
+        ]),
+        "ambiguity is reported in canonical order"
+    );
+
+    assert_eq!(
+        handle
+            .resolve_msgid(NetworkId(1), "no-such-id")
+            .await
+            .expect("lookup succeeds"),
+        MsgidLookup::Missing,
+        "an unknown id is missing, not ambiguous"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn search_bounds_are_enforced_before_any_database_work() {
+    let (store, handle, buffer) = searchable_store("search-bounds").await;
+    say(&handle, buffer, "alice", "word", "2026-01-01T00:00:00.000Z").await;
+    let base = SearchQuery {
+        network: NetworkId(1),
+        buffers: Vec::new(),
+        sender: None,
+        after: None,
+        before: None,
+        terms: vec![SearchTerm::parse("word").expect("term parses")],
+        limit: 16,
+    };
+
+    let over_limit = SearchQuery {
+        limit: MAX_SEARCH_RESULTS + 1,
+        ..base.clone()
+    };
+    assert!(over_limit.validate().is_err());
+    assert!(
+        handle.search(&over_limit).await.is_err(),
+        "an over-limit search is refused, not truncated"
+    );
+
+    let too_many_terms = SearchQuery {
+        terms: (0..MAX_SEARCH_TERMS + 1)
+            .map(|index| SearchTerm::parse(&format!("w{index}")).expect("term parses"))
+            .collect(),
+        ..base.clone()
+    };
+    assert!(too_many_terms.validate().is_err());
+
+    let too_many_buffers = SearchQuery {
+        buffers: (0..MAX_SEARCH_BUFFERS + 1)
+            .map(|index| BufferId(u64::try_from(index).expect("fits")))
+            .collect(),
+        ..base.clone()
+    };
+    assert!(too_many_buffers.validate().is_err());
+
+    let backwards = SearchQuery {
+        after: Some(stamp("2026-01-02T00:00:00.000Z")),
+        before: Some(stamp("2026-01-01T00:00:00.000Z")),
+        ..base.clone()
+    };
+    assert!(
+        backwards.validate().is_err(),
+        "a backwards range is refused rather than silently swapped"
+    );
+
+    // The window is half-open, so a zero-width range is refused too rather than
+    // answering a whole day of history for `after == before`.
+    let empty_window = SearchQuery {
+        after: Some(stamp("2026-01-01T00:00:00.000Z")),
+        before: Some(stamp("2026-01-01T00:00:00.000Z")),
+        ..base.clone()
+    };
+    assert!(empty_window.validate().is_err());
+    store.shutdown().expect("store shuts down");
+}
+
+#[test]
+fn the_schema_five_migration_backfills_the_index_for_retained_history() {
+    let dir = testing::temp_dir("migrate-v5-v6");
+    let path = dir.db("v5.sqlite3");
+    let old = testing::create_v5_database(&path);
+    drop(old);
+
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    let hits = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime builds")
+        .block_on(async {
+            handle
+                .search(&SearchQuery {
+                    network: NetworkId(1),
+                    buffers: Vec::new(),
+                    sender: None,
+                    after: None,
+                    before: None,
+                    terms: vec![SearchTerm::parse("hello").expect("term parses")],
+                    limit: 16,
+                })
+                .await
+        })
+        .expect("search succeeds after migration");
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "history retained before the migration is searchable after it: {hits:?}"
+    );
+    assert_eq!(hits[0].body, "hello there");
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_search_index_that_disagrees_with_history_refuses_the_open() {
+    let dir = testing::temp_dir("search-corrupt");
+    let path = dir.db("corrupt.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, &["#room"]))
+        .await
+        .expect("network saved");
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    say(
+        &handle,
+        buffer,
+        "alice",
+        "findable words",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await;
+    store.shutdown().expect("store shuts down");
+
+    // Drop an index row behind the store's back. The database is still structurally
+    // valid and every table is present, which is exactly why a presence check alone
+    // would not catch it -- and why a search would answer "no matches" and be believed.
+    let connection = testing::raw(&path);
+    connection
+        .execute("DELETE FROM history_search", [])
+        .expect("index row is removable");
+
+    assert!(
+        Store::open(&StorePath::File(path.clone())).is_err(),
+        "a search index that lost rows refuses the open rather than answering 'no matches'"
+    );
+}
+
+#[tokio::test]
+async fn a_window_around_an_anchor_is_bounded_and_centred_on_it() {
+    let (_store, handle, buffer) = searchable_store("around-centre").await;
+    let mut ids = Vec::new();
+    for index in 0..9 {
+        ids.push(
+            say(
+                &handle,
+                buffer,
+                "alice",
+                &format!("m{index}"),
+                &stamp_text(1_700_000_000 + i64::from(index)),
+            )
+            .await,
+        );
+    }
+    let anchor = ids[4];
+
+    let events = handle
+        .history_around(&HistoryAround {
+            buffer,
+            anchor,
+            before: 2,
+            after: 2,
+        })
+        .await
+        .expect("the window is produced");
+
+    assert_eq!(
+        events.iter().map(|event| event.event).collect::<Vec<_>>(),
+        vec![ids[2], ids[3], ids[4], ids[5], ids[6]],
+        "the anchor is included and both budgets are honoured, in ascending local order"
+    );
+
+    // An asymmetric budget is honoured as asked. A single shared `limit` would force the
+    // caller to guess a split and then silently lose half of what it wanted.
+    let lopsided = handle
+        .history_around(&HistoryAround {
+            buffer,
+            anchor,
+            before: 0,
+            after: 3,
+        })
+        .await
+        .expect("the window is produced");
+    assert_eq!(
+        lopsided.iter().map(|event| event.event).collect::<Vec<_>>(),
+        vec![ids[4], ids[5], ids[6], ids[7]]
+    );
+}
+
+#[tokio::test]
+async fn a_window_around_a_removed_anchor_answers_on_both_sides() {
+    let (_store, handle, buffer) = searchable_store("around-pruned").await;
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        ids.push(
+            say(
+                &handle,
+                buffer,
+                "alice",
+                &format!("m{index}"),
+                &stamp_text(1_700_000_000 + i64::from(index)),
+            )
+            .await,
+        );
+    }
+    let anchor = ids[2];
+    handle
+        .retain(&RetentionRequest {
+            network: NetworkId(1),
+            before: ids[3],
+            max_delete: 16,
+        })
+        .await
+        .expect("retention runs");
+
+    // Retention removed everything older than the anchor, so only the "after" side has
+    // anything left. The point is that the call still succeeds: answering with an error
+    // would strand a client holding a bookmark to a message that retention has since
+    // removed, which is exactly the bookmark a returning client has.
+    let events = handle
+        .history_around(&HistoryAround {
+            buffer,
+            anchor,
+            before: 4,
+            after: 4,
+        })
+        .await
+        .expect("a removed anchor is still a position to page from");
+    assert_eq!(
+        events.iter().map(|event| event.event).collect::<Vec<_>>(),
+        vec![ids[3], ids[4]],
+        "the retained side comes back and the pruned side is simply empty"
+    );
+    assert!(
+        events.iter().all(|event| event.event != anchor),
+        "the anchor itself is absent, because it was removed"
+    );
+}
+
+#[tokio::test]
+async fn a_window_larger_than_the_query_ceiling_is_refused_not_truncated() {
+    let (_store, handle, buffer) = searchable_store("around-bounds").await;
+    let anchor = say(&handle, buffer, "alice", "one", "2026-01-01T00:00:00.000Z").await;
+    let over = HistoryAround {
+        buffer,
+        anchor,
+        before: MAX_HISTORY_QUERY_EVENTS,
+        after: MAX_HISTORY_QUERY_EVENTS,
+    };
+    assert!(over.validate().is_err());
+    assert!(
+        handle.history_around(&over).await.is_err(),
+        "an over-wide window is refused rather than served partially, so a caller cannot \
+         mistake the ceiling for the whole conversation"
     );
 }

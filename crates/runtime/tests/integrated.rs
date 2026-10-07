@@ -1358,7 +1358,9 @@ async fn read_marker_and_cursor_survive_retention_and_clamp_monotonically() {
     assert!(cursor < boundary);
     assert_eq!(cursor, marker, "a cursor and a marker clamp identically");
 
-    // A stale reference to pruned history is refused deterministically.
+    // A stale reference to pruned history is refused deterministically, and reported as
+    // "no such message" rather than as an unavailable store: after retention ran
+    // successfully, the only true statement about that id is that nothing carries it.
     assert_eq!(
         i2pr_irc_runtime::chathistory::resolve(
             &journal,
@@ -1367,7 +1369,7 @@ async fn read_marker_and_cursor_survive_retention_and_clamp_monotonically() {
         )
         .await
         .err(),
-        Some(i2pr_irc_runtime::chathistory::HistoryRefusal::HistoryUnavailable)
+        Some(i2pr_irc_runtime::chathistory::HistoryRefusal::UnknownReference)
     );
 }
 
@@ -1758,6 +1760,10 @@ fn capability_advertisement_stays_truthful_after_the_history_adapter_landed() {
         [
             i2pr_irc_runtime::bouncer_networks::BOUNCER_NETWORKS,
             i2pr_irc_runtime::bouncer_networks::BOUNCER_NETWORKS_NOTIFY,
+            // Search is advertised because the adapter, the bounded store query and the
+            // reply batching are all complete; the assertion lives here so a capability
+            // cannot be added to the greeting without this test naming it.
+            i2pr_irc_runtime::search::SEARCH_CAPABILITY,
         ]
         .iter()
         .map(|name| (*name).to_owned()),

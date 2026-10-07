@@ -242,6 +242,7 @@ mod tests {
             pre_away: false,
             bouncer_networks: false,
             bouncer_networks_notify: false,
+            search: false,
         };
         assert!(
             !wants_backlog(explicit),
@@ -258,6 +259,7 @@ mod tests {
             pre_away: false,
             bouncer_networks: false,
             bouncer_networks_notify: false,
+            search: false,
         };
         assert!(
             wants_backlog(markers_only),

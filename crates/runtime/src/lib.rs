@@ -31,6 +31,7 @@ pub mod projection;
 pub mod reconnect;
 pub mod resource;
 pub mod routing;
+pub mod search;
 pub mod session;
 pub mod state;
 

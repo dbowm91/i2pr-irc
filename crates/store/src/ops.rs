@@ -626,13 +626,17 @@ pub(crate) fn append_history(
         transaction
             .execute(
                 "INSERT INTO history_events
-                    (network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (network_id, buffer_id, received_at, server_time, effective_time, msgid, direction, event_class, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     to_sql_id(event.network.0)?,
                     to_sql_id(event.buffer.0)?,
                     event.received_at.unix_seconds(),
                     event.server_time.map(|time| ServerTimeText(time.to_string())),
+                    // Derived once, here, by the same rule the migration backfill and the
+                    // replay path use. Computing it anywhere else would let the index and
+                    // the rendered `time=` tag disagree about where an event sits.
+                    crate::search::effective_time(event.server_time, event.received_at),
                     event.msgid,
                     event_direction_code(event.direction),
                     event.event_class,
@@ -641,6 +645,18 @@ pub(crate) fn append_history(
             )
             .map_err(|error| sql(error, CommitState::RolledBack))?;
         let assigned = from_sql_id(transaction.last_insert_rowid())?;
+        // The index row is written inside the append transaction, so a retained event and
+        // its search text are committed or absent together. There is no state in which a
+        // message is retained but unsearchable, or searchable but not retained.
+        if let Some(fields) = &event.search {
+            crate::search::insert_search_row(
+                &transaction,
+                assigned as i64,
+                fields.sender.clone(),
+                fields.target.clone(),
+                fields.body.clone(),
+            )?;
+        }
         if result.first.is_none() {
             result.first = Some(HistoryEventId(assigned));
         }
@@ -669,8 +685,8 @@ impl rusqlite::ToSql for ServerTimeText {
 pub(crate) fn recent_targets(
     connection: &Connection,
     network: NetworkId,
-    lower_unix_millis: i64,
-    upper_unix_millis: i64,
+    lower: &IrcTimestamp,
+    upper: &IrcTimestamp,
     limit: usize,
 ) -> Result<Vec<RecentTarget>, StoreError> {
     if limit == 0 || limit > MAX_RECENT_TARGETS {
@@ -678,11 +694,16 @@ pub(crate) fn recent_targets(
             "recent-targets limit",
         )));
     }
-    if upper_unix_millis < lower_unix_millis {
+    // Canonical protocol text, because that is what the column holds — see
+    // [`canonical_time`]. The ordering check is therefore also a string comparison, which
+    // is correct only because that text is fixed-width UTC.
+    if upper < lower {
         return Err(StoreError::new(StoreErrorKind::InvalidRequest(
             "recent-targets window",
         )));
     }
+    let lower = canonical_time(lower);
+    let upper = canonical_time(upper);
     let network = to_sql_id(network.0)?;
     // The newest event per buffer is found with the index, not a scan, and the
     // window is applied to that newest value so a client sees only buffers that
@@ -695,8 +716,8 @@ pub(crate) fn recent_targets(
                  SELECT MAX(e.event_id) FROM history_events e WHERE e.buffer_id = b.buffer_id
              )
              WHERE b.network_id = ?1
-               AND COALESCE(h.server_time, '') >= ?2
-               AND COALESCE(h.server_time, '') <= ?3
+               AND h.effective_time >= ?2
+               AND h.effective_time <= ?3
              ORDER BY h.event_id DESC
              LIMIT ?4",
         )
@@ -705,8 +726,8 @@ pub(crate) fn recent_targets(
         .query_map(
             rusqlite::params![
                 network,
-                lower_unix_millis,
-                upper_unix_millis,
+                lower,
+                upper,
                 to_sql_id(u64::try_from(limit).map_err(|_| StoreError::new(
                     StoreErrorKind::InvalidRequest("recent-targets limit")
                 ))?)?
@@ -815,29 +836,231 @@ pub(crate) fn query_history(
             // a caller could mistake for complete history.
             break;
         }
-        let received_at = i2pr_irc_core::WallTime::from_unix_seconds(received_at)
-            .ok_or_else(|| StoreError::new(StoreErrorKind::Corrupt("history receive timestamp")))?;
-        // The v2 column carries canonical text. Anything that does not parse is
-        // durable corruption, not a value to guess at: replaying a rewritten
-        // timestamp would make the bouncer disagree with the upstream silently.
-        let server_time = server_time
-            .map(|value| {
-                IrcTimestamp::parse_str(&value).map_err(|_| {
-                    StoreError::new(StoreErrorKind::Corrupt("history server timestamp"))
-                })
-            })
-            .transpose()?;
-        events.push(HistoryEvent {
-            event: HistoryEventId(from_sql_id(event)?),
-            network: NetworkId(from_sql_id(network)?),
-            buffer: BufferId(from_sql_id(buffer)?),
+        events.push(history_event(
+            event,
+            network,
+            buffer,
             received_at,
             server_time,
             msgid,
-            direction: event_direction_from(direction)?,
-            event_class: class,
+            direction,
+            class,
             payload,
-        });
+        )?);
+    }
+    Ok(events)
+}
+
+/// Decodes one `history_events` row into its typed event.
+///
+/// Shared by every read of that table so the column order and the corruption rules have
+/// one definition. Two decoders would be two places for the timestamp policy to drift,
+/// and a drift here is invisible until a replayed message carries the wrong time.
+#[allow(clippy::too_many_arguments)]
+fn history_event(
+    event: i64,
+    network: i64,
+    buffer: i64,
+    received_at: i64,
+    server_time: Option<String>,
+    msgid: Option<String>,
+    direction: i64,
+    event_class: String,
+    payload: Vec<u8>,
+) -> Result<HistoryEvent, StoreError> {
+    let received_at = i2pr_irc_core::WallTime::from_unix_seconds(received_at)
+        .ok_or_else(|| StoreError::new(StoreErrorKind::Corrupt("history receive timestamp")))?;
+    // The v2 column carries canonical text. Anything that does not parse is
+    // durable corruption, not a value to guess at: replaying a rewritten
+    // timestamp would make the bouncer disagree with the upstream silently.
+    let server_time = server_time
+        .map(|value| {
+            IrcTimestamp::parse_str(&value)
+                .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("history server timestamp")))
+        })
+        .transpose()?;
+    Ok(HistoryEvent {
+        event: HistoryEventId(from_sql_id(event)?),
+        network: NetworkId(from_sql_id(network)?),
+        buffer: BufferId(from_sql_id(buffer)?),
+        received_at,
+        server_time,
+        msgid,
+        direction: event_direction_from(direction)?,
+        event_class,
+        payload,
+    })
+}
+
+/// Reads one bounded history window centred on an anchor event.
+///
+/// Two indexed seeks on the primary key, not a scan. The "before" side walks backwards
+/// from the anchor and the "after" side walks forwards, each with its own budget; the
+/// before-side is reversed afterwards so the result is one ascending run with the anchor
+/// in the middle.
+///
+/// Reading a window of the newest events and filtering it in memory cannot produce this.
+/// The anchor may be older than any such window, so the window would have to be grown
+/// until it happens to contain the anchor — which is the unbounded scan this operation
+/// exists to remove.
+///
+/// A missing anchor is not an error: the two sides are still returned, because a caller
+/// paging either direction from a position it has not retained is exactly the case this
+/// operation has to survive. The empty result therefore means "nothing at all on either
+/// side", never "the anchor was pruned".
+pub(crate) fn history_around(
+    connection: &Connection,
+    request: &HistoryAround,
+) -> Result<Vec<HistoryEvent>, StoreError> {
+    request
+        .validate()
+        .map_err(|reason| StoreError::new(StoreErrorKind::InvalidRequest(reason)))?;
+    let buffer = to_sql_id(request.buffer.0)?;
+    let anchor = to_sql_id(request.anchor.0)?;
+
+    let before = history_window(
+        connection,
+        "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
+         FROM history_events WHERE buffer_id=?1 AND event_id < ?2 ORDER BY event_id DESC LIMIT ?3",
+        buffer,
+        anchor,
+        request.before,
+    )?;
+    let mut events = Vec::with_capacity(before.len() + request.after + 1);
+    events.extend(before.into_iter().rev());
+
+    events.extend(history_window(
+        connection,
+        "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
+         FROM history_events WHERE buffer_id=?1 AND event_id > ?2 ORDER BY event_id ASC LIMIT ?3",
+        buffer,
+        anchor,
+        request.after,
+    )?);
+
+    // The anchor is read separately rather than inferred from the two sides: it is the
+    // one event the caller is guaranteed, and a page that silently omitted it would leave
+    // the client unable to tell where in the conversation it is standing.
+    if let Some(centre) = history_window_by_anchor(connection, buffer, anchor)? {
+        let position = events
+            .iter()
+            .position(|event| event.event >= centre.event)
+            .unwrap_or(events.len());
+        events.insert(position, centre);
+    }
+    Ok(events)
+}
+
+/// Reads the anchor event itself.
+///
+/// Separate from [`history_window`] because its statement binds two placeholders rather
+/// than three. One bound too many is a driver-level error, so the two shapes are two
+/// functions rather than one with a parameter that is sometimes ignored.
+fn history_window_by_anchor(
+    connection: &Connection,
+    buffer: i64,
+    anchor: i64,
+) -> Result<Option<HistoryEvent>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
+             FROM history_events WHERE buffer_id=?1 AND event_id = ?2",
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let mut rows = statement
+        .query_map(params![buffer, anchor], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        })
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    match rows.next() {
+        Some(row) => {
+            let (
+                event,
+                network,
+                buffer_id,
+                received_at,
+                server_time,
+                msgid,
+                direction,
+                class,
+                payload,
+            ) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
+            history_event(
+                event,
+                network,
+                buffer_id,
+                received_at,
+                server_time,
+                msgid,
+                direction,
+                class,
+                payload,
+            )
+            .map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Runs one bounded directional read of `history_events`.
+///
+/// The order is the statement's, not this function's: the caller reverses what it needs.
+/// Deciding order here would mean a second statement shape for the same read, and the
+/// order is exactly what differs between the two sides of an anchor.
+fn history_window(
+    connection: &Connection,
+    text: &str,
+    buffer: i64,
+    bound: i64,
+    limit: usize,
+) -> Result<Vec<HistoryEvent>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = limit.min(MAX_HISTORY_QUERY_EVENTS);
+    let mut statement = connection
+        .prepare(text)
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let rows = statement
+        .query_map(params![buffer, bound, to_sql_id(limit as u64)?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        })
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let mut events = Vec::with_capacity(limit);
+    for row in rows {
+        let (event, network, buffer_id, received_at, server_time, msgid, direction, class, payload) =
+            row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        events.push(history_event(
+            event,
+            network,
+            buffer_id,
+            received_at,
+            server_time,
+            msgid,
+            direction,
+            class,
+            payload,
+        )?);
     }
     Ok(events)
 }
@@ -1065,6 +1288,20 @@ fn clamp_and_delete(
             params![oldest_removed, newest_removed, network],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
+    // The search side index is deleted in the same transaction, by exact event id. A
+    // retained index row for a message that no longer exists would answer a search with
+    // content the Operator has already had deleted, which is the one thing retention
+    // exists to prevent. The ids are already in hand and already bounded by
+    // `MAX_RETENTION_DELETE`, so this costs one statement per row and cannot itself become
+    // an unbounded operation.
+    for event_id in rows {
+        crate::search::delete_search_row(transaction, *event_id).map_err(|error| {
+            sql(
+                rusqlite::Error::ToSqlConversionFailure(Box::new(error)),
+                CommitState::RolledBack,
+            )
+        })?;
+    }
     Ok(ClampOutcome {
         deleted,
         cursors_clamped,
@@ -1086,4 +1323,284 @@ fn oldest_retained(transaction: &Transaction<'_>, network: i64) -> Result<Option
             |row| row.get::<_, Option<i64>>(0),
         )
         .map_err(|error| sql(error, CommitState::RolledBack))
+}
+
+// ------------------------------------------------------------------- search
+
+/// The form every history-time bound is compared in.
+///
+/// `history_events.effective_time` is a TEXT column holding canonical fixed-width UTC,
+/// so this is the *only* representation a bound may use. Binding integer milliseconds
+/// instead would compare TEXT against INTEGER, and SQLite orders every TEXT value after
+/// every INTEGER value regardless of the numbers involved — so the predicate would match
+/// either everything or nothing while still looking like a time comparison.
+fn canonical_time(value: &IrcTimestamp) -> String {
+    value.to_string()
+}
+
+/// Resolves a `msgid=` reference within one Network.
+///
+/// Returns every match rather than the first one. A duplicate upstream id is a real
+/// condition, and picking the lowest `HistoryEventId` would answer a question the client
+/// did not ask while looking authoritative.
+pub(crate) fn resolve_msgid(
+    connection: &Connection,
+    network: NetworkId,
+    msgid: &str,
+) -> Result<MsgidLookup, StoreError> {
+    if msgid.is_empty() || msgid.len() > crate::model::MAX_HISTORY_MSGID_BYTES {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "msgid reference",
+        )));
+    }
+    let network = to_sql_id(network.0)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id FROM history_events
+             WHERE network_id=?1 AND msgid=?2 ORDER BY event_id LIMIT ?3",
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let ceiling = to_sql_id(crate::model::MAX_MSGID_AMBIGUOUS as u64)?;
+    let rows = statement
+        .query_map(params![network, msgid, ceiling], |row| row.get::<_, i64>(0))
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let mut found = Vec::new();
+    for row in rows {
+        found.push(row.map_err(|error| sql(error, CommitState::RolledBack))?);
+    }
+    Ok(match found.len() {
+        0 => MsgidLookup::Missing,
+        1 => MsgidLookup::Unique(HistoryEventId(from_sql_id(found[0])?)),
+        _ => {
+            let mut events = Vec::with_capacity(found.len());
+            for id in found {
+                events.push(HistoryEventId(from_sql_id(id)?));
+            }
+            MsgidLookup::Ambiguous(events)
+        }
+    })
+}
+
+/// Finds the events bracketing one canonical protocol timestamp in one buffer.
+///
+/// Two indexed seeks rather than a scan, which is what makes a `timestamp=` reference
+/// cost the same whether the buffer holds ten events or ten million. Both edges are
+/// reported because `AROUND` needs to know whether the reference landed *on* an event.
+///
+/// Both edges absent means the buffer holds no positioned event at all. That is a
+/// different answer from "the reference falls outside everything retained" -- the
+/// latter has an edge on at least one side -- and a caller that anchors to the nearest
+/// retained event needs to be able to tell them apart.
+pub(crate) fn nearest_event(
+    connection: &Connection,
+    buffer: BufferId,
+    reference: &IrcTimestamp,
+) -> Result<NearestEvent, StoreError> {
+    // `effective_time` is canonical protocol *text*, and the canonical form is
+    // fixed-width UTC, so lexicographic order is chronological order and the index on
+    // `(buffer_id, effective_time, event_id)` is usable. Comparing against integer
+    // milliseconds would compare a TEXT column against an INTEGER parameter, which
+    // SQLite orders by type: every text value sorts after every integer, so the
+    // comparison silently matches everything or nothing. That is not a subtlety this
+    // code is allowed to have.
+    //
+    // `effective_time` rather than `server_time`, so an upstream that stamps nothing
+    // still has a buffer that can be positioned in.
+    let reference_time = canonical_time(reference);
+    let buffer = to_sql_id(buffer.0)?;
+    let before: Option<i64> = connection
+        .query_row(
+            "SELECT event_id FROM history_events
+             WHERE buffer_id=?1 AND effective_time <= ?2
+             ORDER BY effective_time DESC, event_id DESC LIMIT 1",
+            params![buffer, reference_time],
+            |row| row.get(0),
+        )
+        .ok();
+    let after: Option<i64> = connection
+        .query_row(
+            "SELECT event_id FROM history_events
+             WHERE buffer_id=?1 AND effective_time > ?2
+             ORDER BY effective_time ASC, event_id ASC LIMIT 1",
+            params![buffer, reference_time],
+            |row| row.get(0),
+        )
+        .ok();
+    // "Exact" means an event carries the reference's own millisecond. Asking the row is
+    // cheaper than re-deriving it, and it keeps the definition in one place: a reference
+    // is exact when a retained event *has* that timestamp, not when it happens to be the
+    // nearest one.
+    let exact = match before {
+        Some(before) => {
+            connection
+                .query_row(
+                    "SELECT effective_time = ?2 FROM history_events WHERE event_id = ?1",
+                    params![before, reference_time],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                == 1
+        }
+        None => false,
+    };
+    Ok(NearestEvent {
+        before: before.map(from_sql_id).transpose()?.map(HistoryEventId),
+        after: after.map(from_sql_id).transpose()?.map(HistoryEventId),
+        exact,
+    })
+}
+
+/// Runs one bounded search over one Network's retained history.
+///
+/// The `MATCH` expression is compiled from validated terms by
+/// [`crate::model::SearchQuery::match_expression`]; nothing a client typed reaches SQL as
+/// syntax. Buffer scoping is applied in the same statement as the match, so a Network
+/// filter cannot be forgotten by a later edit to the query text.
+pub(crate) fn search(
+    connection: &Connection,
+    query: &SearchQuery,
+) -> Result<Vec<SearchHit>, StoreError> {
+    query
+        .validate()
+        .map_err(|reason| StoreError::new(StoreErrorKind::InvalidRequest(reason)))?;
+    let network = to_sql_id(query.network.0)?;
+    let limit = to_sql_id(query.limit as u64)?;
+    let sender = query.sender.as_deref();
+
+    let mut hits = Vec::new();
+    if let Some(expression) = query.match_expression() {
+        // Buffer scoping is a fixed placeholder layout per shape, so the statement text is
+        // a small closed set and every client-influenced value is a bound parameter.
+        let mut text = String::from(
+            "SELECT h.event_id, h.buffer_id, s.sender, s.target, s.body
+             FROM history_search s
+             JOIN history_events h ON h.event_id = s.rowid
+             WHERE history_search MATCH ?1 AND h.network_id = ?2",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(expression), Box::new(network)];
+        if !query.buffers.is_empty() {
+            let placeholders: Vec<String> = (0..query.buffers.len())
+                .map(|index| format!("?{}", values.len() + index + 1))
+                .collect();
+            text.push_str(&format!(
+                " AND h.buffer_id IN ({})",
+                placeholders.join(", ")
+            ));
+            for buffer in &query.buffers {
+                values.push(Box::new(to_sql_id(buffer.0)?));
+            }
+        }
+        if let Some(nick) = sender {
+            text.push_str(&format!(" AND s.sender = ?{}", values.len() + 1));
+            values.push(Box::new(nick.to_owned()));
+        }
+        if let Some(after) = &query.after {
+            text.push_str(&format!(" AND h.effective_time >= ?{}", values.len() + 1));
+            values.push(Box::new(canonical_time(after)));
+        }
+        if let Some(before) = &query.before {
+            text.push_str(&format!(" AND h.effective_time < ?{}", values.len() + 1));
+            values.push(Box::new(canonical_time(before)));
+        }
+        text.push_str(&format!(" ORDER BY h.event_id LIMIT ?{}", values.len() + 1));
+        values.push(Box::new(limit));
+
+        let reference: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        let mut statement = connection
+            .prepare(&text)
+            .map_err(|error| sql(error, CommitState::RolledBack))?;
+        let rows = statement
+            .query_map(reference.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| sql(error, CommitState::RolledBack))?;
+        for row in rows {
+            let (event, buffer, sender, target, body) =
+                row.map_err(|error| sql(error, CommitState::RolledBack))?;
+            hits.push(SearchHit {
+                event: HistoryEventId(from_sql_id(event)?),
+                buffer: BufferId(from_sql_id(buffer)?),
+                sender,
+                target,
+                body,
+            });
+        }
+        return Ok(hits);
+    }
+
+    // No terms: this is a bounded listing within the caller's scope, which is what a
+    // `from=`-only or time-bounded request means. It is still bounded by the Network, the
+    // buffer scope, the range, and the limit -- never by the size of the journal.
+    let mut text = String::from(
+        "SELECT h.event_id, h.buffer_id, COALESCE(s.sender,''), COALESCE(s.target,''), COALESCE(s.body,'')
+         FROM history_events h
+         LEFT JOIN history_search s ON s.rowid = h.event_id
+         WHERE h.network_id = ?1",
+    );
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(network)];
+    if !query.buffers.is_empty() {
+        let placeholders: Vec<String> = (0..query.buffers.len())
+            .map(|index| format!("?{}", values.len() + index + 1))
+            .collect();
+        text.push_str(&format!(
+            " AND h.buffer_id IN ({})",
+            placeholders.join(", ")
+        ));
+        for buffer in &query.buffers {
+            values.push(Box::new(to_sql_id(buffer.0)?));
+        }
+    }
+    if let Some(nick) = sender {
+        text.push_str(&format!(
+            " AND COALESCE(s.sender,'') = ?{}",
+            values.len() + 1
+        ));
+        values.push(Box::new(nick.to_owned()));
+    }
+    if let Some(after) = &query.after {
+        text.push_str(&format!(" AND h.effective_time >= ?{}", values.len() + 1));
+        values.push(Box::new(canonical_time(after)));
+    }
+    if let Some(before) = &query.before {
+        text.push_str(&format!(" AND h.effective_time < ?{}", values.len() + 1));
+        values.push(Box::new(canonical_time(before)));
+    }
+    text.push_str(&format!(" ORDER BY h.event_id LIMIT ?{}", values.len() + 1));
+    values.push(Box::new(limit));
+
+    let reference: Vec<&dyn rusqlite::ToSql> = values.iter().map(|value| value.as_ref()).collect();
+    let mut statement = connection
+        .prepare(&text)
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let rows = statement
+        .query_map(reference.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    for row in rows {
+        let (event, buffer, sender, target, body) =
+            row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        hits.push(SearchHit {
+            event: HistoryEventId(from_sql_id(event)?),
+            buffer: BufferId(from_sql_id(buffer)?),
+            sender,
+            target,
+            body,
+        });
+    }
+    Ok(hits)
 }
