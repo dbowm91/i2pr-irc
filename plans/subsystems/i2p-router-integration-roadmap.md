@@ -1,6 +1,6 @@
 # I2P Router Integration Roadmap
 
-Status: conditionally closed — R001-A through R001-D closed; R001 portability evidence-blocked; R002/R003 gated on external contracts
+Status: corrective active — R001 implementation complete; Corrective 033 owns corrected live product-path evidence; R002/R003 gated
 
 Long-term references:
 
