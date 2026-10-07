@@ -1,0 +1,795 @@
+//! Plan 027 — M005-H operator diagnostics, configuration, and registration actions.
+//!
+//! The diagnostics surface is the only part of M005-H an Operator sees directly, and its
+//! whole purpose is to be *legible during an incident*. Three properties make it so, and
+//! each has a failure mode that a green test would otherwise miss:
+//!
+//! - **Nothing secret has a field to render.** This is not a redaction pass applied while
+//!   rendering; the report type has no endpoint, no `Destination`, no SASL value, and no
+//!   filesystem path in any variant, so a rendering bug cannot leak one either. The test
+//!   that proves this walks every Network holding a credential and an endpoint and asserts
+//!   neither appears anywhere in the reply.
+//! - **A truncated list says so.** A channel sample that silently stops at 64 is
+//!   indistinguishable from a Network with six channels, and the reader would conclude the
+//!   wrong thing from a truthful-looking report.
+//! - **A classification is a closed set.** `away=manual` is parsed by whatever reads this.
+//!   If the spelling could drift, the report would be decorative.
+//!
+//! The rest of the plan -- versioned configuration snapshots and durable registration
+//! actions -- is covered in the later sections of this file.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use i2pr_irc_core::{ByteStream, ClientId, I2pEndpoint, NetworkId, SessionId};
+use i2pr_irc_runtime::admission::{AdmissionOutcome, DownstreamAdmission, NetworkSelection};
+use i2pr_irc_runtime::controller::{ControlSnapshot, RuntimeControlHandle, RuntimeController};
+use i2pr_irc_store::{NetworkRecord, Store, StorePath};
+use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const CEILING: Duration = Duration::from_secs(10);
+
+fn b32() -> String {
+    format!("{}.b32.i2p", "a".repeat(52))
+}
+
+fn record(network: u64, channels: &[&str]) -> NetworkRecord {
+    NetworkRecord {
+        network: NetworkId(network),
+        display_name: format!("net-{network}"),
+        endpoint: I2pEndpoint::parse(&b32()).expect("a test destination"),
+        nick: "bot".to_owned(),
+        username: "user".to_owned(),
+        realname: "bouncer".to_owned(),
+        sasl: None,
+        desired_channels: channels
+            .iter()
+            .enumerate()
+            .map(|(index, target)| i2pr_irc_store::DesiredChannelRecord {
+                target: (*target).to_owned(),
+                position: index,
+                detached: false,
+            })
+            .collect(),
+        auto_away: false,
+        keep_nick: false,
+    }
+}
+#[derive(Clone)]
+struct Provider(Arc<FakeI2pStreamProvider>);
+
+impl Provider {
+    fn new() -> Self {
+        let provider = Arc::new(FakeI2pStreamProvider::default());
+        for _ in 0..16 {
+            provider
+                .queue_outcome(Ok(FaultScript::default()))
+                .expect("provider queue has room");
+        }
+        Self(provider)
+    }
+
+    async fn plain_peer(&self) -> ScriptedStream {
+        let peer = self.0.take_peer().await;
+        self.0.take_controller().await;
+        peer
+    }
+}
+
+#[async_trait::async_trait]
+impl i2pr_irc_core::I2pStreamProvider for Provider {
+    async fn connect(
+        &self,
+        endpoint: &I2pEndpoint,
+    ) -> Result<Box<dyn ByteStream>, i2pr_irc_core::ProviderError> {
+        self.0.connect(endpoint).await
+    }
+}
+
+struct Runtime {
+    control: RuntimeControlHandle,
+    provider: Provider,
+    task: tokio::task::JoinHandle<Result<(), i2pr_irc_runtime::RuntimeError>>,
+    upstreams: Vec<ScriptedStream>,
+    _store: Store,
+}
+
+impl Runtime {
+    async fn start() -> Self {
+        let store = Store::open(&StorePath::Memory).expect("store opens");
+        let handle = store.handle_clone();
+        let provider = Provider::new();
+        let (mut controller, control) =
+            RuntimeController::with_durable(provider.clone(), handle.clone(), Arc::new(handle));
+        let task = tokio::spawn(async move { controller.serve().await });
+        wait_for(&control, |_| true).await;
+        Self {
+            control,
+            provider,
+            task,
+            upstreams: Vec::new(),
+            _store: store,
+        }
+    }
+
+    /// Brings a Network online with `cap_ls` offered upstream.
+    ///
+    /// `isupport` and `own_join` are parameters because they decide what the bouncer may
+    /// legitimately claim about itself, and a diagnostic must report the bouncer's own
+    /// claims rather than the test's hopes.
+    async fn bring_online(
+        &mut self,
+        network: u64,
+        channels: &[&str],
+        cap_ls: &str,
+        isupport: &str,
+        own_join: &str,
+    ) -> usize {
+        self.bring_online_with_names(network, channels, cap_ls, isupport, own_join, "")
+            .await
+    }
+
+    /// As [`Runtime::bring_online`], with a credential already stored on the Network.
+    ///
+    /// Written into the durable record before the Network starts, rather than through
+    /// `SASL SET` afterwards: a configuration change restarts the owner and detaches every
+    /// session attached to it, including the session that issued the change. Both routes
+    /// produce the same stored credential; only this one leaves a client alive afterwards to
+    /// read a diagnostic that must not contain it.
+    async fn bring_online_credentialed(&mut self, network: u64, channels: &[&str]) -> usize {
+        let mut candidate = record(network, channels);
+        candidate.sasl = Some((
+            "bob".to_owned(),
+            i2pr_irc_store::StoredSecret::new("hunter2".to_owned()),
+        ));
+        self.control
+            .create(candidate)
+            .await
+            .unwrap_or_else(|error| panic!("create {network}: {error:?}"));
+        self.drive_registration(
+            network,
+            channels,
+            // `sasl=PLAIN`, not a bare `sasl`: the owner requires an advertised
+            // *mechanism*, because a server offering SASL without naming one cannot be
+            // authenticated against. A Network holding a credential against a server
+            // that offers neither is refused registration outright rather than
+            // silently connecting unauthenticated -- so a fixture that omitted this
+            // would be testing the no-credential path under a credentialed Network's
+            // name.
+            "message-tags server-time batch sasl=PLAIN",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+            "",
+        )
+        .await
+    }
+
+    /// As [`Runtime::bring_online`], plus `extra_names` added to each channel's `NAMES`.
+    ///
+    /// Membership a test depends on has to exist before any client attaches: a `353`
+    /// written afterwards fans out verbatim, which would make the test measure the fanout
+    /// rather than the bouncer's own rendering of the same facts.
+    async fn bring_online_with_names(
+        &mut self,
+        network: u64,
+        channels: &[&str],
+        cap_ls: &str,
+        isupport: &str,
+        own_join: &str,
+        extra_names: &str,
+    ) -> usize {
+        self.control
+            .create(record(network, channels))
+            .await
+            .unwrap_or_else(|error| panic!("create {network}: {error:?}"));
+        self.drive_registration(network, channels, cap_ls, isupport, own_join, extra_names)
+            .await
+    }
+
+    async fn drive_registration(
+        &mut self,
+        network: u64,
+        channels: &[&str],
+        cap_ls: &str,
+        isupport: &str,
+        own_join: &str,
+        extra_names: &str,
+    ) -> usize {
+        let mut upstream = self.provider.plain_peer().await;
+        read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        let ack = cap_ls
+            .split_whitespace()
+            .map(|name| name.to_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Only the capability advertisement goes out here. `001` is deliberately withheld
+        // until `CAP END`: a real server sends the welcome *after* authentication, and
+        // sending it early ends this generation before the bouncer has finished
+        // negotiating, which is the opposite of what a fixture meant to exercise a
+        // credentialed registration needs.
+        upstream
+            .write_all(format!(":srv CAP * LS :{ack}\r\n").as_bytes())
+            .await
+            .expect("upstream advertises capabilities");
+        // Answering with exactly what the bouncer asked for -- rather than the whole
+        // advertisement -- keeps each test honest about which capabilities were actually
+        // granted, since an ACK naming a capability that was never requested takes a
+        // different branch of registration than the real one.
+        loop {
+            let line = read_line(&mut upstream).await;
+            if line.contains("CAP END") {
+                upstream
+                    .write_all(b":srv 001 bot :welcome\r\n")
+                    .await
+                    .expect("upstream welcomes after negotiation");
+                break;
+            }
+            // SASL is answered, not stubbed. A Network with a credential runs a different
+            // registration path from one without, and a fixture that skipped it would be
+            // testing the path with no credential while claiming to test the one with.
+            if line.starts_with("AUTHENTICATE PLAIN") {
+                upstream
+                    .write_all(b":srv AUTHENTICATE +\r\n")
+                    .await
+                    .expect("upstream starts sasl");
+                continue;
+            }
+            if let Some(payload) = line.strip_prefix("AUTHENTICATE ") {
+                assert!(
+                    !payload.trim().is_empty(),
+                    "the credential must be offered, not offered empty"
+                );
+                upstream
+                    .write_all(b":srv 903 bot :SASL authentication successful\r\n")
+                    .await
+                    .expect("upstream accepts the credential");
+                continue;
+            }
+            if let Some(request) = line.strip_prefix("CAP REQ :") {
+                let requested = request.trim_end_matches("\r\n");
+                upstream
+                    .write_all(format!(":srv CAP * ACK :{requested}\r\n").as_bytes())
+                    .await
+                    .expect("upstream acks");
+            }
+        }
+        // The bouncer's own channel membership is the extended form, which is what gives
+        // a reattaching client something to observe about itself. `NAMELEN` is published
+        // because `setname` obliges the server to say how long a realname may be.
+        for channel in channels {
+            let mut lines = vec![
+                format!(":srv 005 bot {isupport}"),
+                own_join.replace("{channel}", channel),
+            ];
+            // An extra `353` only when there are names to put in it: a memberless `353` is
+            // not a line any server sends, and it would claim a NAMES list was seen.
+            if !extra_names.is_empty() {
+                lines.push(format!(":srv 353 bot = {channel} :{extra_names}"));
+            }
+            lines.push(format!(":srv 366 bot {channel} :End of /NAMES list."));
+            let frame = lines
+                .into_iter()
+                .map(|line| format!("{line}\r\n"))
+                .collect::<String>();
+            upstream
+                .write_all(frame.as_bytes())
+                .await
+                .expect("upstream joins");
+        }
+        let peer = self.upstreams.len();
+        self.upstreams.push(upstream);
+        // Liveness alone is not enough. The advertisement is published just after upstream
+        // negotiation finishes, and a client that registers in between would be answered
+        // against the fallback list -- which is a real ordering this test must not race.
+        wait_for(&self.control, |snapshot| {
+            snapshot
+                .networks
+                .iter()
+                .any(|entry| entry.network == NetworkId(network) && entry.live)
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + CEILING;
+        loop {
+            if !self
+                .control
+                .advertisement(NetworkId(network))
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the owner never published an advertisement for {network}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Neither liveness nor the advertisement proves the startup frames were *applied*.
+        // They were only written, and the owner applies them later, in order. A probe client
+        // settles that ordering: its barrier is a frame it is owed anyway, so seeing it
+        // proves every earlier line -- including any `353` -- was applied first.
+        //
+        // Without this the suite passes in isolation and fails under parallel load, which is
+        // the worst possible failure mode for a harness.
+        let mut probe = register(&*self, NetworkId(network), SessionId(u64::MAX), "").await;
+        sync(self, peer, &mut probe).await;
+        drop(probe);
+        peer
+    }
+
+    async fn send_upstream(&mut self, peer: usize, frame: &str) {
+        self.upstreams[peer]
+            .write_all(frame.as_bytes())
+            .await
+            .expect("upstream accepts traffic");
+    }
+
+    async fn stop(self) {
+        self.control.request_stop();
+        self.task
+            .await
+            .expect("controller task joins")
+            .expect("controller reports success");
+        self._store.shutdown().expect("store shuts down");
+    }
+}
+
+async fn wait_for<F>(control: &RuntimeControlHandle, ready: F)
+where
+    F: Fn(&ControlSnapshot) -> bool,
+{
+    let mut status = control.subscribe_status();
+    let deadline = tokio::time::Instant::now() + CEILING;
+    loop {
+        if ready(&status.borrow()) {
+            return;
+        }
+        let _ = tokio::time::timeout_at(deadline, status.changed())
+            .await
+            .expect("the controller publishes a snapshot");
+    }
+}
+
+struct Client {
+    end: ScriptedStream,
+    _script: i2pr_irc_testkit::FaultController,
+    /// Retained so a client is only dropped when the test ends it. Dropping the task
+    /// would cancel admission rather than ending it, which is not what a test that just
+    /// wants a live client means.
+    _outcome: tokio::task::JoinHandle<AdmissionOutcome>,
+    seen: String,
+}
+
+impl Client {
+    async fn until(&mut self, needle: &str) {
+        self.await_new(0, needle).await
+    }
+
+    async fn await_new(&mut self, mark: usize, needle: &str) {
+        let deadline = tokio::time::Instant::now() + CEILING;
+        while !self.seen[mark..].contains(needle) {
+            let mut chunk = [0u8; 1024];
+            let count = tokio::time::timeout_at(deadline, self.end.read(&mut chunk))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "timed out waiting for {needle:?}; saw {:?}",
+                        &self.seen[mark..]
+                    )
+                })
+                .expect("the client stream does not fail");
+            assert!(
+                count > 0,
+                "client closed waiting for {needle:?}; saw {:?}",
+                &self.seen[mark..]
+            );
+            self.seen
+                .push_str(&String::from_utf8_lossy(&chunk[..count]));
+        }
+    }
+
+    async fn settle(&mut self) {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(250), self.end.read(&mut chunk)).await
+            {
+                Ok(Ok(count)) if count > 0 => {
+                    self.seen
+                        .push_str(&String::from_utf8_lossy(&chunk[..count]));
+                }
+                _ => break,
+            }
+        }
+    }
+
+    async fn send(&mut self, frame: &str) {
+        self.end
+            .write_all(frame.as_bytes())
+            .await
+            .expect("the client writes");
+    }
+
+    fn mark(&self) -> usize {
+        self.seen.len()
+    }
+
+    fn since(&self, mark: usize) -> String {
+        self.seen[mark..].to_owned()
+    }
+}
+
+fn admit(runtime: &Runtime, network: NetworkId, session: SessionId) -> Client {
+    let (end, runtime_end, script) = ScriptedStream::pair(FaultScript::default());
+    let control = runtime.control.clone();
+    let outcome = tokio::spawn(async move {
+        let stream: Box<dyn ByteStream> = Box::new(runtime_end);
+        DownstreamAdmission::new(
+            Some(NetworkSelection {
+                network,
+                expected_nick: "bot".to_owned(),
+            }),
+            control,
+            session,
+            ClientId(7),
+        )
+        .run(stream)
+        .await
+    });
+    Client {
+        end,
+        _script: script,
+        _outcome: outcome,
+        seen: String::new(),
+    }
+}
+
+async fn register(
+    runtime: &Runtime,
+    network: NetworkId,
+    session: SessionId,
+    capabilities: &str,
+) -> Client {
+    let mut client = admit(runtime, network, session);
+    // Requested *during* registration, which is the only moment a negotiated surface can
+    // apply to the projection: the projection is sent once, at attach.
+    let request = if capabilities.is_empty() {
+        "NICK bot\r\nUSER user 0 * :client\r\nCAP END\r\n".to_owned()
+    } else {
+        format!("CAP REQ :{capabilities}\r\nNICK bot\r\nUSER user 0 * :client\r\nCAP END\r\n")
+    };
+    client.send(&request).await;
+    client.until("001 bot").await;
+    if !capabilities.is_empty() {
+        assert!(
+            !client.seen.contains("NAK"),
+            "an advertised capability must be acknowledgeable during registration: {:?}",
+            client.seen
+        );
+    }
+    client.settle().await;
+    client
+}
+
+async fn read_line(stream: &mut ScriptedStream) -> String {
+    let mut all = Vec::new();
+    let mut buf = [0u8; 1];
+    loop {
+        let count = tokio::time::timeout(CEILING, stream.read(&mut buf))
+            .await
+            .expect("upstream produces a line within the ceiling")
+            .expect("the upstream stream does not fail");
+        assert!(count > 0, "upstream stream ended mid-line");
+        all.push(buf[0]);
+        if all.ends_with(b"\r\n") {
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+    }
+}
+
+async fn read_until(stream: &mut ScriptedStream, needle: &[u8]) -> String {
+    let mut all = Vec::new();
+    let mut buf = [0; 512];
+    let read = async {
+        while !all.windows(needle.len()).any(|window| window == needle) {
+            let count = stream.read(&mut buf).await.unwrap();
+            assert!(count > 0, "upstream stream ended");
+            all.extend_from_slice(&buf[..count]);
+        }
+        while let Ok(Ok(count)) = tokio::time::timeout(Duration::ZERO, stream.read(&mut buf)).await
+        {
+            if count == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..count]);
+        }
+    };
+    tokio::time::timeout(CEILING, read)
+        .await
+        .unwrap_or_else(|_| panic!("upstream never sent {}", String::from_utf8_lossy(needle)));
+    String::from_utf8_lossy(&all).into_owned()
+}
+
+/// Sends `frames` upstream and waits until a session has observed everything before them.
+///
+/// Frames written upstream are only *queued*; the owner applies them later, and in order.
+/// Asserting against a projection straight after writing upstream races that queue, and a
+/// test that passes when it wins is not a test. The marker is a frame this client is owed
+/// anyway, so seeing it proves every earlier line was applied first.
+async fn sync(runtime: &mut Runtime, peer: usize, client: &mut Client) {
+    let mark = client.mark();
+    runtime
+        .send_upstream(peer, ":sync!u@h PRIVMSG #room :barrier\r\n")
+        .await;
+    client.await_new(mark, "barrier").await;
+}
+
+// ------------------------------------------------------- diagnostics tests
+
+/// Asks `BouncerServ` for a report and returns everything it said.
+async fn diag(client: &mut Client, argument: &str) -> String {
+    let mark = client.mark();
+    client
+        .send(&format!("PRIVMSG BouncerServ :{argument}\r\n"))
+        .await;
+    client.await_new(mark, "rejected_joins=").await;
+    client.settle().await;
+    client.since(mark)
+}
+
+#[tokio::test]
+async fn diagnostics_report_the_running_state_of_a_live_network() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let reply = diag(&mut client, "diag network 1").await;
+
+    assert!(reply.contains("netid=1"), "{reply}");
+    assert!(
+        reply.contains("name=net-1"),
+        "the Operator's own label: {reply}"
+    );
+    assert!(
+        reply.contains("phase=online"),
+        "a phase an Operator can act on: {reply}"
+    );
+    assert!(reply.contains("generation="), "{reply}");
+    assert!(
+        reply.contains("visible=1"),
+        "the joined channel is counted: {reply}"
+    );
+    assert!(reply.contains("sample=#room"), "{reply}");
+    assert!(
+        reply.contains("counts=") && reply.contains("recorded="),
+        "a bouncer that silently drops history must be visible: {reply}"
+    );
+    assert!(
+        reply.contains("dropped=0"),
+        "dropping history is the one count that means data was lost, and it is reported: {reply}"
+    );
+    assert!(
+        reply.contains("next_retry_delay=none"),
+        "a connected Network has no retry scheduled, and says so rather than claiming zero: {reply}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn diagnostics_carry_no_endpoint_and_no_credential() {
+    // The strongest statement in the plan: there is no field to render a secret in. This
+    // test gives the bouncer both, then reads the whole reply and looks for them.
+    //
+    // The credential is written durably *before* the client attaches rather than with
+    // `SASL SET`, because a configuration change restarts the owner and detaches every
+    // session on it -- including the one that issued it. Both paths produce the same
+    // durable record; only this one leaves a client alive to read the report.
+    let mut runtime = Runtime::start().await;
+    runtime.bring_online_credentialed(1, &["#room"]).await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let reply = diag(&mut client, "diag network 1").await;
+
+    let destination = b32();
+    assert!(
+        !reply.contains(&destination),
+        "an endpoint is not an Operator-facing field: {reply}"
+    );
+    assert!(
+        !reply.contains("hunter2"),
+        "a password must never be rendered: {reply}"
+    );
+    assert!(
+        !reply.contains("b32.i2p"),
+        "not even the shape of one: {reply}"
+    );
+    // The SASL *name* is not a secret, and `SASL STATUS` reports it deliberately. It is
+    // not a diagnostics field, so a report must not carry it either -- a reader scanning
+    // diagnostics would otherwise have to decide which surface is safe to paste.
+    assert!(
+        !reply.contains("bob"),
+        "the credential's name is not a diagnostic field: {reply}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn a_diagnostics_list_that_is_truncated_says_how_many_are_missing() {
+    let mut runtime = Runtime::start().await;
+    // More joined channels than the sample ceiling, so the report has to decide what to
+    // do with the tail. A report that quietly stops is indistinguishable from a short
+    // Network, which is the failure this pair of tests exists to prevent.
+    let many: Vec<String> = (0..i2pr_irc_runtime::diagnostics::MAX_REPORTED_CHANNELS + 9)
+        .map(|index| format!("#room{index}"))
+        .collect();
+    let names: Vec<&str> = many.iter().map(String::as_str).collect();
+    runtime
+        .bring_online(
+            1,
+            &names,
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let reply = diag(&mut client, "diag network 1").await;
+
+    assert!(
+        reply.contains(&format!(
+            "visible={}",
+            i2pr_irc_runtime::diagnostics::MAX_REPORTED_CHANNELS + 9
+        )),
+        "the true count is reported alongside the truncated sample: {reply}"
+    );
+    assert!(
+        reply.contains("overflow=9"),
+        "a truncated list must report what it left out: {reply}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn a_short_list_reports_no_overflow() {
+    // The other half of the previous test: if `overflow` were always non-zero the first
+    // test would prove nothing.
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let reply = diag(&mut client, "diag network 1").await;
+
+    assert!(reply.contains("visible=1"), "{reply}");
+    assert!(
+        reply.contains("overflow=0"),
+        "an untruncated list must say nothing was left out: {reply}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn diagnostics_for_a_network_that_does_not_exist_is_not_a_silent_empty_report() {
+    let mut runtime = Runtime::start().await;
+    // Network 1 exists, so the client can bind; Network 99 is the typo this test types.
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :diag network 99\r\n")
+        .await;
+    client.await_new(mark, "FAIL BOUNCER").await;
+
+    let reply = client.since(mark);
+    assert!(reply.contains("no network with id 99"), "{reply}");
+    assert!(
+        !reply.contains("counts="),
+        "a failed request must not also send a report the Operator could read as success: {reply}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn a_whole_process_report_covers_every_live_network() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    runtime
+        .bring_online(
+            2,
+            &["#other"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let reply = diag(&mut client, "diag").await;
+
+    assert!(reply.contains("netid=1"), "{reply}");
+    assert!(
+        reply.contains("netid=2"),
+        "a process report is not a first-Network report: {reply}"
+    );
+    assert!(
+        reply.contains("revision="),
+        "a reader can tell two reports apart: {reply}"
+    );
+    assert!(
+        reply.contains("owner_tasks="),
+        "the process gauges are here: {reply}"
+    );
+    assert!(reply.contains("store_queue="), "{reply}");
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn a_diagnostics_line_is_tagged_and_bounded() {
+    let mut runtime = Runtime::start().await;
+    let many: Vec<String> = (0..i2pr_irc_runtime::diagnostics::MAX_REPORTED_CHANNELS)
+        .map(|index| format!("#room{index}"))
+        .collect();
+    let names: Vec<&str> = many.iter().map(String::as_str).collect();
+    runtime
+        .bring_online(
+            1,
+            &names,
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let reply = diag(&mut client, "diag network 1").await;
+
+    assert!(
+        reply.contains("@bouncer-diag "),
+        "a client must be able to separate this from administration traffic: {reply}"
+    );
+    for line in reply.lines() {
+        let frame = line.trim_end_matches("\r");
+        if frame.is_empty() {
+            continue;
+        }
+        assert!(
+            frame.len() <= 512,
+            "a diagnostic must never be the thing that splits a message: {frame}"
+        );
+    }
+    runtime.stop().await;
+}

@@ -20,7 +20,7 @@ use crate::{
     downstream::DownstreamDisposition,
     journal::IngestOutcome,
     playback::PlaybackOutcome,
-    presence::{PresencePolicy, PresenceState, ReclaimAttempt, SessionPresence},
+    presence::{AwayOrigin, PresencePolicy, PresenceState, ReclaimAttempt, SessionPresence},
     projection,
     reconnect::{ReconnectScheduler, jitter_entropy},
     resource::{NetworkGauges, ResourceLedger},
@@ -708,6 +708,12 @@ pub struct NetworkSnapshot {
     /// keyboard and a bouncer that is present while they are not are both failures that
     /// are otherwise invisible from outside.
     pub away: Option<String>,
+    /// Why the away state above is being held, when one is.
+    ///
+    /// Published beside the text rather than derived from it, because the text is free form:
+    /// classifying it at read time would mean pattern-matching a value the Operator may
+    /// change at will. Diagnostics reports a *class*; the text itself is not exported.
+    pub away_origin: Option<AwayOrigin>,
     /// Sessions currently counted as the Operator being present.
     ///
     /// Reported next to `detached_channels` for the same reason: a reader must be able to
@@ -3041,10 +3047,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             .values()
             .filter(|presence| presence.is_active())
             .count();
-        let desired = presence.away_state(active);
+        let decided = presence.away_state_with_origin(active);
+        let desired = decided.as_ref().map(|(text, _)| text.clone());
         self.snapshot.send_modify(|snapshot| {
             snapshot.active_sessions = active;
             snapshot.away = desired.clone();
+            snapshot.away_origin = decided.map(|(_, origin)| origin);
         });
         presence.note_upstream_away(desired).map(|text| match text {
             // Returning to present is the protocol's bare `AWAY`, which carries no

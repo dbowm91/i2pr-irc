@@ -24,6 +24,7 @@
 use crate::{
     RuntimeError,
     catalog::{NetworkCatalog, SupervisorContext, SupervisorHandle},
+    diagnostics::{self, ProcessDiagnostics},
     owner::{NetworkOwner, NetworkSnapshot},
 };
 use async_trait::async_trait;
@@ -212,6 +213,16 @@ pub enum ControlRequest {
         session: PreparedBinding,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    /// Read the bounded, secret-free diagnostics report.
+    ///
+    /// `network` selects one Network; `None` reports the process alongside every Network
+    /// the controller has a live owner for. Routed through the controller because it reads
+    /// every owner's snapshot plus the scheduler and the ledger, and assembling that from
+    /// an operator session would need reach into all three.
+    Diagnostics {
+        network: Option<NetworkId>,
+        reply: oneshot::Sender<Result<ProcessDiagnostics, RuntimeError>>,
+    },
     /// Stop every Network and end the controller.
     Stop { reply: oneshot::Sender<()> },
 }
@@ -260,6 +271,22 @@ impl RuntimeControlHandle {
         let (reply, response) = oneshot::channel();
         self.send(ControlRequest::Advertisement { network, reply })?;
         response.await.map_err(|_| RuntimeError::Stopped)
+    }
+
+    /// Reads the bounded diagnostics report.
+    ///
+    /// Reads the live owners rather than the published `ControlSnapshot`, for the same
+    /// reason [`Self::advertisement`] does: the controller's published copy is taken at a
+    /// revision boundary, and a diagnostic that reported a stale queue depth or a
+    /// reconnect count would be actively misleading during exactly the incidents an
+    /// Operator opens it for.
+    pub async fn diagnostics(
+        &self,
+        network: Option<NetworkId>,
+    ) -> Result<ProcessDiagnostics, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::Diagnostics { network, reply })?;
+        response.await.map_err(|_| RuntimeError::Stopped)?
     }
 
     /// Subscribes to future revisions without consuming a queue slot.
@@ -642,6 +669,39 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
         }
     }
 
+    /// The process-wide values every Network's projection reads.
+    ///
+    /// Read live, at projection time, rather than taken from the published snapshot for the
+    /// same reason the advertisement is: a diagnostic whose numbers lag the thing being
+    /// diagnosed is worse than no diagnostic.
+    fn diagnostic_inputs(&self) -> diagnostics::ProcessInputs {
+        diagnostics::ProcessInputs {
+            upstream: self.catalog.reconnect().diagnostics(),
+            resources: self.catalog.resources().snapshot(),
+            store_queue_depth: self.catalog.store_queue_depth(),
+            controller_revision: self.revision,
+        }
+    }
+
+    /// Projects one Network, pairing its live snapshot with the durable label it is listed
+    /// under.
+    ///
+    /// The label comes from the durable record rather than the snapshot because the record
+    /// is the Operator's own name for the Network, and a diagnostic that showed an internal
+    /// identity instead would be the wrong one to copy into a support request.
+    fn project_one(
+        &self,
+        network: NetworkId,
+        inputs: &diagnostics::ProcessInputs,
+    ) -> Option<diagnostics::NetworkDiagnostics> {
+        let owner = self.live.get(&network)?;
+        let name = self
+            .records
+            .get(&network)
+            .map_or(String::new(), |record| record.display_name.clone());
+        diagnostics::project_network(&owner.snapshot.borrow(), &name, inputs)
+    }
+
     async fn dispatch(&mut self, request: ControlRequest) {
         match request {
             ControlRequest::Status { reply } => {
@@ -654,6 +714,37 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                     .map(|owner| owner.snapshot.borrow().advertisement.clone())
                     .unwrap_or_default();
                 let _ = reply.send(advertisement);
+            }
+            ControlRequest::Diagnostics { network, reply } => {
+                let inputs = self.diagnostic_inputs();
+                let report = match network {
+                    // A named Network reports only itself, and reports `NotFound` when it
+                    // has no live owner. Returning an empty-but-successful report would
+                    // let an Operator read "no problems" out of a typo.
+                    Some(network) => match self.project_one(network, &inputs) {
+                        Some(projected) => {
+                            Ok(diagnostics::project_process(&inputs)).map(|mut process| {
+                                process.networks = vec![projected];
+                                process
+                            })
+                        }
+                        None => Err(RuntimeError::UnknownNetwork),
+                    },
+                    None => {
+                        let mut process = diagnostics::project_process(&inputs);
+                        // Sorted so two reports of the same state are byte-identical: an
+                        // Operator diffing two diagnostics reads the order as meaning.
+                        let mut projected: Vec<_> = self
+                            .live
+                            .keys()
+                            .filter_map(|network| self.project_one(*network, &inputs))
+                            .collect();
+                        projected.sort_by(|left, right| left.network.cmp(&right.network));
+                        process.networks = projected;
+                        Ok(process)
+                    }
+                };
+                let _ = reply.send(report);
             }
             ControlRequest::Reconcile { network, reply } => {
                 let outcome = match self.live.get(&network) {

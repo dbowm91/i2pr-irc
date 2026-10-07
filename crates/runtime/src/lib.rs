@@ -138,6 +138,14 @@ pub enum RuntimeError {
     NickExhausted,
     #[error("invalid network configuration")]
     InvalidConfig,
+    /// No durable or live Network carries the requested identity.
+    ///
+    /// Distinct from [`RuntimeError::InvalidConfig`], which reports a Network that exists
+    /// and whose configuration was rejected. Administration has to tell those apart: the
+    /// first is a typo and the second is a broken record, and answering both with the same
+    /// message would teach an Operator that the bouncer's answer is not trustworthy.
+    #[error("no such network")]
+    UnknownNetwork,
     #[error("bounded output queue overloaded")]
     QueueOverloaded,
     #[error("connection generation space exhausted")]
@@ -1034,6 +1042,7 @@ pub(crate) fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
         Err(RuntimeError::Io(_)) => "io",
         Err(RuntimeError::Stopped) => "stopped",
         Err(RuntimeError::InvalidConfig) => "configuration",
+        Err(RuntimeError::UnknownNetwork) => "unknown-network",
         Err(RuntimeError::QueueOverloaded) => "queue-overload",
         Err(RuntimeError::GenerationExhausted) => "generation-exhausted",
         Err(RuntimeError::AmbiguousBuffer(_)) => "ambiguous-buffer",

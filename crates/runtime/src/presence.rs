@@ -138,13 +138,53 @@ pub fn away_decision(
     manual: Option<&str>,
     active_sessions: usize,
 ) -> Option<String> {
+    away_decision_with_origin(policy, manual, active_sessions).map(|(text, _)| text)
+}
+
+/// The away state and its [`AwayOrigin`] from the single precedence rule above.
+///
+/// [`away_decision`] delegates here so the text and the class can never disagree: there is
+/// one decision, and the two outputs are two views of it. A bouncer that classified the
+/// text separately would eventually disagree with itself about what its own policy did.
+pub fn away_decision_with_origin(
+    policy: PresencePolicy,
+    manual: Option<&str>,
+    active_sessions: usize,
+) -> Option<(String, AwayOrigin)> {
     if let Some(text) = manual {
-        return Some(text.to_owned());
+        return Some((text.to_owned(), AwayOrigin::Manual));
     }
     if policy.auto_away && active_sessions == 0 {
-        return Some(AUTO_AWAY_TEXT.to_owned());
+        return Some((AUTO_AWAY_TEXT.to_owned(), AwayOrigin::Automatic));
     }
     None
+}
+
+/// *Why* an away state is being held, for the diagnostics projection.
+///
+/// Recorded alongside the away text rather than re-derived from it at read time. The text
+/// is Operator- or bouncer-written free form, so classifying from it would mean string
+/// matching on a value the bouncer is free to change; the decision and the class come from
+/// the same [`away_decision`] call, so they cannot disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AwayOrigin {
+    /// The Operator asked to be away.
+    Manual,
+    /// The policy is on and no session counted as active.
+    Automatic,
+}
+
+impl AwayOrigin {
+    /// The fixed classification string shown in diagnostics.
+    ///
+    /// A closed set with a fixed spelling: a diagnostic reader parses these, so the set
+    /// cannot grow silently.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Automatic => "automatic",
+        }
+    }
 }
 
 /// Aggregated presence for one Network, generation-scoped except for manual-away.
@@ -207,6 +247,11 @@ impl PresenceState {
     /// What upstream should currently believe about our away state.
     pub fn away_state(&self, active_sessions: usize) -> Option<String> {
         away_decision(self.policy, self.manual_away.as_deref(), active_sessions)
+    }
+
+    /// The away state together with why it is being held, from the same rule.
+    pub fn away_state_with_origin(&self, active_sessions: usize) -> Option<(String, AwayOrigin)> {
+        away_decision_with_origin(self.policy, self.manual_away.as_deref(), active_sessions)
     }
 
     /// What upstream is currently being told.

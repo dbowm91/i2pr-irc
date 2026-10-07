@@ -29,6 +29,7 @@
 use crate::bouncer_networks::{self, BouncerCommand, BouncerError, SERVICE_NICK};
 use crate::bouncerserv::{self, ServCommand};
 use crate::controller::{ControlSnapshot, RuntimeControlHandle};
+use crate::diagnostics;
 use crate::session::SessionHandle;
 use i2pr_irc_core::NetworkId;
 use i2pr_irc_store::NetworkRecord;
@@ -363,6 +364,46 @@ impl ControlSurface {
                 record.sasl = None;
                 self.finish_unit(self.control.change(record).await, "", "Cleared credential")
             }
+            ServCommand::Diag => self.report_diagnostics(None).await,
+            ServCommand::DiagNetwork { network } => self.report_diagnostics(Some(network)).await,
+        }
+    }
+
+    /// Writes the bounded diagnostics report as tagged `NOTICE` lines.
+    ///
+    /// Sent as `NOTICE` rather than as `BOUNCER NET` lines on purpose: this reply is a
+    /// reading of live state, not an administration result, and reusing the administration
+    /// frame would make a client that watches `BOUNCER NET` treat a diagnostic as a network
+    /// change. The `bouncer-diag` tag is what actually separates them on the wire, and the
+    /// line is truncated upstream in `diagnostics` so it cannot split a message here.
+    async fn report_diagnostics(&mut self, selected: Option<NetworkId>) {
+        let report = match self.control.diagnostics(selected).await {
+            Ok(report) => report,
+            Err(error) => {
+                let reason = match (error, selected) {
+                    // A typo is the overwhelmingly likely cause and deserves a specific
+                    // answer; collapsing it into "not persisted" would send the Operator
+                    // looking at their storage instead of at their netid.
+                    (crate::RuntimeError::UnknownNetwork, Some(network)) => {
+                        BouncerError::NoSuchNetwork(network)
+                    }
+                    (crate::RuntimeError::QueueOverloaded, _) => BouncerError::Overloaded,
+                    _ => BouncerError::NotPersisted,
+                };
+                self.fail("DIAG", &reason);
+                return;
+            }
+        };
+        for line in diagnostics::render_process(&report) {
+            // The CRLF is part of the frame, not a decoration: `queue_line` refuses any
+            // line without one, and `write` discards the refusal, so a reply built without
+            // it would vanish without a trace.
+            self.write(&format!(
+                "@{tag} :{SERVICE_NICK} NOTICE {nick} :{fields}\r\n",
+                tag = line.tag,
+                nick = self.nick,
+                fields = line.fields
+            ));
         }
     }
 

@@ -95,6 +95,10 @@ pub enum ServCommand {
     },
     /// Forget a Network's credential.
     SaslReset { network: NetworkId },
+    /// Report the bounded process-wide diagnostics, with every live Network.
+    Diag,
+    /// Report one Network's bounded diagnostics.
+    DiagNetwork { network: NetworkId },
 }
 
 impl std::fmt::Debug for ServCommand {
@@ -133,6 +137,8 @@ impl std::fmt::Debug for ServCommand {
                 network, username, ..
             } => return write!(f, "SaslSet({network:?}, {username:?})"),
             Self::SaslReset { network } => return write!(f, "SaslReset({network:?})"),
+            Self::Diag => return write!(f, "Diag"),
+            Self::DiagNetwork { network } => return write!(f, "DiagNetwork({network:?})"),
         };
         f.write_str(name)
     }
@@ -161,6 +167,8 @@ pub const HELP_TEXT: &str = concat!(
     " | sasl status <netid>",
     " | sasl set <netid> user=<username> pass=<password>",
     " | sasl reset <netid>",
+    " | diag",
+    " | diag network <netid>",
 );
 
 /// Parses one command line.
@@ -312,6 +320,20 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
             }
             other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
         },
+        // `DIAG` is deliberately not an attribute-accepting command. There is no `filter=`
+        // or `detail=` word: a diagnostic surface that could be asked to render *less* would
+        // also be one that could be asked to render something else, and this surface has no
+        // second mode. Whole-process or one named Network, nothing in between.
+        "DIAG" => match word(1).to_ascii_uppercase().as_str() {
+            "" => {
+                if words.len() != 1 {
+                    return Err(BouncerError::Usage);
+                }
+                Ok(ServCommand::Diag)
+            }
+            "NETWORK" => Ok(ServCommand::DiagNetwork { network: netid(2)? }),
+            other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+        },
         other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
     }
 }
@@ -365,6 +387,8 @@ mod tests {
             "sasl status 1",
             "sasl set 1 user=bob pass=hunter2",
             "sasl reset 1",
+            "diag",
+            "diag network 1",
         ] {
             parse(line).unwrap_or_else(|error| panic!("{line:?} must parse: {error}"));
         }

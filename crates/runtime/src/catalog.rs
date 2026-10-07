@@ -248,6 +248,16 @@ impl NetworkCatalog {
         &self.reconnect
     }
 
+    /// Ingress depth of the store worker, read live.
+    ///
+    /// Live rather than ledger-sampled: the ledger's `store_queue` gauge is folded into a
+    /// snapshot and is only as fresh as the last bookkeeping call, whereas this is what the
+    /// worker's channel reports right now. Diagnostics wants the reading that would explain
+    /// a rejection happening this second.
+    pub fn store_queue_depth(&self) -> u64 {
+        i2pr_irc_store::STORE_QUEUE_CAPACITY.saturating_sub(self.store.queue_capacity()) as u64
+    }
+
     /// Process-wide bounded resource accounting.
     ///
     /// Handed to every owner so each publishes its own gauges; read through it to take a
