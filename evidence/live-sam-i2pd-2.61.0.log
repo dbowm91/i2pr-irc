@@ -1,22 +1,40 @@
+# i2pd 2.61.0 (0.9.70) — corrected STREAM ACCEPT qualification (Corrective 033)
+# Router: i2pd 2.61.0, SAM on 127.0.0.1:7656, HTTP/SOCKS proxies disabled.
+# Peer: independent Python harness. Connecting side: production i2pr-irc-sam SamProvider.
+# No Destination material is recorded below; only lengths.
+
 bridge: 127.0.0.1:7656
-  HELLO: PASS
-  peer SESSION ok in 24.0s id_echoed=False destlen=908
-  SESSION CREATE (independent peer): PASS — 24.0s
-  control SESSION ok in 30.0s id_echoed=False destlen=908
-  SESSION CREATE (owned topology): PASS — 30.0s
-  STREAM CONNECT: PASS — 0.6s, STREAM STATUS RESULT=OK
-  binary fixture reaches the peer: NOT RUN — 0 of 31 bytes
-  reply reaches the client: NOT RUN — 0 of 13 bytes
-  second stream reuses the session: PASS — STREAM STATUS RESULT=OK
+  HELLO (independent peer): PASS
+  SESSION CREATE (independent peer control socket): PASS — 27.0s, id_echoed=False, destlen=908
+  STREAM ACCEPT armed on a separate socket: PASS
+  inbound peer-Destination line: PASS — 524 characters
+  router blank line after the Destination line: PASS — i2pd 2.61.0 sent one; skipped exactly one
+  binary fixture reaches the peer (NUL, invalid UTF-8, CRLF, SAM text): PASS — exact bytes
+  production STREAM CONNECT (real SamProvider): PASS — 11.7s, 31 bytes out, 14 bytes back
+  reply reaches the production client: PASS — exact bytes
+  second STREAM ACCEPT armed: PASS
+  second payload reaches the peer: PASS — exact bytes
+  second STREAM CONNECT (same provider process): PASS — 1.8s
+  one session creation for two streams: PASS — session_creations=1 stream_successes=2
+  provider release leaves zero scope: PASS — release_ok=True live_scopes=0
 
 --- summary ---
-PASS     HELLO
-PASS     SESSION CREATE (independent peer) (24.0s)
-PASS     SESSION CREATE (owned topology) (30.0s)
-PASS     STREAM CONNECT (0.6s, STREAM STATUS RESULT=OK)
-NOT RUN  binary fixture reaches the peer (0 of 31 bytes)
-NOT RUN  reply reaches the client (0 of 13 bytes)
-PASS     second stream reuses the session (STREAM STATUS RESULT=OK)
+PASS     HELLO (independent peer)
+PASS     SESSION CREATE (independent peer control socket) (27.0s, id_echoed=False, destlen=908)
+PASS     STREAM ACCEPT armed on a separate socket
+PASS     inbound peer-Destination line (524 characters)
+PASS     router blank line after the Destination line (i2pd 2.61.0 sent one; skipped exactly one)
+PASS     binary fixture reaches the peer (NUL, invalid UTF-8, CRLF, SAM text) (exact bytes)
+PASS     production STREAM CONNECT (real SamProvider) (11.7s, 31 bytes out, 14 bytes back)
+PASS     reply reaches the production client (exact bytes)
+PASS     second STREAM ACCEPT armed
+PASS     second payload reaches the peer (exact bytes)
+PASS     second STREAM CONNECT (same provider process) (1.8s)
+PASS     one session creation for two streams (session_creations=1 stream_successes=2)
+PASS     provider release leaves zero scope (release_ok=True live_scopes=0)
 
-5 passed, 0 failed, 2 not run
-NOT RUN steps are reported as evidence unavailable, never as passes.
+13 passed, 0 failed, 0 not run
+Note: i2pd 2.61.0 sends a blank line after the peer-Destination line. The peer
+skips exactly one. A payload whose first byte is a newline is therefore
+indistinguishable from that blank line on this router, which is why every
+fixture used here begins with NUL.

@@ -1,6 +1,6 @@
 # I2P Router Integration Roadmap
 
-Status: corrective active — R001 implementation complete; Corrective 033 owns corrected live product-path evidence; R002/R003 gated
+Status: R001 conditionally closed — Corrective 033 closed 2026-10-07; R002/R003 gated
 
 Long-term references:
 
@@ -71,7 +71,7 @@ It does not use clearnet as a fallback when the router is unavailable.
 
 ## 4. Current state
 
-R001 implementation is complete through Plans 029-032, but its live product-path evidence is under Corrective 033 review.
+R001 implementation is complete through Plans 029-032, and Corrective 033 has since replaced its invalid live product-path evidence with a corrected full pass.
 
 Plans 029-031 remain technically closed:
 
@@ -82,17 +82,17 @@ Plans 029-031 remain technically closed:
 - SAM session loss is fenced/recreated under the existing reconnect scheduler;
 - no external SAM production dependency exists.
 
-Plan 032 historically conditionally closed R001 after live i2pd 2.61.0 evidence proved HELLO, SESSION CREATE, STREAM CONNECT and session reuse. Its application-byte failure, however, was produced by a qualification harness that treated the SESSION CREATE control socket as the inbound peer stream and never issued STREAM ACCEPT. That finding is therefore not valid negative product-path evidence until rerun with a correct inbound topology.
+Plan 032 historically conditionally closed R001 after live i2pd 2.61.0 evidence proved HELLO, SESSION CREATE, STREAM CONNECT and session reuse. Its application-byte failure, however, was produced by a qualification harness that treated the SESSION CREATE control socket as the inbound peer stream and never issued STREAM ACCEPT. That finding is therefore not valid negative product-path evidence.
 
-Corrective 033 is the strict current authority for R001 evidence. It must:
+**Corrective 033 closed on 2026-10-07 and supersedes that interpretation.** Its closure record is `plans/closure/router-integration/033-status.md`.
 
-- create an independent peer using SESSION CREATE plus a separate STREAM ACCEPT socket;
-- exercise the production Rust SamProvider on the connecting side;
-- prove exact bidirectional bytes or record a corrected attributable failure;
-- rerun session reuse with one persistent provider instance;
-- reconcile R001/R002 readiness from corrected evidence.
+With the corrected topology — an independent peer holding its session on one socket and arming STREAM ACCEPT on a second, with the production SamProvider on the connecting side — i2pd 2.61.0 carried the exact 31-byte and 14-byte fixtures in both directions, served two streams from one session on one provider instance, and released to zero live scope. Thirteen stages, no failures and no not-run rows.
 
-R002 remains blocked both on Corrective 033 closure and on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts.
+The corrective also found a real production defect that only a live router could expose: the owned client's HELLO classifier accepted Java I2P's bare `HELLO OK` and rejected the specification's canonical `HELLO REPLY RESULT=OK VERSION=3.1`, which is what i2pd sends. Every connect to i2pd failed at the handshake. The scripted loopback bridge answers the Java spelling, so the entire deterministic suite agreed with the bug. Fixed in `crates/sam/src/protocol.rs` with regression coverage for both spellings; no production API changed.
+
+R001 is therefore **conditionally closed on portability evidence only**: Java I2P and i2pr remain NOT RUN and cross-router interoperability remains unattempted. Nothing about the product path for i2pd 2.61.0 is in doubt.
+
+R002 remains blocked on its own managed-app interface prerequisites and on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts. Corrective 033 unblocked none of them; it removed only the obsolete reason that R001's product-path evidence was invalid.
 
 ## 5. Target architecture
 
@@ -161,8 +161,8 @@ R001-D / Plan 032 [historical conditional closure]
 live qualification
      |
      v
-Corrective 033 [ready]
-repair STREAM ACCEPT qualification
+Corrective 033 [closed 2026-10-07]
+repaired STREAM ACCEPT qualification
      |
      +----------------------+
      |                      |
@@ -174,9 +174,9 @@ integration                 (only if concrete need exists)
 Dependency classes:
 
 - Plans 029-031 are satisfied and closed.
-- Plan 032 is historically closed, but its stream-delivery interpretation is not current readiness authority because the peer harness omitted STREAM ACCEPT.
-- Corrective 033 is dependency-ready and owns corrected live product-path evidence.
-- R002 hard-depends on Corrective 033 closure plus the resulting R001 disposition, and interface-depends on stable written i2pr app contracts for I2P streams/local accepted streams/lifecycle.
+- Plan 032 is historically closed, and its stream-delivery interpretation is **superseded** by Corrective 033: the peer harness omitted STREAM ACCEPT, so it never built an inbound stream to measure.
+- Corrective 033 is closed and is the current readiness authority for R001 evidence.
+- R002 does not hard-depend on Corrective 033 any longer. It depends on its own managed-app interface prerequisites, and interface-depends on stable written i2pr app contracts for I2P streams/local accepted streams/lifecycle. It may be authored on the corrected R001 basis, but must not treat one router as sufficient for a managed-app data-transfer claim.
 - R003 has no automatic implementation eligibility; it requires a concrete product use case plus stable scoped i2pr/Proposal-170 semantics.
 
 ## 7. Milestones
@@ -198,7 +198,9 @@ Implementation decomposition:
 1. R001-A / Plan 029 — provider scope, lifecycle, and endpoint foundation. **Closed**; plans/closure/router-integration/029-status.md.
 2. R001-B / Plan 030 — owned SAM 3.1 wire/client foundation. **Closed**; plans/closure/router-integration/030-status.md.
 3. R001-C / Plan 031 — per-Network SAM provider integration. **Closed**; its hard dependency on 030 was satisfied and its own closure records five fixed defects plus the connect-budget reconciliation.
-4. R001-D / Plan 032 — cross-router qualification and R001 closure. **Closed.** i2pd 2.61.0 qualified to the stream-establishment stage; the byte-exchange and Java I2P/i2pr rows are recorded as not-run, and R001 closes conditionally rather than as a portable-SAM pass.
+4. R001-D / Plan 032 — cross-router qualification and R001 closure. **Closed, interpretation superseded.** i2pd 2.61.0 qualified to the stream-establishment stage; its byte-exchange rows were not-run because the harness never issued STREAM ACCEPT, and Corrective 033 has since replaced that evidence with a full pass. Java I2P and i2pr remain not-run, so R001 closes conditionally rather than as a portable-SAM pass.
+
+5. Corrective 033 — repair the STREAM ACCEPT qualification. **Closed 2026-10-07.** Full live pass on i2pd 2.61.0 through a real inbound accept, plus the production HELLO classifier fix it exposed.
 
 Required behavior:
 
@@ -358,11 +360,11 @@ Proposal 170 is not required for completion unless a later canonical product req
 
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
-| R001 | conditional / corrective active | Plans 029-032 + Corrective 033 | plans/closure/router-integration/032-status.md; future plans/closure/router-integration/033-status.md | Plan 032 stream-delivery finding requires corrected qualification |
+| R001 | conditionally closed | Plans 029-032 + Corrective 033 | plans/closure/router-integration/032-status.md; plans/closure/router-integration/033-status.md | Corrective 033 superseded Plan 032's stream-delivery finding with a full live pass; conditional only on Java I2P, i2pr, and cross-router evidence |
 | R001-A / Plan 029 | closed | plans/implementation/router-integration/029-r001a-provider-scope-lifecycle-and-endpoint-foundation.md | plans/closure/router-integration/029-status.md | none |
 | R001-B / Plan 030 | closed | plans/implementation/router-integration/030-r001b-owned-sam31-wire-client-foundation.md | plans/closure/router-integration/030-status.md | none |
 | R001-C / Plan 031 | closed | plans/implementation/router-integration/031-r001c-per-network-sam-provider-integration.md | plans/closure/router-integration/031-status.md | none |
-| R001-D / Plan 032 | historical closure | plans/implementation/router-integration/032-r001d-sam-cross-router-qualification-and-closure.md | plans/closure/router-integration/032-status.md | stream-delivery interpretation superseded pending Corrective 033 |
-| Corrective 033 | ready | plans/implementation/router-integration/033-r001-live-stream-accept-qualification-corrective.md | future plans/closure/router-integration/033-status.md | none |
-| R002 | blocked | future | future | Corrective 033/R001 disposition + stable i2pr app stream/listener/lifecycle contracts |
+| R001-D / Plan 032 | historical closure, superseded on Finding 1 | plans/implementation/router-integration/032-r001d-sam-cross-router-qualification-and-closure.md | plans/closure/router-integration/032-status.md | superseded by Corrective 033; closure-date typo recorded as an erratum |
+| Corrective 033 | closed 2026-10-07 | plans/implementation/router-integration/033-r001-live-stream-accept-qualification-corrective.md | plans/closure/router-integration/033-status.md | none |
+| R002 | blocked | future | future | its own managed-app interface prerequisites + stable i2pr app stream/listener/lifecycle contracts |
 | R003 | research-blocked | future only if justified | future | concrete product need + stable scoped control contract |

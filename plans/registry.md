@@ -27,19 +27,23 @@ Canonical direction:
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
 | Bouncer core | M005 closed | plans/subsystems/bouncer-core-roadmap.md | Plans 020-028 closed; M005 complete | M004, Corrective 019, and Plans 020-025 are closed. Research 006 and ADR-0003 freeze M005 control-session/runtime ownership. Plan 020 landed the bounded RuntimeController, pre-bind DownstreamAdmission, one-shot PreparedSession transfer, and schema 3. Plan 021 landed the typed DesiredChannelRecord, schema 4's durable detached flag, and the detach/reattach transitions. Plan 022 landed schema 5's auto_away and keep_nick policy, per-session active/passive classification with draft/pre-away mediation, owner-scoped manual away, a bounded deterministic nick fallback answered inside the registration window, and generation-owned reclaim. Plan 023 landed the soju.im/bouncer-networks draft, the local BouncerServ administration service, controller-allocated netids, a single-sourced I2P attribute profile, and snapshot-derived notification deltas. Plan 024 landed the soju.im/search adapter, schema 6's FTS5 side index and effective_time rule, indexed msgid and timestamp reference lookups, the HistoryPosition model for out-of-window references, and a two-seek AROUND. Plan 025 promoted server-time, standard-replies, cap-notify and draft/no-implicit-names, made echo-message conditional on the upstream negotiation, gave the tag surface and the refusal format a per-session third and dual form, and replaced the static capability list with one advertisement shared by the owner and the reader. Plan 026 accepted extended-join, account-notify, away-notify, multi-prefix and setname as a set whose downstream advertisement is conditional on the upstream acknowledgement, recorded account-tag, chghost, invite-notify and extended-monitor as deliberately deferred with stated reasons, added bounded observed member metadata with a three-state account model, mediated extended JOINs and prefix runs per session across NAMES and routed WHO and WHOIS, and made registration read the Network's live advertisement. Plan 027 landed the bounded secret-free diagnostics surface read from the live owners, the versioned local configuration snapshot format with plan-then-apply import and a stored-credential merge, and the bounded allowlisted registration actions with schema 7 and a replay runner that emits them after every successful generation; it also recorded a pre-existing finding that a generation teardown takes about 120 s to be noticed, which Plan 028 resolved. Plan 028 qualified M005 as one integrated product and **closed the milestone**. The integrated pass found three production defects that eight per-subsystem suites had each correctly passed over: the connect rate limiter could hang, because `ReconnectScheduler::acquire` parked on a notification while the token gate frees on a clock that notifies nothing, so every Network past `MAX_CONNECT_BURST` could stay unconnected forever on a cold start; `ControlSnapshot` answered from memory, because `publish()` ran only from `commit()`, so a Network with two live sessions reported `attached=0 phase=idle` until an unrelated edit happened; and `registration_actions`, `clients` and `network_secrets` were missing from `REQUIRED_TABLES`, so a database declaring the current version without them opened successfully and failed later. Plan 028 also **withdrew** Plan 027's teardown finding as a fixture defect -- `drop_generation` silently matched nothing, so the test measured `LIVENESS_DEADLINE` rather than the bouncer, which ends a generation on end-of-stream immediately. |
-| I2P router integration | corrective active | plans/subsystems/i2p-router-integration-roadmap.md | Corrective 033 ready | Plans 029-031 remain closed and the owned SAM implementation is complete. Plan 032's live i2pd handshake/session/CONNECT evidence remains historical, but its "no application bytes" finding came from an invalid peer topology that omitted STREAM ACCEPT and is not current product-path evidence. Corrective 033 is the strict readiness authority: it must rerun i2pd with an independent ACCEPT peer and the real Rust SamProvider on the connecting side. R002 remains blocked on that corrected R001 disposition plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts. |
+| I2P router integration | R001 conditionally closed | plans/subsystems/i2p-router-integration-roadmap.md | Corrective 033 closed | Corrective 033 closed on 2026-10-07 after a full live pass against i2pd 2.61.0: exact bidirectional application bytes crossed an I2P stream between an independently implemented accepting peer and the production SamProvider, on one provider instance, with one session creation serving both streams and an explicit release leaving zero scope. Plan 032's "no application bytes" finding is **superseded** — its peer never issued STREAM ACCEPT, so it measured a socket arrangement SAM does not define. The corrective also found and fixed a real production defect: the owned client's HELLO classifier rejected the specification's canonical `HELLO REPLY RESULT=OK VERSION=3.1`, so every connect to i2pd failed at the handshake; the scripted bridge answered the Java form and agreed with the bug. R001 is now conditional solely on portability evidence: Java I2P and i2pr are NOT RUN, and cross-router interoperability is not attempted. R002 remains blocked on its own managed-app interface prerequisites plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
+No implementation plan is active or dependency-ready. Corrective 033 closed on 2026-10-07;
+the next router plan is R002, which is blocked on its own prerequisites rather than on
+R001's disposition.
+
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Router Corrective 033 — Repair Live SAM STREAM Qualification | ready | qualification corrective | plans/subsystems/i2p-router-integration-roadmap.md | future plans/closure/router-integration/033-status.md |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
-| Router R001-D / Plan 032 — SAM Cross-Router Qualification and R001 Closure | historical closure | capability qualification | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/032-status.md |
+| Router Corrective 033 — Repair Live SAM STREAM Qualification | closed | qualification corrective | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/033-status.md |
+| Router R001-D / Plan 032 — SAM Cross-Router Qualification and R001 Closure | historical closure, superseded on Finding 1 by Corrective 033 | capability qualification | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/032-status.md |
 | Router R001-C / Plan 031 — Per-Network SAM Provider Integration | closed | invariant + capability | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/031-status.md |
 | Router R001-B / Plan 030 — Owned SAM 3.1 Wire/Client Foundation | closed | infrastructure + invariant | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/030-status.md |
 | Router R001-A / Plan 029 — Provider Scope, Lifecycle, and Endpoint Foundation | closed | invariant + infrastructure | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/029-status.md |
@@ -76,13 +80,14 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Router R002 — i2pr Managed-App Adapter | blocked | Corrective 033/R001 disposition plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts | no implementation handoff yet |
+| Router R002 — i2pr Managed-App Adapter | blocked | its own managed-app interface prerequisites, plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts | no implementation handoff yet |
 
 ## Unplanned later milestones
 
-R001 is planned and registered. Later router milestones remain outside the current handoff:
+R001 is conditionally closed on corrected evidence. Later router milestones remain outside
+the current handoff:
 
-- Router R002 — i2pr managed-app adapter, blocked on R001 closure plus stable public app stream/listener/lifecycle contracts;
+- Router R002 — i2pr managed-app adapter, blocked on its own managed-app interface prerequisites plus stable public app stream/listener/lifecycle contracts. It may be authored on the corrected R001 basis: the SAM adapter's ability to carry application bytes is established for i2pd 2.61.0 rather than assumed from an invalid run. It must not treat one router as sufficient for a managed-app data-transfer claim;
 - Router R003 — optional scoped Proposal 170/control integration, research-blocked until a concrete product need exists.
 
 ## Accepted architecture decisions
@@ -119,12 +124,25 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Implement only:
+Implement nothing from the router milestone until a successor plan is registered.
 
-- plans/implementation/router-integration/033-r001-live-stream-accept-qualification-corrective.md
+Corrective 033 closed on 2026-10-07. Its closure record,
+`plans/closure/router-integration/033-status.md`, supersedes Plan 032 Finding 1: that
+finding measured a harness that never issued `STREAM ACCEPT`, so it never built an inbound
+stream to measure. The corrected run proves exact bidirectional bytes through a real inbound
+`STREAM ACCEPT` between an independent peer and the production `SamProvider`.
 
-Corrective 033 repairs the live R001 evidence rather than redesigning production SAM. The independent peer must use SESSION CREATE plus a separate STREAM ACCEPT socket, while the connecting side must use the actual Rust SamProvider/I2pStreamProvider path. The run must measure exact bidirectional bytes, second-stream session reuse, and provider release against i2pd where available.
+R001 stays conditionally closed, now blocked only on portability evidence that was never
+produced: Java I2P and i2pr are NOT RUN, and cross-router interoperability is not
+attempted.
 
-Plan 032 remains a historical conditional closure, but its "no application bytes traversed" finding is not current readiness evidence because the peer never issued STREAM ACCEPT. Corrective 033 will supersede that interpretation with corrected live evidence and record the Plan 032 closure-date typo as an erratum.
+R002 remains blocked on its own prerequisites — a managed-app interface, an i2pr integration
+consuming public managed-app capabilities, and a reviewable data-transfer surface — plus the
+separate public i2pr stream/listener/lifecycle contracts. Corrective 033 unblocked none of
+them. R003 remains research-blocked.
 
-R002 remains blocked until Corrective 033 closes and the separate public i2pr managed-app stream/listener/lifecycle contracts are stable. R003 remains research-blocked.
+One pre-existing verification gap is recorded rather than worked around:
+`rustup run 1.88.0 sh scripts/verify.sh full` fails on `crates/core/src/lib.rs` with
+`clippy::uninlined_format_args`, a lint that fires only on the older toolchain. It fails
+identically on the pre-corrective baseline. Fixing `crates/core` is not part of any open
+plan.

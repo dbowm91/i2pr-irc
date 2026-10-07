@@ -100,17 +100,34 @@ pub fn classify(phase: SamState, line: &str) -> Result<Transition, SamError> {
     match phase {
         SamState::AwaitingHello => match reply.verb() {
             "HELLO" => {
-                // Java I2P answers a bare `HELLO OK`; some builds answer
-                // `HELLO OK VERSION ...`. Both are success, and the bare form has no
-                // `=` in the token at all, so it arrives as a valueless option.
-                if reply.contains("OK") || reply.has("OK", "true") {
+                // Two documented success shapes, and this client must speak to both routers.
+                //
+                // The specification's canonical reply is
+                // `HELLO REPLY RESULT=OK VERSION=3.1`, which is what i2pd sends.
+                // Java I2P answers a bare `HELLO OK`, and some builds answer
+                // `HELLO OK VERSION ...`. The bare form has no `=` in the token at all,
+                // so it arrives as a valueless option rather than as `RESULT=OK`.
+                //
+                // Accepting only the Java form made every connect to i2pd fail at the
+                // handshake, and nothing else in the workspace could have found it: the
+                // scripted bridge answers `HELLO OK`, so the deterministic suite agreed
+                // with the narrower rule. That is the shape of defect a real-router
+                // qualification exists to catch, and it is why this comment names the
+                // router rather than only the tokens.
+                let ok =
+                    reply.contains("OK") || reply.has("OK", "true") || reply.has("RESULT", "OK");
+                if ok {
                     Ok(Transition::Hello(HelloReply::Ok31 {
                         min: reply.value("MIN").and_then(|value| value.parse().ok()),
                         max: reply.value("MAX").and_then(|value| value.parse().ok()),
                     }))
-                } else if reply.contains("NOVERSION") {
+                } else if reply.has("RESULT", "NOVERSION") || reply.contains("NOVERSION") {
                     Ok(Transition::Hello(HelloReply::NoVersion))
                 } else {
+                    // Notably `HELLO REPLY RESULT=I2P_ERROR MESSAGE="..."`, which is a
+                    // failed handshake rather than a version disagreement. Mapping it to
+                    // `NoVersion` would send the operator looking at a protocol version
+                    // when the bridge was reporting something else entirely.
                     Err(unexpected("HELLO"))
                 }
             }
@@ -297,7 +314,16 @@ mod tests {
     /// Both routers' `HELLO` spellings, because they genuinely differ.
     #[test]
     fn hello_ok_is_recognised_in_both_router_spellings() {
-        for line in ["HELLO OK", "HELLO OK VERSION MIN=3.1 MAX=3.1"] {
+        // The specification's canonical reply, which i2pd sends, and Java I2P's bare form.
+        // The first of these is the regression: an owned client that only accepted the
+        // bare `HELLO OK` could not complete a handshake with i2pd at all, and the
+        // scripted bridge — which answers the bare form — agreed with it.
+        for line in [
+            "HELLO OK",
+            "HELLO OK VERSION MIN=3.1 MAX=3.1",
+            "HELLO REPLY RESULT=OK VERSION=3.1",
+            "HELLO REPLY RESULT=OK",
+        ] {
             let transition = classify(SamState::AwaitingHello, line).expect("a hello parses");
             assert!(
                 matches!(transition, Transition::Hello(HelloReply::Ok31 { .. })),
@@ -313,11 +339,29 @@ mod tests {
 
     #[test]
     fn hello_noversion_is_a_terminal_failure() {
-        let transition =
-            classify(SamState::AwaitingHello, "HELLO NOVERSION").expect("a hello parses");
-        assert_eq!(transition, Transition::Hello(HelloReply::NoVersion));
-        assert_eq!(transition.as_error(), Some(SamError::UnsupportedVersion));
-        assert_eq!(transition.next_state(SamState::AwaitingHello), None);
+        for line in ["HELLO NOVERSION", "HELLO REPLY RESULT=NOVERSION"] {
+            let transition = classify(SamState::AwaitingHello, line).expect("a hello parses");
+            assert_eq!(transition, Transition::Hello(HelloReply::NoVersion));
+            assert_eq!(transition.as_error(), Some(SamError::UnsupportedVersion));
+            assert_eq!(transition.next_state(SamState::AwaitingHello), None);
+        }
+    }
+
+    /// A bridge reporting a handshake error is not a version disagreement.
+    ///
+    /// Mapping `RESULT=I2P_ERROR` onto `NoVersion` would send an operator looking at a
+    /// protocol version when the bridge was reporting something else entirely.
+    #[test]
+    fn hello_i2p_error_is_a_failure_and_not_a_version_disagreement() {
+        let error = classify(
+            SamState::AwaitingHello,
+            "HELLO REPLY RESULT=I2P_ERROR MESSAGE=\"Timeout waiting for HELLO VERSION\"",
+        )
+        .expect_err("an I2P_ERROR hello is not a success");
+        assert!(
+            !matches!(error, SamError::UnsupportedVersion),
+            "a handshake error must not read as an unsupported version: {error:?}"
+        );
     }
 
     /// The sequencing claim, in every wrong order.

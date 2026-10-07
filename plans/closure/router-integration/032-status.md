@@ -1,5 +1,19 @@
 # Plan 032 — R001-D SAM Cross-Router Qualification and R001 Closure
 
+> **Administrative erratum, recorded 2026-10-07 by Corrective 033.** The heading below
+> reads "Closed 2026-10-08"; the closure commit landed on 2026-10-07. The date is left
+> as written rather than rewritten in place, so this record still says what it said when
+> it was written.
+>
+> **Supersession.** The application-byte finding below is **superseded** by
+> `plans/closure/router-integration/033-status.md`. Its harness treated the `SESSION
+> CREATE` control socket as the inbound peer stream and never issued `STREAM ACCEPT`, so it
+> never built an inbound stream to measure. The corrected topology carried the exact
+> fixtures in both directions against the same router. Every substantive statement in this
+> record is left untouched and remains accurate as a historical account of what was
+> believed at closure; it is simply no longer the current readiness evidence.
+
+
 Closed 2026-10-08. Outcome: **R001-D closed. R001 is CONDITIONALLY CLOSED.**
 Implementation is complete and one live router (i2pd 2.61.0) was qualified far enough to
 prove SAM handshake, session creation, stream establishment, and session reuse against an

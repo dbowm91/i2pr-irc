@@ -198,8 +198,32 @@ that the deterministic suites could not have told us:
   with `i2cp.dontPublishLeaseSet=false`. This adapter keeps `=true`, which is correct for a
   client that never needs to be reachable.
 
-Carrying application bytes through a live I2P stream is **not** established; see
-`plans/closure/router-integration/032-status.md`.
+Carrying application bytes through a live I2P stream is **established for i2pd 2.61.0**.
+The first attempt to show it did not; see [below](#live-qualification). Java I2P and i2pr
+were never available, so portability remains evidence-blocked rather than passed.
+
+### Live qualification
+
+`scripts/live-sam-qualify.py` is the live harness. It drives the **independent peer** side
+and instructs `crates/sam/examples/live-qualify-probe.rs`, a cargo example built from this
+crate, to do the **connecting** side with the real `SamProvider` and the real
+`I2pStreamProvider::connect`. The split is the point: the peer shares no code with this
+crate, and the connecting side is the code that ships.
+
+An inbound peer holds its session on one socket and arms `STREAM ACCEPT` on a second. The
+accept socket carries, in order, `STREAM STATUS RESULT=OK`, the connecting peer's
+Destination line, and then raw application bytes. i2pd 2.61.0 additionally writes one blank
+line after the Destination line; the peer skips exactly one and reports it as its own stage.
+
+Corrective 033 replaced an earlier harness that treated the `SESSION CREATE` control socket
+as the inbound stream. SAM does not deliver inbound data there, so that harness never built
+an inbound stream to measure, and its "0 bytes traversed" result described its own topology
+rather than the router. See `plans/closure/router-integration/033-status.md`.
+
+The corrected run also exposed a defect no scripted fixture could: this crate accepted Java
+I2P's bare `HELLO OK` and rejected the specification's canonical
+`HELLO REPLY RESULT=OK VERSION=3.1`, so every connect to i2pd failed at the handshake. The
+loopback bridge answers the Java spelling, so the deterministic suite agreed with the bug.
 
 ## What this crate does not know
 

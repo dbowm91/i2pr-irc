@@ -1,6 +1,6 @@
 # Router Integration Corrective 033 — Repair Live SAM STREAM Qualification
 
-Status: ready for handoff
+Status: closed 2026-10-07 — see plans/closure/router-integration/033-status.md
 
 Repository baseline:
 

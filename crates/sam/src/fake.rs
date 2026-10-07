@@ -635,54 +635,505 @@ impl FakeIrcPeer {
 /// How long one pass of [`FakeIrcPeer::recv`] waits on a single stream before moving on.
 const POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::net::TcpStream;
+// ------------------------------------------------- the inbound (ACCEPT) side
 
-    #[tokio::test]
-    async fn the_fake_records_requests_and_counts_connections() {
-        let bridge = FakeBridge::start(Script {
-            hello: vec![hello_ok()],
-            ..Script::default()
-        })
-        .await;
-        let mut stream = TcpStream::connect(bridge.endpoint().socket_addr())
-            .await
-            .expect("the fake accepts on loopback");
-        stream
-            .write_all(&line("HELLO VERSION MIN=3.1 MAX=3.1"))
-            .await
-            .expect("the request is written");
-        let mut reply = [0u8; 64];
-        let count = stream.read(&mut reply).await.expect("a reply arrives");
-        assert_eq!(&reply[..count], b"HELLO OK\r\n");
-        // The recording happens on the serving task, so poll for it rather than
-        // assuming it has already run.
-        for _ in 0..100 {
-            if !bridge.requests().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+/// Ceiling on the peer-Destination line an accept socket delivers before raw bytes.
+///
+/// The same bound the client's own line reader enforces. This is a fixture, but a fixture
+/// that read an unbounded line would model the exact defect the fixture exists to detect,
+/// so the ceiling is the one a conforming peer needs.
+pub const MAX_ACCEPT_DESTINATION_LINE: usize = crate::line::MAX_SAM_LINE_BYTES;
+
+/// Ceiling on accepts a peer may have armed at once.
+///
+/// Explicit because the registry is fed by network-triggered events. Refusal is returned
+/// rather than silently dropped, so a test that exceeded it can say so.
+pub const MAX_ARMED_ACCEPTS: usize = 8;
+
+/// Ceiling on one inbound application read, so no read in this file is unbounded.
+const MAX_INBOUND_READ: usize = 16 * 1024;
+
+/// How long an armed accept waits for a connection, a line, or a payload before giving up.
+///
+/// Short, because everything here is a loopback fixture: a long budget would only make a
+/// designed failure take longer to observe. Bounded is the property; generous is not.
+const ACCEPT_BUDGET: Duration = Duration::from_secs(10);
+
+/// What the bridge delivers on the accept socket once a connection lands.
+///
+/// Three shapes, because the raw transition is the property under test and a fixture that
+/// only produces the happy case cannot test it.
+#[derive(Debug, Clone)]
+pub enum Prelude {
+    /// A Destination line and the first application bytes, written in one `write_all`.
+    ///
+    /// One write is the point: it makes the two arrive in one TCP segment, so a reader
+    /// that discards whatever it read past the newline loses bytes here.
+    Destination {
+        destination: Vec<u8>,
+        payload: Vec<u8>,
+    },
+    /// No Destination line at all: raw bytes start immediately.
+    Missing,
+    /// A Destination line longer than [`MAX_ACCEPT_DESTINATION_LINE`].
+    Oversized,
+}
+
+impl Default for Prelude {
+    fn default() -> Self {
+        Self::Destination {
+            // Fake key material, same shape as `session_ok_with_destination`. No coalesced
+            // payload by default, so the default prelude is exactly one line; the
+            // coalescing case is its own configuration and its own test.
+            destination: "Q".repeat(600).into_bytes(),
+            payload: Vec::new(),
         }
-        assert_eq!(
-            bridge.requests(),
-            vec!["HELLO VERSION MIN=3.1 MAX=3.1".to_owned()],
-            "the request is recorded verbatim"
-        );
-        assert_eq!(bridge.connections(), 1);
+    }
+}
+
+/// How the fake bridge answers the inbound side.
+#[derive(Debug, Clone, Default)]
+pub struct AcceptConfig {
+    /// The reply to `STREAM ACCEPT`, when it is not the conforming `RESULT=OK`.
+    ///
+    /// `None` means a conforming bridge. `Some(...)` exists so a test can check the
+    /// *peer's* fail-closed behaviour, which is the other half of the raw transition.
+    pub accept_status: Option<Vec<u8>>,
+    /// What the accept socket carries once a connection arrives.
+    pub prelude: Prelude,
+}
+
+/// Why an inbound accept could not be armed or completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptError {
+    /// The accept socket closed before the expected bytes arrived.
+    Closed,
+    /// A line exceeded the ceiling.
+    PreludeTooLong,
+    /// No connection or line arrived within the budget.
+    TimedOut,
+    /// The bridge refused the accept, or never acknowledged it `RESULT=OK`.
+    Refused,
+}
+
+/// An accept that has been armed on its own socket and is waiting for a connection.
+///
+/// Owned by the test. Holding the accept socket here is what keeps the peer session alive
+/// for the accept's lifetime, which is the property the previous live harness got wrong
+/// by reusing the `SESSION CREATE` control socket.
+pub struct ArmedAccept {
+    /// The accept socket itself.
+    ///
+    /// Held so the connection the bridge acknowledged stays open for the accept's whole
+    /// lifetime. Dropping it would end the accept, not just release the socket.
+    _socket: TcpStream,
+    /// The connection the bridge routed here, and the prelude it put on this accept.
+    arriving: tokio::sync::oneshot::Receiver<Arrived>,
+}
+
+/// A connection the bridge routed to an armed accept.
+struct Arrived {
+    /// The connecting socket, now raw in both directions.
+    connecting: TcpStream,
+    /// What the bridge wrote on the accept before the application started.
+    ///
+    /// Bytes the bridge authored, not the test's. A test that could write its own
+    /// Destination line would be able to make the transition pass by construction.
+    prelude: Vec<u8>,
+}
+
+impl ArmedAccept {
+    /// Completes the raw transition and returns the application stream.
+    ///
+    /// Reads the accept socket's prelude in order — the peer-Destination line, then raw
+    /// application bytes — and only then returns a stream on which application bytes can
+    /// appear. Bytes already read past the line are kept rather than dropped, which is the
+    /// property this fixture exists to check.
+    ///
+    /// A missing line fails on a bounded wait rather than by parsing: waiting is what a
+    /// real peer does, and it is the behaviour worth having under test.
+    pub async fn incoming(self) -> Result<(PeerStream, Vec<u8>), AcceptError> {
+        let ArmedAccept { _socket, arriving } = self;
+        let Arrived {
+            connecting,
+            prelude,
+        } = match tokio::time::timeout(ACCEPT_BUDGET, arriving).await {
+            Ok(Ok(arrived)) => arrived,
+            Ok(Err(_)) => return Err(AcceptError::Refused),
+            Err(_) => return Err(AcceptError::TimedOut),
+        };
+
+        // After the transition both ends are raw, in both directions, until either closes.
+        // The pairing is read-from-one/write-to-the-other in each direction; crossing them
+        // would compile-fail here rather than silently unidirectional.
+        let (mine, theirs) = tokio::io::duplex(MAX_INBOUND_READ);
+
+        // The prelude goes in before the relay starts, so the Destination line is read
+        // ahead of any application byte. Written as one segment where the config says so,
+        // which is what makes a reader that discards its read tail lose bytes here.
+        let mut opening = mine;
+        opening
+            .write_all(&prelude)
+            .await
+            .map_err(|_| AcceptError::Closed)?;
+        let _ = opening.flush().await;
+
+        let (mut peer_reader, mut peer_writer) = tokio::io::split(opening);
+        let (mut client_reader, mut client_writer) = tokio::io::split(connecting);
+        // Connecting peer -> accepting peer.
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut client_reader, &mut peer_writer).await;
+        });
+        // Accepting peer -> connecting peer.
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut peer_reader, &mut client_writer).await;
+        });
+
+        // The Destination line comes off the same stream the application bytes will, so
+        // this read is the transition rather than a separate handshake.
+        let mut stream = PeerStream {
+            inner: theirs,
+            buffered: Vec::new(),
+        };
+        let destination_line = stream.read_destination_line().await?;
+        Ok((stream, destination_line))
+    }
+}
+
+/// The raw application stream, as the accepting peer sees it.
+///
+/// Bytes read past the Destination newline are kept here rather than discarded, so the
+/// first application read is exact even when the bridge coalesced the prelude and the
+/// payload into one segment.
+pub struct PeerStream {
+    inner: tokio::io::DuplexStream,
+    buffered: Vec<u8>,
+}
+
+impl PeerStream {
+    /// Reads the peer-Destination line, keeping any bytes that arrived past its newline.
+    ///
+    /// Bounded on both ends. A ceiling rather than "read until a newline shows up", since
+    /// an unbounded line is exactly the thing a router on the other end controls.
+    async fn read_destination_line(&mut self) -> Result<Vec<u8>, AcceptError> {
+        loop {
+            if let Some(end) = line_end(&self.buffered) {
+                if end > MAX_ACCEPT_DESTINATION_LINE {
+                    return Err(AcceptError::PreludeTooLong);
+                }
+                return Ok(self.buffered.drain(..end).collect());
+            }
+            if self.buffered.len() > MAX_ACCEPT_DESTINATION_LINE {
+                return Err(AcceptError::PreludeTooLong);
+            }
+            self.fill().await?;
+        }
     }
 
-    /// The fake is bound to loopback only, like the real client must be.
-    #[test]
-    fn the_fake_binds_loopback_and_nothing_else() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().expect("the literal parses");
-        assert!(addr.ip().is_loopback());
+    /// Reads exactly `count` bytes, taking anything already buffered first.
+    pub async fn read_exact(&mut self, count: usize) -> Result<Vec<u8>, AcceptError> {
+        while self.buffered.len() < count {
+            self.fill().await?;
+        }
+        let taken: Vec<u8> = self.buffered.drain(..count).collect();
+        Ok(taken)
     }
 
-    /// A helper that cannot accidentally become a wildcard bind.
-    #[test]
-    fn the_bind_literal_is_loopback() {
-        assert_eq!(FAKE_BIND, "127.0.0.1:0");
+    /// Writes application bytes toward the connecting peer.
+    pub async fn write_all(&mut self, bytes: &[u8]) -> Result<(), AcceptError> {
+        self.inner
+            .write_all(bytes)
+            .await
+            .map_err(|_| AcceptError::Closed)
+    }
+
+    /// Pulls one bounded read into the buffer, or reports why it could not.
+    async fn fill(&mut self) -> Result<(), AcceptError> {
+        let mut chunk = vec![0u8; MAX_INBOUND_READ];
+        let read = tokio::time::timeout(ACCEPT_BUDGET, self.inner.read(&mut chunk))
+            .await
+            .map_err(|_| AcceptError::TimedOut)?;
+        let count = read.map_err(|_| AcceptError::Closed)?;
+        if count == 0 {
+            return Err(AcceptError::Closed);
+        }
+        self.buffered.extend_from_slice(&chunk[..count]);
+        Ok(())
+    }
+}
+
+/// The index just past the first `\n` in a buffer, if it holds one.
+fn line_end(buffered: &[u8]) -> Option<usize> {
+    buffered
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+}
+
+/// A running fake bridge that serves both the connecting side and the inbound side.
+///
+/// Separate from [`FakeBridge`] because the two answer different questions. This one
+/// exists to check that a `STREAM CONNECT` reaches an accept armed on its **own** socket,
+/// which is the topology the previous live harness never built.
+pub struct FakeSamPeer {
+    addr: SocketAddr,
+    accepts: Arc<std::sync::Mutex<Vec<PendingAccept>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl FakeSamPeer {
+    /// Binds a loopback listener that answers both directions.
+    pub async fn start(config: AcceptConfig) -> Self {
+        let listener = TcpListener::bind(FAKE_BIND)
+            .await
+            .expect("the fake peer binds a loopback port");
+        let addr = listener
+            .local_addr()
+            .expect("the bound address is readable");
+        let accepts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = tokio::spawn(serve_inbound(listener, config, Arc::clone(&accepts)));
+        Self {
+            addr,
+            accepts,
+            handle,
+        }
+    }
+
+    /// The loopback address to hand to a client.
+    pub fn endpoint(&self) -> crate::endpoint::SamBridgeEndpoint {
+        crate::endpoint::SamBridgeEndpoint::parse(&self.addr.to_string())
+            .expect("a bound loopback address is a valid bridge endpoint")
+    }
+
+    /// How many accepts are armed and waiting for a connection.
+    pub fn armed(&self) -> usize {
+        self.accepts
+            .lock()
+            .expect("the accept registry is readable")
+            .len()
+    }
+
+    /// Opens a control socket, says `HELLO`, and creates a session.
+    ///
+    /// Returns the socket and the Destination the bridge minted. The socket is returned so
+    /// the caller can hold the session open; an accept issued on *this* socket has nowhere
+    /// to deliver a connection, which is why [`FakeSamPeer::open_accept`] opens another.
+    pub async fn create_session(&self) -> Result<(TcpStream, Vec<u8>), AcceptError> {
+        let mut socket = TcpStream::connect(self.addr)
+            .await
+            .map_err(|_| AcceptError::Refused)?;
+        let (mut lines, mut chunk) = say_hello(&mut socket).await?;
+        socket
+            .write_all(&line(
+                "SESSION CREATE STYLE=STREAM ID=peer DESTINATION=TRANSIENT",
+            ))
+            .await
+            .map_err(|_| AcceptError::Refused)?;
+        let reply = read_line(&mut socket, &mut lines, &mut chunk)
+            .await
+            .ok_or(AcceptError::Closed)?;
+        let destination = reply
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("DESTINATION="))
+            .ok_or(AcceptError::Refused)?
+            .as_bytes()
+            .to_vec();
+        Ok((socket, destination))
+    }
+
+    /// Opens a second socket, says `HELLO`, and arms `STREAM ACCEPT` for `session_id`.
+    ///
+    /// Returns once the bridge has acknowledged the accept `RESULT=OK`. The caller then
+    /// drives it with [`ArmedAccept::incoming`], which is where the raw transition happens.
+    pub async fn open_accept(&self, session_id: &str) -> Result<ArmedAccept, AcceptError> {
+        {
+            let registry = self
+                .accepts
+                .lock()
+                .expect("the accept registry is readable");
+            if registry.len() >= MAX_ARMED_ACCEPTS {
+                return Err(AcceptError::Refused);
+            }
+        }
+        let mut socket = TcpStream::connect(self.addr)
+            .await
+            .map_err(|_| AcceptError::Refused)?;
+        let (mut lines, mut chunk) = say_hello(&mut socket).await?;
+        socket
+            .write_all(&line(&format!(
+                "STREAM ACCEPT ID={session_id} SILENT=false"
+            )))
+            .await
+            .map_err(|_| AcceptError::Refused)?;
+        let status = read_line(&mut socket, &mut lines, &mut chunk)
+            .await
+            .ok_or(AcceptError::Closed)?;
+        if !status.contains("RESULT=OK") {
+            return Err(AcceptError::Refused);
+        }
+        // Registered only once the accept is acknowledged, so a `STREAM CONNECT` that
+        // arrives cannot find a half-armed accept.
+        let (arrived, arriving) = tokio::sync::oneshot::channel();
+        self.accepts
+            .lock()
+            .expect("the accept registry is writable")
+            .push(PendingAccept {
+                session_id: session_id.to_owned(),
+                arrived,
+            });
+        Ok(ArmedAccept {
+            _socket: socket,
+            arriving,
+        })
+    }
+}
+
+impl Drop for FakeSamPeer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Sends `HELLO` and drains the acknowledgement, so later reads start clean.
+async fn say_hello(socket: &mut TcpStream) -> Result<(LineAccumulator, [u8; 512]), AcceptError> {
+    socket
+        .write_all(&line("HELLO VERSION MIN=3.1 MAX=3.1"))
+        .await
+        .map_err(|_| AcceptError::Refused)?;
+    let mut reader = LineAccumulator::default();
+    let mut chunk = [0u8; 512];
+    while reader.take_line().is_none() {
+        let count = socket
+            .read(&mut chunk)
+            .await
+            .map_err(|_| AcceptError::Refused)?;
+        if count == 0 {
+            return Err(AcceptError::Refused);
+        }
+        reader.push(&chunk[..count]);
+    }
+    Ok((reader, chunk))
+}
+
+/// Reads one more complete line, returning `None` if the peer hangs up first.
+async fn read_line(
+    socket: &mut TcpStream,
+    reader: &mut LineAccumulator,
+    chunk: &mut [u8],
+) -> Option<String> {
+    loop {
+        match socket.read(chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(count) => reader.push(&chunk[..count]),
+        }
+        if let Some(line) = reader.take_line() {
+            return Some(line);
+        }
+    }
+}
+
+/// An accept waiting inside a serving task for a connection to be routed to it.
+struct PendingAccept {
+    session_id: String,
+    arrived: tokio::sync::oneshot::Sender<Arrived>,
+}
+
+/// Pops the oldest armed accept, if any.
+///
+/// Its own function so the `std::sync::MutexGuard` is released before the caller's first
+/// `await`; a guard held across a suspension would make every caller `!Send`.
+fn take_pending(accepts: &Arc<std::sync::Mutex<Vec<PendingAccept>>>) -> Option<PendingAccept> {
+    let mut registry = accepts.lock().expect("the accept registry is writable");
+    (!registry.is_empty()).then(|| registry.remove(0))
+}
+
+/// Serves the connecting side and the inbound side from one listener.
+///
+/// One task per connection, because SAM is one socket per I2P socket: the control socket,
+/// the accept socket, and each connecting socket are separate connections with their own
+/// lifetimes.
+async fn serve_inbound(
+    listener: TcpListener,
+    config: AcceptConfig,
+    accepts: Arc<std::sync::Mutex<Vec<PendingAccept>>>,
+) {
+    while let Ok((mut socket, _)) = listener.accept().await {
+        let accepts = Arc::clone(&accepts);
+        let accept_status = config.accept_status.clone();
+        let prelude = config.prelude.clone();
+        tokio::spawn(async move {
+            let mut reader = LineAccumulator::default();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let Some(request) = reader.take_line() else {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(count) => reader.push(&chunk[..count]),
+                    }
+                    continue;
+                };
+                if request.starts_with("HELLO") {
+                    if socket.write_all(&hello_ok()).await.is_err() {
+                        return;
+                    }
+                } else if request.starts_with("SESSION CREATE") {
+                    if socket
+                        .write_all(&session_ok_with_destination())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else if request.starts_with("STREAM ACCEPT") {
+                    let status = accept_status.clone().unwrap_or_else(stream_ok);
+                    if socket.write_all(&status).await.is_err() {
+                        return;
+                    }
+                } else if request.starts_with("STREAM CONNECT") {
+                    if socket.write_all(&stream_ok()).await.is_err() {
+                        return;
+                    }
+                    // Route the connecting socket to the armed accept. FIFO rather than
+                    // matched on destination: the fixture has one peer identity, so
+                    // matching on destination would only be testing itself.
+                    // Taken in a helper so the `std::sync` guard never spans an await: it
+                    // is not `Send`, and holding one across a suspension would make this
+                    // task `!Send`.
+                    let Some(pending) = take_pending(&accepts) else {
+                        return;
+                    };
+                    let _ = pending.session_id;
+                    // The prelude is authored by the bridge and handed over with the
+                    // connection, so the accepting side reads it off the same stream its
+                    // application bytes will arrive on. Coalesced with the first payload
+                    // where the config says so, which is what makes a reader that discards
+                    // its read tail lose bytes here.
+                    let prelude: Vec<u8> = match &prelude {
+                        Prelude::Destination {
+                            destination,
+                            payload,
+                        } => {
+                            let mut line = destination.clone();
+                            line.extend_from_slice(b"\r\n");
+                            line.extend_from_slice(payload);
+                            line
+                        }
+                        Prelude::Missing => Vec::new(),
+                        Prelude::Oversized => {
+                            let mut line = vec![b'Q'; MAX_ACCEPT_DESTINATION_LINE + 64];
+                            line.extend_from_slice(b"\r\n");
+                            line
+                        }
+                    };
+                    let _ = pending.arrived.send(Arrived {
+                        connecting: socket,
+                        prelude,
+                    });
+                    // Everything after `RESULT=OK` on this socket belongs to the relay that
+                    // `ArmedAccept::incoming` starts, so this connection's task is done.
+                    return;
+                }
+            }
+        });
     }
 }
