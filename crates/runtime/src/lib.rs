@@ -21,6 +21,7 @@ pub mod chathistory;
 pub mod control_session;
 pub mod controller;
 pub mod ctcp;
+pub mod diagnostics;
 pub mod downstream;
 pub mod ircv3;
 pub mod journal;

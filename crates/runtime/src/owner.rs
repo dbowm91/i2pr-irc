@@ -694,6 +694,13 @@ pub struct NetworkSnapshot {
     /// asked for this room to be hidden".
     pub detached_channels: Vec<String>,
     pub reconnect_attempt: u32,
+    /// How long this owner will wait before its next reconnect attempt.
+    ///
+    /// `None` means nothing is scheduled, which is different from a zero delay: an
+    /// Operator watching a flapping Network needs to tell "waiting four seconds" from
+    /// "already retrying", and only the owner knows which, because the backoff schedule
+    /// lives here rather than in the process-wide connect scheduler.
+    pub next_retry_delay: Option<std::time::Duration>,
     /// The away state upstream is currently being told, if any.
     ///
     /// This is the Operator's presence as the rest of the network sees it, which makes it
@@ -1245,6 +1252,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 state.phase = Some(Phase::Backoff);
                 state.attached_sessions = 0;
                 state.reconnect_attempt = backoff.attempt;
+                state.next_retry_delay = Some(delay);
                 state.last_error = Some(crate::error_class(&outcome));
             });
             tokio::select! {

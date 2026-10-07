@@ -1,6 +1,6 @@
 # Bouncer Core M005-H / Plan 027 — Operator Diagnostics, Configuration Snapshots, and Constrained Registration Actions
 
-Status: blocked
+Status: ready
 
 Blocker:
 
