@@ -1,6 +1,6 @@
 # Initial runtime security boundary
 
-The runtime accepts only a validated `I2pEndpoint` and calls only `I2pStreamProvider` for upstream connections. Local downstream I/O arrives only through `LocalAcceptor`. It adds no DNS, generic TCP, HTTP, proxy, SAM, router-private, or remote-listener path, and the static guard enforces that over the runtime sources as well as core and wire.
+The runtime accepts only a validated `I2pEndpoint` and calls only `I2pStreamProvider` for upstream connections. Local downstream I/O arrives only through `LocalAcceptor`. It adds no DNS, generic TCP, HTTP, proxy, router-private, or remote-listener path, and the static guard enforces that over the runtime sources as well as core, wire, and the SAM crate. The one socket authority in the workspace is `crates/sam`, and it is loopback-only by construction: `SamBridgeEndpoint` accepts nothing but a loopback literal and there is no resolver call in the crate. Its session IDs are 128 bits of OS randomness rather than the `NetworkId`, so two Networks cannot be correlated at the bridge by their session identifiers.
 
 Runtime identity strings and configured channels reject CR/LF injection and have explicit length/count ceilings. Client prefixes are rejected before upstream routing. SASL PLAIN secrets are redacted by `Debug`, credential lengths are bounded, and temporary raw/base64 buffers are zeroized after encoding. Raw protocol and SASL payloads are not logged.
 

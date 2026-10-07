@@ -25,7 +25,12 @@ import sys
 import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
-CRATES=("core","wire","store","runtime","testkit","fuzz-smoke")
+CRATES=("core","wire","store","runtime","sam","testkit","fuzz-smoke")
+# R001-B: `crates/sam` is the only production path permitted to open a TCP socket, and
+# only ever to a loopback SAM bridge. It is scanned like every other crate for the generic
+# primitives, and separately for socket authority, because "loopback only" is a claim this
+# script has to be able to fail rather than a comment in a source file.
+SAM_CRATE="sam"
 SOURCE_TOKENS=("std::net::Tcp","std::net::Udp","ToSocketAddrs","tokio::net::Tcp","tokio::net::Udp","reqwest","hyper::Client","trust_dns","hickory_resolver","ureq::","socks::")
 # Corrected to the canonical crate name so the DNS family control exercises the real
 # spelling rather than a typo no manifest can ever carry.
@@ -42,6 +47,13 @@ def source_findings(label,text):
 def dcc_findings(label,text):
     return [(label,token) for token in DCC_TOKENS if token in text]
 
+# R001-B section 13. Every symbol that can reach a socket, named exhaustively so that
+# renaming one fails the control instead of quietly widening the crate's authority.
+SAM_SOCKET_TOKENS=("TcpStream","TcpListener","tokio::net","TcpSocket","UdpSocket","UnixStream","UnixListener")
+# The only two files permitted to name a socket: the client that must connect, and the
+# test-only fake that must listen. Anything else is an authority the crate did not need.
+SAM_SOCKET_ALLOWLIST=("src/client.rs","src/fake.rs")
+
 def manifest_findings(label,text):
     names=re.findall(r"(?m)^\s*([A-Za-z0-9_-]+)\s*=\s*\{?",text)
     return [(label,name) for name in names if name.replace('_','-').lower() in DEPENDENCY_NAMES]
@@ -54,6 +66,37 @@ def dependency_findings(label,tree):
         if normalized in DEPENDENCY_NAMES: found.append((label,normalized))
     return found
 
+def _sam_allowlisted(path):
+    """Whether `path` is one of the two SAM files permitted to name a TCP socket."""
+    tail=path.as_posix().split(f"crates/{SAM_CRATE}/",1)[-1]
+    return any(tail==allowed for allowed in SAM_SOCKET_ALLOWLIST)
+
+def sam_findings(path,text):
+    """Socket authority inside the SAM crate, which is allowed exactly two files.
+
+    Compared on the path *relative to `crates/sam/src`*, not on an absolute suffix, so a
+    fixture tree laid out anywhere on disk is held to the same rule as the real crate.
+    """
+    relative=path.as_posix()
+    if not relative.endswith(".rs"):
+        return []
+    if not _sam_allowlisted(path):
+        return [(relative,token) for token in SAM_SOCKET_TOKENS if token in text]
+    # Even in an allowed file, a *generic* socket is not acceptable: only a loopback
+    # TCP connect in the client and a loopback bind in the fake.
+    findings=[]
+    # The generic primitives stay forbidden even in an allowlisted file. A resolver is
+    # the important one: "loopback only" is enforced by never resolving anything, so a
+    # name that reached `to_socket_addrs` would defeat the whole type-level boundary.
+    for token in ("UdpSocket","UnixStream","UnixListener","TcpSocket","ToSocketAddrs"):
+        if token in text:
+            findings.append((relative,token))
+    if path.as_posix().split(f"crates/{SAM_CRATE}/",1)[-1]=="src/fake.rs" and "TcpStream" in text:
+        # The fake may listen and accept, and may connect back only in a test.
+        if "TcpListener" not in text:
+            findings.append((relative,"TcpStream without a listener"))
+    return findings
+
 def scan_sources(root,crates=CRATES):
     found=[]
     for crate in crates:
@@ -61,11 +104,29 @@ def scan_sources(root,crates=CRATES):
         if not base.exists():continue
         for path in sorted(base.rglob("*.rs")):
             text=path.read_text()
-            found.extend(source_findings(path,text))
+            # R001-B: `tokio::net` is in the generic socket predicate and the SAM client
+            # has to name it. Exempted for exactly the two allowlisted files, and
+            # compensated by `sam_findings`, which is the stricter predicate: it permits
+            # only those two files and only TCP, so the exemption cannot become a door to
+            # DNS, UDP, or a unix socket.
+            if not (crate==SAM_CRATE and _sam_allowlisted(path)):
+                found.extend(source_findings(path,text))
             # The CTCP module names DCC only to block it. It is the one place allowed
             # to say so, so the guard is scoped rather than blanket.
-            if path.name!="ctcp.rs":
+            #
+            # R001-B: the SAM client and its test-only fake are the second exemption, for
+            # a different reason. They must name a TCP socket to do their job, so the
+            # blanket DCC predicate would flag the crate that is *supposed* to own the
+            # only socket authority in the workspace. The exemption is compensated by
+            # `sam_findings`, which is stricter: it names the exact two files allowed to
+            # hold a socket and the exact socket families even those may not use. A
+            # blanket `path.name` exemption with nothing behind it would be a hole; this
+            # one has a narrower predicate in front of it.
+            exempt = path.name=="ctcp.rs" or (crate==SAM_CRATE and _sam_allowlisted(path))
+            if not exempt:
                 found.extend(dcc_findings(path,text))
+            if crate==SAM_CRATE:
+                found.extend(sam_findings(path,text))
         for path in (base/"Cargo.toml",base/"build.rs"):
             if path.exists():found.extend(manifest_findings(path,path.read_text()))
     return found
@@ -143,6 +204,39 @@ def positive_control_failures():
     ):
         if not dependency_findings("fixture tree",fixture):
             failures.append(family)
+    # R001-B section 13 positive controls. Each must fail on its own, so a future
+    # narrowing of the SAM allowlist fails the script instead of quietly relaxing the
+    # boundary it exists to enforce.
+    for family,relpath,text,token in (
+        ("sam tcp authority outside the allowlist control","src/endpoint.rs","pub fn open() { let _s = TcpStream::connect(addr).await; }","TcpStream"),
+        ("sam listener authority outside the allowlist control","src/protocol.rs","pub fn listen() { let _l = TcpListener::bind(addr).unwrap(); }","TcpListener"),
+        ("sam udp in an allowlisted file control","src/client.rs","pub fn send() { let _s = UdpSocket::bind(addr).unwrap(); }","UdpSocket"),
+        ("sam unix in an allowlisted file control","src/client.rs","pub fn dial() { let _s = UnixStream::connect(path).unwrap(); }","UnixStream"),
+        ("sam raw-socket control","src/client.rs","pub fn send() { let _s = TcpSocket::new_v4().unwrap(); }","TcpSocket"),
+        ("sam udp in the fake control","src/fake.rs","pub fn send() { let _s = UdpSocket::bind(addr).unwrap(); }","UdpSocket"),
+        ("sam resolver authority control","src/client.rs","pub fn resolve() { let _a = ToSocketAddrs::to_socket_addrs(addr); }","ToSocketAddrs"),
+        ("sam dns in a non-allowlisted file control","src/session.rs","pub fn resolve() { let _a = ToSocketAddrs::to_socket_addrs(addr); }","ToSocketAddrs"),
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            # `scan_sources` expects a workspace root containing `crates/<name>`.
+            root=Path(temporary)/"root"
+            (root/"crates"/SAM_CRATE/"src").mkdir(parents=True)
+            (root/"crates"/SAM_CRATE/relpath).write_text(text+"\n")
+            found=scan_sources(root,crates=(SAM_CRATE,))
+            if not any(finding[1]==token for finding in found):
+                failures.append(family)
+    # The allowlist itself must be load-bearing: a socket in the two permitted files is
+    # fine, and in any other file it is not. Proven by removing one and expecting a hit.
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture=Path(temporary)
+        (fixture/"crates"/"sam"/"src").mkdir(parents=True)
+        (fixture/"crates"/"sam"/"src"/"client.rs").write_text("pub fn connect() { let _s = TcpStream::connect(addr).await; }\n")
+        (fixture/"crates"/"sam"/"src"/"fake.rs").write_text("pub fn listen() { let _l = TcpListener::bind(addr).await.unwrap(); }\n")
+        if scan_sources(fixture,crates=(SAM_CRATE,)):
+            failures.append("sam fixture did not stay clean")
+        (fixture/"crates"/"sam"/"src"/"session.rs").write_text("pub fn open() { let _s = TcpStream::connect(addr).await; }\n")
+        if not scan_sources(fixture,crates=(SAM_CRATE,)):
+            failures.append("sam socket authority outside the allowlist is not detected")
     with tempfile.TemporaryDirectory() as temporary:
         fixture=Path(temporary)
         for crate in CRATES:(fixture/"crates"/crate/"src").mkdir(parents=True)

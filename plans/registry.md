@@ -27,18 +27,19 @@ Canonical direction:
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
 | Bouncer core | M005 closed | plans/subsystems/bouncer-core-roadmap.md | Plans 020-028 closed; M005 complete | M004, Corrective 019, and Plans 020-025 are closed. Research 006 and ADR-0003 freeze M005 control-session/runtime ownership. Plan 020 landed the bounded RuntimeController, pre-bind DownstreamAdmission, one-shot PreparedSession transfer, and schema 3. Plan 021 landed the typed DesiredChannelRecord, schema 4's durable detached flag, and the detach/reattach transitions. Plan 022 landed schema 5's auto_away and keep_nick policy, per-session active/passive classification with draft/pre-away mediation, owner-scoped manual away, a bounded deterministic nick fallback answered inside the registration window, and generation-owned reclaim. Plan 023 landed the soju.im/bouncer-networks draft, the local BouncerServ administration service, controller-allocated netids, a single-sourced I2P attribute profile, and snapshot-derived notification deltas. Plan 024 landed the soju.im/search adapter, schema 6's FTS5 side index and effective_time rule, indexed msgid and timestamp reference lookups, the HistoryPosition model for out-of-window references, and a two-seek AROUND. Plan 025 promoted server-time, standard-replies, cap-notify and draft/no-implicit-names, made echo-message conditional on the upstream negotiation, gave the tag surface and the refusal format a per-session third and dual form, and replaced the static capability list with one advertisement shared by the owner and the reader. Plan 026 accepted extended-join, account-notify, away-notify, multi-prefix and setname as a set whose downstream advertisement is conditional on the upstream acknowledgement, recorded account-tag, chghost, invite-notify and extended-monitor as deliberately deferred with stated reasons, added bounded observed member metadata with a three-state account model, mediated extended JOINs and prefix runs per session across NAMES and routed WHO and WHOIS, and made registration read the Network's live advertisement. Plan 027 landed the bounded secret-free diagnostics surface read from the live owners, the versioned local configuration snapshot format with plan-then-apply import and a stored-credential merge, and the bounded allowlisted registration actions with schema 7 and a replay runner that emits them after every successful generation; it also recorded a pre-existing finding that a generation teardown takes about 120 s to be noticed, which Plan 028 resolved. Plan 028 qualified M005 as one integrated product and **closed the milestone**. The integrated pass found three production defects that eight per-subsystem suites had each correctly passed over: the connect rate limiter could hang, because `ReconnectScheduler::acquire` parked on a notification while the token gate frees on a clock that notifies nothing, so every Network past `MAX_CONNECT_BURST` could stay unconnected forever on a cold start; `ControlSnapshot` answered from memory, because `publish()` ran only from `commit()`, so a Network with two live sessions reported `attached=0 phase=idle` until an unrelated edit happened; and `registration_actions`, `clients` and `network_secrets` were missing from `REQUIRED_TABLES`, so a database declaring the current version without them opened successfully and failed later. Plan 028 also **withdrew** Plan 027's teardown finding as a fixture defect -- `drop_generation` silently matched nothing, so the test measured `LIVENESS_DEADLINE` rather than the bouncer, which ends a generation on end-of-stream immediately. |
-| I2P router integration | active | plans/subsystems/i2p-router-integration-roadmap.md | R001-A closed; R001-B / Plan 030 ready | R001 is decomposed into Plans 029-032 under ADRs 0004-0005 and Research 007. **Plan 029 is closed** (plans/closure/router-integration/029-status.md): `NetworkId`-scoped `connect`, explicit bounded `release` wired into delete and shutdown, and the `I2pEndpoint` Base64 Destination profile corrected so a real Destination is accepted. Plan 030 is now the sole dependency-ready handoff; 031-032 remain sequenced behind it. Its closure records one deliberate deviation from Plan 029 section 10's base64url alphabet, with the reason stated there. R002 still waits on R001 closure plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 still requires a concrete product need plus stable scoped control semantics. |
+| I2P router integration | active | plans/subsystems/i2p-router-integration-roadmap.md | R001-A and R001-B closed; R001-C / Plan 031 ready | R001 is decomposed into Plans 029-032 under ADRs 0004-0005 and Research 007. **Plan 029 is closed** (plans/closure/router-integration/029-status.md): `NetworkId`-scoped `connect`, explicit bounded `release` wired into delete and shutdown, and the `I2pEndpoint` Base64 Destination profile corrected so a real Destination is accepted. **Plan 030 is closed** (plans/closure/router-integration/030-status.md): `crates/sam` is the workspace's first and only socket authority, loopback-only by construction, with bounded framing, typed replies, opaque session identity, and an exact raw transition; its closure also records a pre-existing `m005g_member_state` flake that was fixed and a 140s-vs-120s cold-path deadline mismatch that Plan 031 must reconcile. Plan 031 is now the sole dependency-ready handoff; 032 remains sequenced behind it. Its closure records one deliberate deviation from Plan 029 section 10's base64url alphabet, with the reason stated there. R002 still waits on R001 closure plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts. R003 still requires a concrete product need plus stable scoped control semantics. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-
+| Router R001-C / Plan 031 — Per-Network SAM Provider Integration | ready | invariant + capability | plans/subsystems/i2p-router-integration-roadmap.md | future plans/closure/router-integration/031-status.md |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Router R001-B / Plan 030 — Owned SAM 3.1 Wire/Client Foundation | closed | infrastructure + invariant | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/030-status.md |
 | Router R001-A / Plan 029 — Provider Scope, Lifecycle, and Endpoint Foundation | closed | invariant + infrastructure | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/029-status.md |
 | Bouncer Core M005-I / Plan 028 — Integrated Mature-Bouncer Qualification and M005 Closure | closed | invariant + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/028-status.md |
 | Bouncer Core M005-H / Plan 027 — Operator Diagnostics, Configuration Snapshots, and Constrained Registration Actions | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/027-status.md |
@@ -73,8 +74,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Router R001-B / Plan 030 — Owned SAM 3.1 Wire/Client Foundation | ready | none | plans/implementation/router-integration/030-r001b-owned-sam31-wire-client-foundation.md |
-| Router R001-C / Plan 031 — Per-Network SAM Provider Integration | blocked | Plan 030 closure | plans/implementation/router-integration/031-r001c-per-network-sam-provider-integration.md |
 | Router R001-D / Plan 032 — SAM Cross-Router Qualification and R001 Closure | blocked | Plan 031 closure + live router environments for portability claims | plans/implementation/router-integration/032-r001d-sam-cross-router-qualification-and-closure.md |
 
 ## Unplanned later milestones
@@ -120,15 +119,14 @@ Important retained conclusions:
 
 Implement only:
 
-- plans/implementation/router-integration/030-r001b-owned-sam31-wire-client-foundation.md
+- plans/implementation/router-integration/031-r001c-per-network-sam-provider-integration.md
 
-Plan 030 is the sole dependency-ready handoff. Plan 029 closed the provider scope and release lifecycle and corrected the I2pEndpoint Destination profile, so the loopback-only protocol foundation it adds is the first production adapter path in the repository.
+Plan 031 is the sole dependency-ready handoff. Plan 029 closed the provider scope and release lifecycle and corrected the I2pEndpoint Destination profile, so the loopback-only protocol foundation it adds is the first production adapter path in the repository.
 
-Plan 029 is closed. What it landed, and the one recorded deviation from its own section 10, are in plans/closure/router-integration/029-status.md.
+Plans 029 and 030 are closed. Their records, including 029's one recorded deviation from its own section 10 and 030's deadline-mismatch finding for Plan 031, are in plans/closure/router-integration/.
 
 Remaining R001 sequence:
 
-- Plan 030 adds the dedicated owned SAM 3.1 STREAM client crate and loopback-only protocol foundation.
 - Plan 031 composes one long-lived transient SAM session per active Network behind I2pStreamProvider.
 - Plan 032 performs Java I2P/i2pd/i2pr qualification and owns the R001 closure claim.
 

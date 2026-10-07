@@ -1000,6 +1000,11 @@ async fn a_mode_delta_widens_a_run_without_completing_one_that_was_never_observe
         .await;
     let mut wide = register(&runtime, NetworkId(1), SessionId(1), "multi-prefix").await;
     wide.until("005").await;
+    // Two barriers. The first proves the JOIN and MODE were processed *before* the client
+    // was attached, which is the premise of the test; without it a slow scheduler can let
+    // the client register first, observe a completed run, and pass for the wrong reason --
+    // or fail depending on which order the two racing events win.
+    sync(&mut runtime, peer, &mut wide).await;
     sync(&mut runtime, peer, &mut wide).await;
     let names = names_of(&wide.seen, "#room");
     assert!(

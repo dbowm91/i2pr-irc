@@ -6,7 +6,9 @@ Every form shares one application ceiling of 4096 textual bytes, and each form k
 
 A Destination's shape is decided here and its reachability is not. Whether the bytes name a service that answers is a router question, so an unreachable Destination is a well-formed endpoint that fails at connect time like any other unreachable target, rather than a configuration error the Operator is asked to fix. The accepted alphabet is the union of standard Base64 (`A-Z a-z 0-9 + /`) and the base64url variant (`- ~`), because real Destinations use `+` and `/` and accepting only the narrower set would reject every Destination a real router can produce. Destination validity is decided by the router adapter, never by the bouncer.
 
-Upstream bytes can be acquired only through `I2pStreamProvider`. `LocalAcceptor` is separate and cannot be used as an upstream connector. The workspace includes no SAM implementation, system resolver, generic socket connector, HTTP client, or router administration API.
+Upstream bytes can be acquired only through `I2pStreamProvider`. `LocalAcceptor` is separate and cannot be used as an upstream connector. The workspace includes no system resolver, generic socket connector, HTTP client, or router administration API.
+
+As of R001-B there is exactly one SAM implementation: `crates/sam`, the only crate permitted to open a socket, and only to a loopback bridge. See [the owned SAM 3.1 adapter](sam-adapter.md).
 
 ## Provider scope and release
 
@@ -31,7 +33,7 @@ Release is explicit because a router scope outlives any single IRC connection. A
 
 Releasing an unknown or already-released Network is a no-op, which is what makes a retry after a timeout converge rather than wedging a Network permanently undeletable. Release is bounded by `PROVIDER_RELEASE_TIMEOUT`, deliberately far below the connect budget because it runs where a caller is already blocked and shutdown has no timeout of its own.
 
-The network guard scans source, build scripts, and crate manifests for every first-party crate that could own network access — `core`, `wire`, `store`, `runtime`, and `testkit` — plus each crate's normal, build, and dev dependency tree. The store is scanned because its SQLite dependency tree is third-party native code. Covering the runtime matters because it owns the upstream connection and the downstream client sockets. Positive controls exercise the same predicates and the same crate scoping against a synthetic fixture tree, including a dedicated store fixture, so a future coverage regression fails the guard instead of silently narrowing the boundary.
+The network guard scans source, build scripts, and crate manifests for every first-party crate that could own network access — `core`, `wire`, `store`, `runtime`, `sam`, and `testkit` — plus each crate's normal, build, and dev dependency tree. The store is scanned because its SQLite dependency tree is third-party native code. Covering the runtime matters because it owns the upstream connection and the downstream client sockets. Positive controls exercise the same predicates and the same crate scoping against a synthetic fixture tree, including a dedicated store fixture, so a future coverage regression fails the guard instead of silently narrowing the boundary.
 
 A future router or SAM adapter inherits this boundary: it must be a separate crate that consumes managed-app capabilities, it may not add generic host DNS or generic upstream TCP, and adding it requires architecture review.
 

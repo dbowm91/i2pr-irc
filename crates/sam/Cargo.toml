@@ -1,0 +1,33 @@
+[package]
+name = "i2pr-irc-sam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Reviewed for Plan 030 section 7. `getrandom` is the only OS-random primitive in
+# the workspace and it exists for one reason: SAM session IDs must carry at least
+# 128 bits of OS randomness and must never be derived from anything identifying.
+#
+# MIT OR Apache-2.0, matching every other dependency here. rust-version 1.63, below
+# this workspace's 1.88 floor. Its backends are libc calls and syscalls already
+# present on the supported platforms, and every other backend is `cfg`-gated, so
+# it adds no transitive dependency on Linux, macOS, or Windows.
+[dependencies]
+async-trait.workspace = true
+getrandom = "0.3"
+i2pr-irc-core = { path = "../core" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "time", "io-util"] }
+
+[features]
+# The deterministic loopback bridge. A feature rather than a `#[cfg(test)]` module so
+# an integration test in `tests/` can use it; it is never reachable from a build of
+# this crate as a library dependency.
+testkit = []
+
+[lints]
+workspace = true

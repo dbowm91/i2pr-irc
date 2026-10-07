@@ -1,6 +1,8 @@
 # Router Integration R001-B / Plan 030 — Owned SAM 3.1 Wire/Client Foundation
 
-Status: ready
+Status: closed
+
+Closure: plans/closure/router-integration/030-status.md
 
 Hard dependency:
 
