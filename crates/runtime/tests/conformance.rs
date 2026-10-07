@@ -220,10 +220,7 @@ fn assert_state_field(vector: &Vector, key: &str, raw: &str, state: &NetworkStat
             let mut actual: Vec<String> = room
                 .members
                 .iter()
-                .map(|member| match member.symbol {
-                    Some(symbol) => format!("{symbol}{}", member.nick),
-                    None => member.nick.clone(),
-                })
+                .map(|member| member.display(false))
                 .collect();
             actual.sort();
             assert_eq!(
@@ -253,10 +250,7 @@ fn assert_state_field(vector: &Vector, key: &str, raw: &str, state: &NetworkStat
                 .map(|member| {
                     (
                         member.nick.clone(),
-                        member
-                            .symbol
-                            .map(|symbol| symbol.to_string())
-                            .unwrap_or_default(),
+                        member.symbols.iter().collect::<String>(),
                     )
                 })
                 .collect();

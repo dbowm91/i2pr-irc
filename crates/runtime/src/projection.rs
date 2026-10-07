@@ -46,6 +46,13 @@ pub fn project(
     handle.queue_normal(&format!(
         ":bouncer 005 {target} CLIENTTAGDENY=* :are supported by this server\r\n"
     ))?;
+    // `setname` requires the server to publish a realname ceiling, so this bouncer owes
+    // it to any session that negotiated the capability -- and owes it to nobody else.
+    if let Some(token) = crate::member::namelen_token(state, &handle.capabilities()) {
+        handle.queue_normal(&format!(
+            ":bouncer 005 {target} {token} :are supported by this server\r\n"
+        ))?;
+    }
     for channel in state.visible_channels() {
         project_channel(handle, state, target, &channel, read_markers)?;
     }
@@ -67,7 +74,11 @@ pub fn project_channel(
 ) -> Result<(), RuntimeError> {
     let channel = channel.to_owned();
     {
-        handle.queue_normal(&format!(":{} JOIN {channel}\r\n", state.nick))?;
+        handle.queue_normal(&crate::member::own_join_line(
+            state,
+            &channel,
+            &handle.capabilities(),
+        ))?;
         // The read-marker draft requires the server to send the channel's marker after
         // the JOIN and before RPL_ENDOFNAMES. It is emitted from the JOIN rather than
         // from the NAMES block so it still arrives when membership is incomplete, and
@@ -106,10 +117,17 @@ pub fn project_channel(
         // nothing about what another client on the same connection wants.
         let implicit_names = !handle.capabilities().negotiated_no_implicit_names();
         if implicit_names && channel_state.names_seen && channel_state.members_complete {
+            // Membership is rendered at this session's negotiated surface. A session
+            // without `multi-prefix` gets the single highest symbol per member; one with
+            // it gets the complete run for every member whose run was actually observed
+            // completely. A member whose run is incomplete falls back to the single symbol
+            // rather than being shown a partial set, because a client that negotiated
+            // `multi-prefix` reads an absent symbol as an absent mode.
+            let multi_prefix = handle.capabilities().negotiated_multi_prefix();
             let mut names: Vec<String> = channel_state
                 .members
                 .iter()
-                .map(|member| member.display())
+                .map(|member| member.display(multi_prefix))
                 .collect();
             names.sort();
             let list = names.join(" ");

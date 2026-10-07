@@ -21,7 +21,8 @@ The downstream advertisement is a function of the upstream negotiation, not a st
 list: `message-tags`, `batch`, `labeled-response`, `server-time`, `standard-replies`,
 `cap-notify` and `draft/no-implicit-names`, plus the implemented `draft/chathistory`,
 `draft/read-marker`, `draft/pre-away`, `soju.im/search` and `soju.im/bouncer-networks`
-adapters. `echo-message` is the one conditional member — see below.
+adapters. `echo-message` and the five member-state capabilities are the conditional members — see
+below and [member-state.md](member-state.md).
 
 One cell holds it, shared by the owner and the session reader, so `CAP LS`, `CAP REQ` and
 the `005` welcome cannot answer from different sets. The full contract, including the
@@ -36,6 +37,23 @@ A `CAP` line from upstream is consumed by the bouncer and never fanned out. Rela
 would show a local client the upstream's capability negotiation under the upstream's own
 prefix, which the client reads as the server addressing it — and it discloses the upstream
 connection's shape to every attached Operator.
+
+## Member-state capabilities are conditional, because mediation is real
+
+`extended-join`, `account-notify`, `away-notify`, `multi-prefix` and `setname` are requested
+upstream when offered and advertised downstream only once *acknowledged*. A server can offer
+a capability and refuse it, so the acknowledgement is the only statement about the connection
+in hand.
+
+The condition is the same one `echo-message` has and for the same kind of reason: the
+bouncer mediates what the server supplied. A `multi-prefix` bouncer that never negotiated
+`multi-prefix` has no complete prefix runs to widen, and advertising it would promise every
+client a NAMES list richer than any client could ever receive.
+
+Advertising them is the easy half. What each one asserts -- that a JOIN, an `ACCOUNT`, an
+`AWAY`, a `SETNAME` and a prefix run are each delivered at the surface *this* session
+negotiated, and not at the surface some other client on the same Network negotiated -- is in
+[member-state.md](member-state.md).
 
 ## echo-message is conditional, because confirmation is real
 

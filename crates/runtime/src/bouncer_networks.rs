@@ -695,6 +695,7 @@ mod tests {
             phase: Some("connected".to_owned()),
             attached_sessions: 2,
             last_session_disposition: Some("accepted"),
+            advertisement: Vec::new(),
         };
         let rendered = render_network(&entry, "");
         assert!(rendered.contains("netid=1"));
@@ -714,6 +715,7 @@ mod tests {
                 phase: None,
                 attached_sessions: 0,
                 last_session_disposition: None,
+                advertisement: Vec::new(),
             }],
         };
         // The same revision is nothing at all, however many times it is asked.
@@ -729,6 +731,7 @@ mod tests {
                     phase: None,
                     attached_sessions: 0,
                     last_session_disposition: None,
+                    advertisement: Vec::new(),
                 },
             ],
         };

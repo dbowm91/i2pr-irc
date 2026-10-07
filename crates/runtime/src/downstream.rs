@@ -640,9 +640,13 @@ impl<D: ByteStream> DownstreamSession<D> {
             }
         }
         for channel in ctx.state.joined_channels() {
+            // The same renderer the owner's projection uses, so an extended JOIN is
+            // emitted here on exactly the same condition as there. Two projection paths
+            // that answer "what does this client see" differently is how a session gets a
+            // richer view than a freshly attached one.
             queue_line(
                 &self.normal_tx,
-                &format!(":{} JOIN {channel}\r\n", ctx.state.nick),
+                &crate::member::own_join_line(ctx.state, &channel, &self.capabilities()),
             )?;
             let Some(state) = ctx.state.channels.get(&channel) else {
                 continue;
@@ -667,10 +671,11 @@ impl<D: ByteStream> DownstreamSession<D> {
             }
             // Membership is projected only when it is known to be complete.
             if state.names_seen && state.members_complete {
+                let multi_prefix = self.capabilities().negotiated_multi_prefix();
                 let mut names: Vec<String> = state
                     .members
                     .iter()
-                    .map(|member| member.display())
+                    .map(|member| member.display(multi_prefix))
                     .collect();
                 names.sort();
                 let list = names.join(" ");

@@ -1379,6 +1379,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             for token in params.iter().flat_map(|p| p.split_whitespace()) {
                                 upstream_caps.note_enabled(token);
                             }
+                            // Observed state needs to know whether a membership prefix run
+                            // is the member's complete set or only its highest symbol, and
+                            // only the upstream negotiation can settle that. Recording it
+                            // here, once, is what keeps a later projection from guessing.
+                            state.set_upstream_multi_prefix(
+                                upstream_caps.is_enabled(crate::capability::MEMBER_MULTI_PREFIX),
+                            );
                             let sasl_accepted = upstream_caps.is_enabled("sasl");
                             if self.context.record.sasl.is_some() && !sasl_accepted {
                                 return Err(RuntimeError::Registration);
@@ -1885,6 +1892,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                     }
                                 }
                             }
+                            // A withdrawn capability stops being something the bouncer may
+                            // rely on, and a `multi-prefix` run the server had promised
+                            // must stop being reported as complete.
+                            if matches!(change, crate::capability::CapChange::Del) {
+                                state.set_upstream_multi_prefix(upstream_caps.is_enabled(
+                                    crate::capability::MEMBER_MULTI_PREFIX,
+                                ));
+                            }
                             if matches!(change, crate::capability::CapChange::New) {
                                 // The server now offers a capability. If the bouncer
                                 // serves it downstream and has not enabled it, the only
@@ -1942,6 +1957,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                     upstream_caps.note_enabled(&name);
                                 }
                             }
+                            // A capability that arrives mid-generation changes what the
+                            // bouncer can mediate just as a startup ACK does, so observed
+                            // state is told here too rather than only at registration.
+                            state.set_upstream_multi_prefix(upstream_caps.is_enabled(
+                                crate::capability::MEMBER_MULTI_PREFIX,
+                            ));
                             let now: BTreeSet<String> =
                                 crate::capability::DownstreamCapabilities::advertisement(
                                     &upstream_caps,
@@ -2343,7 +2364,25 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let outcome = router.deliver(incoming_for(message), |route| {
             // The client's own label is restored and the server's opaque label is
             // removed. No other client ever sees either.
-            rebuild_reply(message, route.downstream_label.as_deref())
+            //
+            // The reply is also degraded for the client that asked: `multi-prefix` puts
+            // complete prefix runs into WHO and WHOIS replies, and the reply goes only
+            // to a session that may not read them. Reading that session's own
+            // capabilities here, rather than somewhere that could answer for a
+            // different one, is what keeps two clients on one Network from being
+            // answered the same question identically.
+            let multi_prefix = sessions
+                .get(&route.session)
+                .map(|task| task.handle().capabilities().negotiated_multi_prefix())
+                .unwrap_or(false);
+            let reply =
+                match crate::member::degrade_routed_reply(message, &state.prefix, multi_prefix) {
+                    crate::member::Mediated::Rewritten(reduced) => reduced,
+                    crate::member::Mediated::Pass | crate::member::Mediated::Withhold => {
+                        message.clone()
+                    }
+                };
+            rebuild_reply(&reply, route.downstream_label.as_deref())
         });
         let mut fans_out = matches!(outcome, RouteOutcome::Fanout);
         // A detached channel's live traffic is withheld from attached sessions while
@@ -2419,61 +2458,41 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // session that negotiated the tag prefix but not that particular tag gets
             // every other tag and loses only `time`, because the others are exactly what
             // it asked for.
-            let untagged = if message.tags.is_empty() {
-                None
-            } else {
-                let mut bare = message.clone();
-                bare.tags.clear();
-                Some(bare.encode().map_err(|_| RuntimeError::Protocol)?)
-            };
-            let timed =
-                if message.tags.is_empty() || !message.tags.contains_key(i2pr_irc_wire::TIME_TAG) {
-                    None
-                } else {
-                    let mut without_time = message.clone();
-                    without_time.tags.remove(i2pr_irc_wire::TIME_TAG);
-                    if without_time.tags.is_empty() {
-                        untagged.clone()
-                    } else {
-                        Some(without_time.encode().map_err(|_| RuntimeError::Protocol)?)
-                    }
-                };
-            let tagged = if message.tags.is_empty() {
-                None
-            } else {
-                Some(message.encode().map_err(|_| RuntimeError::Protocol)?)
-            };
+            let tag_forms = TagForms::build(message, raw);
             // A rewritten frame already has every detached channel removed from it, so it
-            // replaces both forms. Dropping its tags is sound: a tag is optional in every
-            // direction, and the alternative would reintroduce a detached channel name
-            // carried by a server-chosen tag value.
+            // replaces all three forms. Dropping its tags is sound: a tag is optional in
+            // every direction, and the alternative would reintroduce a detached channel
+            // name carried by a server-chosen tag value.
             let rewritten = match &detached {
                 DetachedFanout::Rewritten(line) => Some(line.clone()),
                 _ => None,
             };
-            // Every form is `Some` together or not at all: they are all derived from the
-            // same non-empty tag set. That invariant is what lets the choice be total
-            // without a fallback arm -- `tagged`, `untagged`, and `timed` are either all
-            // present or all absent, so the three cases below cover every state.
             for (id, task) in sessions {
-                let surface = task.handle().capabilities().tag_surface();
+                let capabilities = task.handle().capabilities();
+                // Member-state mediation runs per session and before the tag surface is
+                // chosen, because it can withhold the frame or hand back a *different*
+                // frame. Choosing the surface first would let a session be handed reduced
+                // bytes carrying the tag set of the frame it no longer has.
+                let reduced = match crate::member::mediate(state, message, &capabilities) {
+                    crate::member::Mediated::Withhold => continue,
+                    crate::member::Mediated::Rewritten(reduced) => Some(reduced),
+                    crate::member::Mediated::Pass => None,
+                };
+                let surface = capabilities.tag_surface();
                 let line = match &rewritten {
                     Some(line) => line.clone(),
-                    None => match (&tagged, &untagged, &timed) {
-                        (None, None, _) => raw.to_vec(),
-                        (Some(tagged), Some(untagged), timed) => match surface {
-                            TagSurface::All => tagged.clone(),
-                            TagSurface::WithoutTime => {
-                                timed.clone().unwrap_or_else(|| untagged.clone())
-                            }
-                            TagSurface::None => untagged.clone(),
-                        },
-                        // Unreachable while every form derives from the same tag set.
-                        // The arm is total rather than a panic because a future tag form
-                        // added without the invariant would otherwise take the whole
-                        // generation down, and a wrong frame is recoverable where a
-                        // disconnected Operator is not.
-                        _ => untagged.clone().unwrap_or_else(|| raw.to_vec()),
+                    // The unreduced frame already has all three forms built.
+                    None if reduced.is_none() => match &tag_forms {
+                        Some(forms) => forms.render(surface),
+                        None => raw.to_vec(),
+                    },
+                    // A reduced frame carries its own tags, so its forms are built from it.
+                    None => match TagForms::build(
+                        reduced.as_ref().expect("reduced is Some in this arm"),
+                        raw,
+                    ) {
+                        Some(forms) => forms.render(surface),
+                        None => raw.to_vec(),
                     },
                 };
                 if task.handle().fanout(line).is_err() {
@@ -3684,6 +3703,67 @@ fn incoming_for(message: &Message) -> Incoming<'_> {
 /// means nothing downstream and would let one client observe another's routing state.
 /// Every other tag is preserved, because a client that negotiated `labeled-response` has
 /// already negotiated the message-tag surface those tags travel on.
+/// The delivery forms of one frame, one per negotiated tag surface.
+///
+/// Built once per frame rather than once per session, because encoding a frame is the
+/// expensive part and the forms depend only on the frame's tags.
+#[derive(Clone, Debug)]
+struct TagForms {
+    tagged: Vec<u8>,
+    untagged: Vec<u8>,
+    /// `None` when the frame carried no `time` tag to withhold, which is the same
+    /// situation as the `untagged` form.
+    timed: Option<Vec<u8>>,
+}
+impl TagForms {
+    /// Builds every form for one frame.
+    ///
+    /// Returns `None` when any form cannot be encoded, so a caller can fall back to the
+    /// bytes it already has. Encoding is total rather than panicking: a frame that will
+    /// not encode is a real condition, and taking the generation down over it would
+    /// disconnect an Operator for something the bouncer can simply relay as received.
+    fn build(message: &Message, raw: &[u8]) -> Option<Self> {
+        if message.tags.is_empty() {
+            // The untagged form of an untagged message *is* that message, re-encoded.
+            // `raw` would be wrong here: a mediated frame carries different bytes from
+            // the line it replaced, and handing the original back would undo the
+            // mediation exactly when the mediation happened on a frame with no tags.
+            let encoded = message.encode().ok().unwrap_or_else(|| raw.to_vec());
+            return Some(Self {
+                tagged: encoded.clone(),
+                untagged: encoded,
+                timed: None,
+            });
+        }
+        let mut bare = message.clone();
+        bare.tags.clear();
+        let untagged = bare.encode().ok()?;
+        let mut without_time = message.clone();
+        without_time.tags.remove(i2pr_irc_wire::TIME_TAG);
+        let timed = if message.tags.contains_key(i2pr_irc_wire::TIME_TAG)
+            && !without_time.tags.is_empty()
+        {
+            Some(without_time.encode().ok()?)
+        } else {
+            None
+        };
+        Some(Self {
+            tagged: message.encode().ok()?,
+            untagged,
+            timed,
+        })
+    }
+    /// The form this session's negotiated surface calls for.
+    fn render(&self, surface: TagSurface) -> Vec<u8> {
+        match surface {
+            TagSurface::All => self.tagged.clone(),
+            // Withholding `time` only matters when a `time` tag was present to withhold.
+            TagSurface::WithoutTime => self.timed.clone().unwrap_or_else(|| self.untagged.clone()),
+            TagSurface::None => self.untagged.clone(),
+        }
+    }
+}
+
 fn rebuild_reply(message: &Message, downstream_label: Option<&str>) -> Vec<u8> {
     let mut rebuilt = message.clone();
     rebuilt.tags.remove(LABEL_TAG.as_bytes());

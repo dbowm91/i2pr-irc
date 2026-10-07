@@ -300,6 +300,23 @@ impl Message {
         Ok(())
     }
 
+    /// Returns this message with only its first `keep` parameters.
+    ///
+    /// The trailing marker is recomputed rather than copied, because it describes the
+    /// parameter that was last, not this one. Dropping a trailing parameter therefore
+    /// drops that fact: leaving it set would re-encode the surviving parameter as a
+    /// trailing argument. That parses identically -- `:` is only a delimiter -- but no
+    /// server writes it that way, and a rewriter that drops a parameter should not also
+    /// restyle the one it kept.
+    ///
+    /// `keep` beyond the current length leaves the message unchanged.
+    pub fn truncate_params(&self, keep: usize) -> Self {
+        let mut reduced = self.clone();
+        reduced.params.truncate(keep);
+        reduced.trailing_parameter = false;
+        reduced
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         if self.params.len() > MAX_PARAMS {
             return Err(WireError::TooManyParams);

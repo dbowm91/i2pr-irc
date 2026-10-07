@@ -248,6 +248,11 @@ mod tests {
             cap_notify: false,
             no_implicit_names: false,
             echo_message: false,
+            extended_join: false,
+            account_notify: false,
+            away_notify: false,
+            multi_prefix: false,
+            setname: false,
         };
         assert!(
             !wants_backlog(explicit),
@@ -270,6 +275,11 @@ mod tests {
             cap_notify: false,
             no_implicit_names: false,
             echo_message: false,
+            extended_join: false,
+            account_notify: false,
+            away_notify: false,
+            multi_prefix: false,
+            setname: false,
         };
         assert!(
             wants_backlog(markers_only),

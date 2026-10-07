@@ -21,12 +21,65 @@ use std::collections::BTreeSet;
 /// This list is intentionally small and reviewed. Requesting everything a server
 /// offers would make the bouncer's behavior depend on the server's whim rather than
 /// on what it actually implements.
-pub const UPSTREAM_FOUNDATIONAL: [&str; 5] = [
+///
+/// M005-G adds the five member-state capabilities. Each is requested only because the
+/// runtime handles every message form it enables, and each name is still filtered
+/// through what the server actually offered, so the request set remains a pure function
+/// of the server's answer.
+pub const UPSTREAM_FOUNDATIONAL: [&str; 10] = [
     "message-tags",
     "server-time",
     "batch",
     "labeled-response",
     "echo-message",
+    MEMBER_EXTENDED_JOIN,
+    MEMBER_ACCOUNT_NOTIFY,
+    MEMBER_AWAY_NOTIFY,
+    MEMBER_MULTI_PREFIX,
+    MEMBER_SETNAME,
+];
+
+/// `extended-join`: a JOIN carries the joining member's account and realname, so an
+/// attaching client can be shown them without a WHO.
+pub const MEMBER_EXTENDED_JOIN: &str = "extended-join";
+/// `account-notify`: the server reports when a member logs into or out of an account.
+pub const MEMBER_ACCOUNT_NOTIFY: &str = "account-notify";
+/// `away-notify`: the server reports when a member becomes away or returns.
+pub const MEMBER_AWAY_NOTIFY: &str = "away-notify";
+/// `multi-prefix`: membership carries the member's complete prefix run rather than only
+/// its highest symbol.
+pub const MEMBER_MULTI_PREFIX: &str = "multi-prefix";
+/// `setname`: a realname can be changed mid-connection, and the change is reported.
+pub const MEMBER_SETNAME: &str = "setname";
+
+/// The accepted member-state capabilities, as one reviewed set.
+///
+/// Named as a set rather than as five independent booleans because they share one
+/// property that decides whether any of them may be advertised: the bouncer can only
+/// mediate richer member metadata if the server first supplied it. A capability here
+/// whose upstream negotiation failed is withheld downstream rather than advertised with
+/// nothing behind it.
+pub const MEMBER_CAPABILITIES: [&str; 5] = [
+    MEMBER_EXTENDED_JOIN,
+    MEMBER_ACCOUNT_NOTIFY,
+    MEMBER_AWAY_NOTIFY,
+    MEMBER_MULTI_PREFIX,
+    MEMBER_SETNAME,
+];
+
+/// Member-state capabilities this build implements but does not serve.
+///
+/// Each is withheld for a stated reason rather than silently omitted, so "not offered"
+/// is a reviewable decision. `chghost` is the instructive one: its specification falls
+/// back to a synthetic `QUIT`/`JOIN`/`MODE` sequence for clients that did not negotiate
+/// it, and a bouncer whose whole projection discipline is that it never claims a
+/// membership a client did not see established must not synthesise membership events.
+/// The other three are additive metadata this build does not yet derive or route.
+pub const DOWNSTREAM_DEFERRED_MEMBER: [&str; 4] = [
+    "account-tag",
+    "chghost",
+    "invite-notify",
+    "extended-monitor",
 ];
 
 /// Downstream capabilities this build can truthfully advertise.
@@ -346,6 +399,16 @@ impl DownstreamCapabilities {
         if upstream.echo_available() {
             advertised.push(ECHO_MESSAGE.to_owned());
         }
+        // Member-state capabilities are conditional on upstream for the same reason
+        // `echo-message` is: the bouncer mediates what the server supplied, so a server
+        // that never offered `extended-join` leaves nothing to mediate and advertising it
+        // would promise a richer JOIN than any client could ever receive.
+        advertised.extend(
+            MEMBER_CAPABILITIES
+                .iter()
+                .filter(|name| upstream.is_enabled(name))
+                .map(|name| (*name).to_owned()),
+        );
         advertised.sort();
         advertised
     }
@@ -467,16 +530,55 @@ mod tests {
         assert!(upstream_is_client_independent(&before, &offered));
         // The set is the reviewed constant in its declared order, which is stable for
         // a given generation and independent of what any client negotiated.
-        assert_eq!(
-            before.request_set(),
-            vec![
-                "message-tags",
-                "server-time",
-                "batch",
-                "labeled-response",
-                "echo-message"
-            ]
-        );
+        assert_eq!(before.request_set(), UPSTREAM_FOUNDATIONAL);
+        // Every accepted member-state capability is requested for the same reason: the
+        // runtime mediates every message form it enables. Nothing in the request set may
+        // be one this build only serves sometimes.
+        for name in MEMBER_CAPABILITIES {
+            assert!(
+                UPSTREAM_FOUNDATIONAL.contains(&name),
+                "{name} is mediated downstream, so it must be requested upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn member_capabilities_are_withheld_downstream_when_upstream_never_supplied_them() {
+        // The property that decides whether any of the five may be advertised: with
+        // nothing upstream, advertising them would promise a richer view than any client
+        // could ever receive. It is the *acknowledged* set that counts, not the offered
+        // one -- a server can offer a capability and still refuse it.
+        let mut offered = UpstreamCapabilities::default();
+        for name in UPSTREAM_FOUNDATIONAL {
+            offered.note_offer(name);
+            offered.note_enabled(name);
+        }
+        let advertised = DownstreamCapabilities::default().advertise(&offered);
+        for name in MEMBER_CAPABILITIES {
+            assert!(
+                advertised.iter().any(|entry| entry == name),
+                "{name} was offered upstream, so it must be advertised downstream"
+            );
+        }
+        // A server that negotiated only the foundational set supplies no member metadata,
+        // so every member capability is withheld rather than advertised empty.
+        let mut bare = UpstreamCapabilities::default();
+        bare.note_offer("message-tags");
+        let advertised = DownstreamCapabilities::default().advertise(&bare);
+        for name in MEMBER_CAPABILITIES {
+            assert!(
+                !advertised.iter().any(|entry| entry == name),
+                "{name} must not be advertised without upstream agreement"
+            );
+        }
+        // And the deferred names are never advertised at all, so a client probing for
+        // them learns this build does not serve them.
+        for name in DOWNSTREAM_DEFERRED_MEMBER {
+            assert!(
+                !advertised.iter().any(|entry| entry == name),
+                "{name} is deferred and must not be advertised"
+            );
+        }
     }
 
     #[test]

@@ -62,6 +62,27 @@ pub const MAX_MODE_LETTERS: usize = 64;
 pub const MAX_MODE_ARGS: usize = 16;
 pub const MAX_MODE_ARG_BYTES: usize = 100;
 
+/// Ceiling on one observed account name.
+///
+/// The server supplies this field and the bouncer retains it verbatim, so the ceiling is
+/// what stops a single `ACCOUNT` line from becoming an unbounded allocation. An account
+/// name is a service-assigned identifier rather than prose, which is why this sits well
+/// below the realname and away ceilings below.
+pub const MAX_ACCOUNT_BYTES: usize = 64;
+/// Ceiling on one observed realname, independent of what the server advertises.
+///
+/// `setname` requires the server to publish a `NAMELEN` token, and when it does that
+/// value is honoured as well. This is the hard ceiling that stands when it does not,
+/// because a realname is free text in a field the bouncer cannot otherwise bound.
+pub const MAX_REALNAME_BYTES: usize = 128;
+/// Ceiling on one observed away message.
+///
+/// This bounds what *other* members put in the field. It is deliberately a separate
+/// constant from the Operator's own `MAX_AWAY_TEXT_BYTES`: that one bounds the words
+/// this bouncer writes upstream on the Operator's behalf, and this one bounds text that
+/// arrived from elsewhere and is on its way to a client.
+pub const MAX_AWAY_MESSAGE_BYTES: usize = 200;
+
 /// Conservative pre-connection channel-type assumption. Live state uses the
 /// server-advertised `CHANTYPES` once `005` supplies one.
 pub const DEFAULT_CHANTYPES: &str = "#&";
@@ -158,20 +179,89 @@ impl PrefixMap {
     pub fn is_membership_mode(&self, mode: char) -> bool {
         self.symbol_for(mode).is_some()
     }
+    /// The advertised rank of a membership mode, highest first.
+    fn rank_of_mode(&self, mode: char) -> Option<usize> {
+        self.pairs
+            .iter()
+            .position(|(advertised, _)| *advertised == mode)
+    }
+    /// The highest-ranked symbol in `symbols`, ignoring anything the server never
+    /// advertised in its `PREFIX` map.
+    ///
+    /// This is the one-symbol view every client that did not negotiate `multi-prefix` is
+    /// entitled to, so it is defined once here rather than as "the first character" at
+    /// each call site.
+    pub fn highest(&self, symbols: &[char]) -> Option<char> {
+        symbols
+            .iter()
+            .copied()
+            .filter_map(|symbol| {
+                self.rank_of_mode(self.mode_for(symbol)?)
+                    .map(|rank| (rank, symbol))
+            })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, symbol)| symbol)
+    }
     /// Splits an advertised membership symbol run from a NAMES/member entry and
-    /// reports the highest-ranked membership mode seen. Arbitrary leading
-    /// punctuation is never treated as a prefix.
-    pub fn split_prefix<'a>(&self, entry: &'a str) -> (Option<char>, &'a str) {
-        let mut highest = None;
+    /// reports the member's symbols in rank order, highest first.
+    ///
+    /// A `multi-prefix` server sends the member's complete run; without it the run holds
+    /// only the highest symbol. Both are read here rather than at the call site, because
+    /// "which symbols did this entry actually claim" is a property of the observation and
+    /// not of who is going to look at it. Arbitrary leading punctuation is never treated
+    /// as a prefix.
+    ///
+    /// The run is re-sorted into rank order and de-duplicated rather than taken in the
+    /// order it arrived. `multi-prefix` requires rank order, but a server that violated it
+    /// would otherwise let a reordered prefix change which symbol a legacy client is shown
+    /// as its highest.
+    pub fn split_prefix_run<'a>(&self, entry: &'a str) -> (Vec<char>, &'a str) {
+        let mut ranked: Vec<(usize, char)> = Vec::new();
         let mut index = 0;
         for (offset, symbol) in entry.char_indices() {
             let Some(mode) = self.mode_for(symbol) else {
                 break;
             };
-            highest = Some(mode);
             index = offset + symbol.len_utf8();
+            let Some(rank) = self.rank_of_mode(mode) else {
+                continue;
+            };
+            if !ranked.iter().any(|(existing, _)| *existing == rank) {
+                ranked.push((rank, symbol));
+            }
         }
-        (highest, &entry[index..])
+        ranked.sort_by_key(|(rank, _)| *rank);
+        (
+            ranked
+                .into_iter()
+                .take(MAX_PREFIX_PAIRS)
+                .map(|(_, symbol)| symbol)
+                .collect(),
+            &entry[index..],
+        )
+    }
+    /// Merges two observed membership symbol runs into one, in rank order.
+    ///
+    /// Used when a member is observed twice: a `MODE` delta adds a symbol to what a NAMES
+    /// entry already established, and neither observation may discard the other. The
+    /// union is capped at the same ceiling as a single observation, so repeated deltas
+    /// cannot grow a member's prefix run without bound.
+    pub fn merge_symbols(&self, left: &[char], right: &[char]) -> Vec<char> {
+        let mut ranked: Vec<(usize, char)> = Vec::new();
+        for symbol in left.iter().chain(right.iter()) {
+            let Some(mode) = self.mode_for(*symbol) else {
+                continue;
+            };
+            let Some(rank) = self.rank_of_mode(mode) else {
+                continue;
+            };
+            if !ranked.iter().any(|(existing, _)| *existing == rank) {
+                ranked.push((rank, *symbol));
+            }
+        }
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.truncate(MAX_PREFIX_PAIRS);
+        ranked.into_iter().map(|(_, symbol)| symbol).collect()
     }
 }
 
@@ -363,18 +453,148 @@ impl ModeSnapshot {
     }
 }
 
+/// What is known about the account a member identified with.
+///
+/// The three states are genuinely different answers. `Unknown` means nothing has been
+/// observed, which is not the same statement as "is not logged in": a member who joined
+/// before the bouncer negotiated `extended-join` has no account, while a member whose
+/// extended JOIN carried `*` has been *observed* not to be logged in. Collapsing them
+/// would let the bouncer present a member as logged out because it never looked.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum AccountState {
+    /// No account observation has been made for this member.
+    #[default]
+    Unknown,
+    /// The member's account state was observed.
+    ///
+    /// The inner `None` is an observed logout; `Some` is an observed login.
+    Known(Option<String>),
+}
+impl AccountState {
+    /// Reads one account parameter, where `*` is the spec's logged-out sentinel.
+    ///
+    /// Returns `None` when the parameter is not a usable account name, so an
+    /// unrepresentable value is omitted rather than retained as something a client
+    /// would read as a real account.
+    pub fn observed(raw: &str) -> Self {
+        if raw == "*" {
+            return Self::Known(None);
+        }
+        let account = raw.trim();
+        if account.is_empty()
+            || account.len() > MAX_ACCOUNT_BYTES
+            || account.bytes().any(|byte| {
+                byte == 0 || byte == b'\r' || byte == b'\n' || byte.is_ascii_whitespace()
+            })
+        {
+            return Self::Unknown;
+        }
+        Self::Known(Some(account.to_owned()))
+    }
+}
+
+/// Whether a member was observed away, and the message they gave for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AwayState {
+    /// Observed present.
+    Here,
+    /// Observed away with a bounded message.
+    Away(String),
+}
+
+/// One observed channel member and whatever richer metadata was learned about them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberEntry {
     pub nick: String,
-    /// The advertised membership symbol currently held by this member.
-    pub symbol: Option<char>,
+    /// Membership symbols held by this member, highest rank first.
+    ///
+    /// A `multi-prefix` observation fills this with the complete run; a plain one leaves
+    /// only the highest symbol, which is what the server said and therefore still the
+    /// truth about what was claimed.
+    pub symbols: Vec<char>,
+    /// True when `symbols` is the member's complete set rather than its highest alone.
+    ///
+    /// False for any member first observed without `multi-prefix`, and a `MODE` delta can
+    /// add a symbol to a complete set but can never complete an incomplete one.
+    pub symbols_complete: bool,
+    /// What is known about this member's account.
+    pub account: AccountState,
+    /// The realname, from an extended JOIN or a `SETNAME`. Absent when never observed.
+    pub realname: Option<String>,
+    /// Observed away state. Absent when nothing has been observed.
+    pub away: Option<AwayState>,
+}
+impl Default for MemberEntry {
+    fn default() -> Self {
+        Self {
+            nick: String::new(),
+            symbols: Vec::new(),
+            symbols_complete: false,
+            account: AccountState::Unknown,
+            realname: None,
+            away: None,
+        }
+    }
 }
 impl MemberEntry {
-    pub fn display(&self) -> String {
-        match self.symbol {
-            Some(symbol) => format!("{symbol}{}", self.nick),
-            None => self.nick.clone(),
+    /// Renders the NAMES entry for this member at one session's negotiated surface.
+    ///
+    /// A complete run is shown only to a session that negotiated `multi-prefix` *and* for a
+    /// member whose run was actually observed completely. Both conditions are required, and
+    /// the reason matters: a client that negotiated `multi-prefix` reads an absent symbol as
+    /// an absent mode, so showing it a partial run would tell it the member holds no other
+    /// modes. That is a claim about membership the bouncer cannot make about a run it never
+    /// saw whole.
+    ///
+    /// Anything else yields the single highest symbol. That symbol was genuinely observed,
+    /// and it is the whole of what a view without `multi-prefix` can represent -- so
+    /// omitting it would understate what the bouncer knows, and widening it would overstate
+    /// what the server said.
+    pub fn display(&self, multi_prefix: bool) -> String {
+        let complete = multi_prefix && self.symbols_complete;
+        let symbols: String = if complete {
+            self.symbols.iter().collect()
+        } else {
+            self.symbols
+                .first()
+                .map(|symbol| symbol.to_string())
+                .unwrap_or_default()
+        };
+        format!("{symbols}{}", self.nick)
+    }
+    /// The account name to render in an extended JOIN, if one is known.
+    ///
+    /// `Some(None)` is the spec's `*`, which is the correct rendering for a member observed
+    /// to be logged out. `None` means the account was never observed, and the caller must
+    /// fall back to a plain JOIN rather than claim a logout that was not observed.
+    pub fn account_field(&self) -> Option<Option<&str>> {
+        match &self.account {
+            AccountState::Unknown => None,
+            AccountState::Known(account) => Some(account.as_deref()),
         }
+    }
+}
+
+/// The bounded facts a single membership observation contributes to one member.
+///
+/// Grouped rather than passed as a widening argument list, because every field here is
+/// "something the server may or may not have told us", and a caller that omitted one
+/// would silently convert it into an assertion that it is unknown.
+#[derive(Clone, Debug, Default)]
+pub struct MemberObservation {
+    /// Membership symbols this observation claimed, in rank order.
+    pub symbols: Vec<char>,
+    /// True when this observation claimed the member's complete set.
+    pub symbols_complete: bool,
+    pub account: AccountState,
+    pub realname: Option<String>,
+}
+
+impl MemberObservation {
+    /// An observation that says only "this member is here", from a plain NAMES entry or a
+    /// JOIN with no membership prefix.
+    pub fn membership_only() -> Self {
+        Self::default()
     }
 }
 
@@ -433,6 +653,19 @@ pub struct NetworkState {
     /// Bounded generation-local record of written desired JOINs, keyed by casemapped
     /// channel identity. Discarded when the generation is replaced.
     join_attempts: BTreeMap<Vec<u8>, (String, JoinAttempt)>,
+    /// True when the server acknowledged `multi-prefix` for this generation.
+    ///
+    /// This decides whether an observed prefix run is the member's complete set or only
+    /// its highest symbol. It is generation-local because it is a property of one
+    /// negotiation: a reconnect that failed to negotiate `multi-prefix` genuinely has
+    /// less membership information, and must not inherit the previous generation's claim.
+    multi_prefix: bool,
+    /// The realname ceiling the server advertised through `NAMELEN`.
+    ///
+    /// `setname` requires the server to publish it, so its absence is not itself a fault.
+    /// It is recorded because honouring it is what stops the bouncer retaining a realname
+    /// the server would have rejected.
+    namelen: Option<usize>,
 }
 impl NetworkState {
     /// Builds generation-local state from durable channel intent.
@@ -458,7 +691,65 @@ impl NetworkState {
                 .collect(),
             pending_reveal: BTreeSet::new(),
             join_attempts: BTreeMap::new(),
+            multi_prefix: false,
+            namelen: None,
         }
+    }
+    /// Records what the upstream negotiation agreed for member metadata.
+    ///
+    /// Called once per generation as the `CAP` acknowledgement is applied, and never from
+    /// a downstream path: which capabilities the *server* agreed is not something a client
+    /// attaching can influence.
+    pub fn set_upstream_multi_prefix(&mut self, negotiated: bool) {
+        self.multi_prefix = negotiated;
+    }
+    /// True when this generation's membership observations carry complete prefix runs.
+    pub fn upstream_multi_prefix(&self) -> bool {
+        self.multi_prefix
+    }
+    /// The realname ceiling to apply to an observation from this server.
+    pub fn namelen_ceiling(&self) -> usize {
+        match self.namelen {
+            Some(advertised) => advertised.clamp(1, MAX_REALNAME_BYTES),
+            None => MAX_REALNAME_BYTES,
+        }
+    }
+    /// True when the server published its own `NAMELEN`.
+    ///
+    /// `setname` obliges the server to publish one, and the bouncer relays what the
+    /// server said. It therefore owes a ceiling of its own only when nobody upstream
+    /// supplied one -- publishing a second `NAMELEN` beside a relayed one would put two
+    /// answers to the same question in one `005`.
+    pub fn upstream_published_namelen(&self) -> bool {
+        self.namelen.is_some()
+    }
+    fn bounded_realname(&self, raw: &str) -> Option<String> {
+        if raw.is_empty() || raw.len() > self.namelen_ceiling() {
+            return None;
+        }
+        if raw
+            .bytes()
+            .any(|byte| byte == 0 || byte == b'\r' || byte == b'\n')
+        {
+            return None;
+        }
+        Some(raw.to_owned())
+    }
+    /// The observed account name and realname for this bouncer's own nick, if any channel
+    /// holds this bouncer's own membership.
+    ///
+    /// An extended-join projection of our own channel JOIN needs exactly these two fields,
+    /// and it must not invent them: a generation that joined before `extended-join` was
+    /// negotiated has neither.
+    pub fn own_profile(&self) -> (AccountState, Option<String>) {
+        for state in self.channels.values() {
+            for member in &state.members {
+                if self.same_nick(&member.nick, &self.nick) {
+                    return (member.account.clone(), member.realname.clone());
+                }
+            }
+        }
+        (AccountState::Unknown, None)
     }
     /// Suppresses downstream presentation of `channel` without touching membership.
     ///
@@ -670,8 +961,31 @@ impl NetworkState {
                 .position(|member| self.casemapping.fold(member.nick.as_bytes()) == folded)
         })
     }
-    fn insert_member(&mut self, channel: &str, nick: &str, symbol: Option<char>) {
-        if nick.is_empty() || self.member_index(channel, nick).is_some() {
+    fn insert_member(&mut self, channel: &str, nick: &str, observation: MemberObservation) {
+        if nick.is_empty() {
+            return;
+        }
+        if let Some(index) = self.member_index(channel, nick)
+            && let Some(state) = self.channels.get_mut(channel)
+            && let Some(member) = state.members.get_mut(index)
+        {
+            // Re-observing a member merges rather than replaces. A NAMES entry establishes
+            // the prefix run; a later `MODE` delta adds one symbol to it, and neither may
+            // erase the other. An observation that carries no account or realname leaves
+            // what is already known untouched, because "not mentioned" is not "logged out".
+            if !observation.symbols.is_empty() {
+                let merged = self
+                    .prefix
+                    .merge_symbols(&member.symbols, &observation.symbols);
+                member.symbols = merged;
+                member.symbols_complete |= observation.symbols_complete;
+            }
+            if let AccountState::Known(account) = &observation.account {
+                member.account = AccountState::Known(account.clone());
+            }
+            if let Some(realname) = observation.realname {
+                member.realname = Some(realname);
+            }
             return;
         }
         let total = self.total_members();
@@ -695,9 +1009,63 @@ impl NetworkState {
             }
             state.members.push(MemberEntry {
                 nick: nick.to_owned(),
-                symbol,
+                symbols: observation.symbols,
+                symbols_complete: observation.symbols_complete,
+                account: observation.account,
+                realname: observation.realname,
+                away: None,
             });
         }
+    }
+    /// Records an observed account change for every channel this member is in.
+    ///
+    /// `account-notify` defines the message as covering the target's *common* channels, and
+    /// a member has one account rather than one per room. An unknown member is a line the
+    /// bouncer simply has nowhere to put: it is applied nowhere rather than to some
+    /// guessed channel.
+    pub fn note_account(&mut self, nick: &str, account: AccountState) {
+        self.for_each_member(nick, |member| member.account = account.clone());
+    }
+    /// Records an observed realname change for every channel this member is in.
+    ///
+    /// An over-long or framing-bearing realname is dropped, which leaves whatever was
+    /// previously observed in place: retaining the last known value is a stale answer,
+    /// but replacing it with a fabricated one would be a false one, and the projection
+    /// omits a realname it does not have rather than inventing one.
+    pub fn note_realname(&mut self, nick: &str, realname: &str) {
+        let Some(realname) = self.bounded_realname(realname) else {
+            return;
+        };
+        self.for_each_member(nick, |member| member.realname = Some(realname.clone()));
+    }
+    /// Records an observed away-state change for every channel this member is in.
+    pub fn note_away(&mut self, nick: &str, away: AwayState) {
+        self.for_each_member(nick, |member| member.away = Some(away.clone()));
+    }
+    fn for_each_member(&mut self, nick: &str, mut apply: impl FnMut(&mut MemberEntry)) {
+        let casemapping = self.casemapping;
+        let folded = casemapping.fold(nick.as_bytes());
+        for state in self.channels.values_mut() {
+            for member in &mut state.members {
+                if casemapping.fold(member.nick.as_bytes()) == folded {
+                    apply(member);
+                }
+            }
+        }
+    }
+    /// Bounds one observed away message to the ceiling, returning `None` when the message
+    /// cannot be retained.
+    fn bounded_away(&self, raw: &str) -> Option<String> {
+        if raw.is_empty() || raw.len() > MAX_AWAY_MESSAGE_BYTES {
+            return None;
+        }
+        if raw
+            .bytes()
+            .any(|byte| byte == 0 || byte == b'\r' || byte == b'\n')
+        {
+            return None;
+        }
+        Some(raw.to_owned())
     }
     fn remove_member(&mut self, channel: &str, nick: &str) {
         let casemapping = self.casemapping;
@@ -756,12 +1124,56 @@ impl NetworkState {
                 if let Some(nick) = source.as_deref()
                     && self.is_channel(&channel)
                 {
-                    let (mode, bare) = self.prefix.split_prefix(nick);
-                    let symbol = mode.and_then(|mode| self.prefix.symbol_for(mode));
+                    let (symbols, bare) = self.prefix.split_prefix_run(nick);
                     if self.same_nick(bare, &self.nick) {
                         self.confirm_self_join(&channel);
                     }
-                    self.insert_member(&channel, bare, symbol);
+                    // `extended-join` appends the account and the realname. A JOIN without
+                    // them says nothing about either, and "this JOIN did not mention an
+                    // account" is not the same observation as "this member is logged out":
+                    // the account stays `Unknown` so a projection cannot render a `*` the
+                    // server never sent.
+                    let mut observation = MemberObservation {
+                        symbols,
+                        symbols_complete: self.multi_prefix,
+                        ..MemberObservation::membership_only()
+                    };
+                    if params.len() >= 3 {
+                        observation.account = AccountState::observed(&text(&params[1]));
+                        observation.realname =
+                            self.bounded_realname(&text(params.last().expect("checked length")));
+                    }
+                    self.insert_member(&channel, bare, observation);
+                }
+            }
+            // The server-to-client form is only ever emitted under `away-notify`, so
+            // receiving one means the server agrees the bouncer negotiated it. The
+            // message covers the sender's own state, which is why the observation is
+            // applied from the prefix rather than from a parameter.
+            "AWAY" => {
+                if let Some(nick) = source.as_deref() {
+                    let away = match params.last() {
+                        Some(raw) => {
+                            let raw = text(raw);
+                            self.bounded_away(&raw)
+                                .map(AwayState::Away)
+                                .unwrap_or(AwayState::Here)
+                        }
+                        None => AwayState::Here,
+                    };
+                    self.note_away(nick, away);
+                }
+            }
+            "ACCOUNT" if !params.is_empty() => {
+                if let Some(nick) = source.as_deref() {
+                    let account = AccountState::observed(&text(&params[0]));
+                    self.note_account(nick, account);
+                }
+            }
+            "SETNAME" if !params.is_empty() => {
+                if let Some(nick) = source.as_deref() {
+                    let realname = text(params.last().expect("checked length"));
+                    self.note_realname(nick, &realname);
                 }
             }
             "PART" if !params.is_empty() => {
@@ -887,6 +1299,10 @@ impl NetworkState {
             && let Some(chanmodes) = ChanModes::parse(value)
         {
             self.chanmodes = chanmodes;
+        } else if let Some(value) = token.strip_prefix("NAMELEN=") {
+            // A `NAMELEN` that does not parse leaves the hard ceiling authoritative rather
+            // than widening or narrowing what the bouncer is willing to retain.
+            self.namelen = value.parse::<usize>().ok().filter(|len| *len > 0);
         }
         // Tokens are retained for the downstream `005` projection, bounded.
         if token.len() <= MAX_ISUPPORT_TOKEN_BYTES
@@ -921,18 +1337,23 @@ impl NetworkState {
         if !self.is_channel(channel) {
             return;
         }
-        let entries: Vec<(Option<char>, String)> = names
+        let entries: Vec<MemberObservation> = names
             .split_whitespace()
             .map(|entry| {
-                let (mode, bare) = self.prefix.split_prefix(entry);
-                (
-                    mode.and_then(|mode| self.prefix.symbol_for(mode)),
-                    bare.to_owned(),
-                )
+                let (symbols, _) = self.prefix.split_prefix_run(entry);
+                MemberObservation {
+                    symbols,
+                    symbols_complete: self.multi_prefix,
+                    ..MemberObservation::membership_only()
+                }
             })
             .collect();
-        for (symbol, nick) in entries {
-            self.insert_member(channel, &nick, symbol);
+        let names: Vec<String> = names
+            .split_whitespace()
+            .map(|entry| self.prefix.split_prefix_run(entry).1.to_owned())
+            .collect();
+        for (observation, nick) in entries.into_iter().zip(names) {
+            self.insert_member(channel, &nick, observation);
         }
         if let Some(state) = self.channels.get_mut(channel) {
             state.names_seen = true;
@@ -1020,14 +1441,35 @@ impl NetworkState {
         let symbol = self.prefix.symbol_for(mode);
         match self.member_index(channel, nick) {
             Some(index) => {
+                // The merge is computed from an owned copy rather than in place: it needs
+                // the prefix map while the member itself is mutably borrowed, and taking
+                // `&self` for the map would overlap that borrow.
+                let Some(current) = self
+                    .channels
+                    .get(channel)
+                    .and_then(|state| state.members.get(index))
+                    .map(|member| member.symbols.clone())
+                else {
+                    return false;
+                };
+                let next = match (adding, symbol) {
+                    // A delta adds one symbol to the run and leaves completeness alone.
+                    // Completing an incomplete set would be a claim this observation does
+                    // not support.
+                    (true, Some(symbol)) => self.prefix.merge_symbols(&current, &[symbol]),
+                    (false, Some(symbol)) => {
+                        let mut next = current;
+                        next.retain(|held| *held != symbol);
+                        next
+                    }
+                    // A membership mode with no advertised symbol cannot change anything,
+                    // so the run is left exactly as observed.
+                    (_, None) => current,
+                };
                 if let Some(state) = self.channels.get_mut(channel)
                     && let Some(member) = state.members.get_mut(index)
                 {
-                    if adding {
-                        member.symbol = symbol;
-                    } else if member.symbol == symbol {
-                        member.symbol = None;
-                    }
+                    member.symbols = next;
                 }
                 true
             }
@@ -1109,7 +1551,7 @@ mod tests {
         let mut members: Vec<String> = state.channels[channel]
             .members
             .iter()
-            .map(MemberEntry::display)
+            .map(|member| member.display(false))
             .collect();
         members.sort();
         members
@@ -1122,9 +1564,20 @@ mod tests {
         assert_eq!(map.symbol_for('v'), Some('+'));
         assert!(map.is_membership_mode('o'));
         assert!(!map.is_membership_mode('b'));
-        assert_eq!(map.split_prefix("@Alice"), (Some('o'), "Alice"));
-        assert_eq!(map.split_prefix("~Bob"), (None, "~Bob"));
-        assert_eq!(map.split_prefix("Alice"), (None, "Alice"));
+        assert_eq!(map.split_prefix_run("@Alice"), (vec!['@'], "Alice"));
+        assert_eq!(map.split_prefix_run("~Bob"), (Vec::new(), "~Bob"));
+        assert_eq!(map.split_prefix_run("Alice"), (Vec::new(), "Alice"));
+        // A run is read whole and put back into rank order, so a server that sent it
+        // backwards cannot change which symbol a legacy client is shown as its highest.
+        assert_eq!(map.split_prefix_run("+@Alice"), (vec!['@', '+'], "Alice"));
+        assert_eq!(map.split_prefix_run("@+Alice"), (vec!['@', '+'], "Alice"));
+        // A repeated symbol is one held mode, not two.
+        assert_eq!(map.split_prefix_run("@@Alice"), (vec!['@'], "Alice"));
+        assert_eq!(map.highest(&['+', '@']), Some('@'));
+        assert_eq!(map.highest(&['+']), Some('+'));
+        assert_eq!(map.highest(&['!']), None);
+        assert_eq!(map.merge_symbols(&['+'], &['@']), vec!['@', '+']);
+        assert_eq!(map.merge_symbols(&['@'], &['!']), vec!['@']);
         assert!(PrefixMap::parse("(ov@+").is_none());
         assert!(PrefixMap::parse("(ov)@").is_none());
         assert!(PrefixMap::parse("()@").is_none());
@@ -1244,14 +1697,20 @@ mod tests {
             .members
             .iter()
             .find(|member| member.nick == "bot");
-        assert_eq!(member.and_then(|member| member.symbol), Some('@'));
+        assert_eq!(
+            member.map(|member| member.symbols.as_slice()),
+            Some(['@'].as_slice())
+        );
         assert!(state.channels["#room"].members_complete);
         state.apply_line(&line(b":srv MODE #room -o bot\r\n"));
         let member = state.channels["#room"]
             .members
             .iter()
             .find(|member| member.nick == "bot");
-        assert_eq!(member.and_then(|member| member.symbol), None);
+        assert_eq!(
+            member.map(|member| member.symbols.as_slice()),
+            Some([].as_slice())
+        );
         state.apply_line(&line(b":srv MODE #room +v Stranger\r\n"));
         assert!(!state.channels["#room"].members_complete);
         assert!(!state.channels["#room"].modes.is_complete());
@@ -1423,18 +1882,148 @@ mod tests {
     }
 
     #[test]
+    fn observed_member_metadata_is_bounded_and_never_fabricated() {
+        let mut state = NetworkState::new("bot", &[]);
+        state.apply_line(&line(b":srv 005 bot PREFIX=(ov)@+ NAMELEN=32\r\n"));
+        state.apply_line(&line(b":srv 353 bot = #room :@+Alice bot\r\n"));
+        state.apply_line(&line(b":srv 366 bot #room :End of /NAMES list.\r\n"));
+
+        // The run is retained as observed -- the entry really did carry both symbols -- but no
+        // completeness is claimed, so it is never presented as a complete set.
+        let alice = |state: &NetworkState| {
+            state.channels["#room"]
+                .members
+                .iter()
+                .find(|member| member.nick == "Alice")
+                .expect("Alice is a member")
+                .clone()
+        };
+        let member = alice(&state);
+        assert_eq!(member.symbols, ['@', '+']);
+        assert!(
+            !member.symbols_complete,
+            "an unnegotiated run is never complete"
+        );
+        assert_eq!(
+            member.display(true),
+            "@Alice",
+            "an incomplete run must fall back to the one symbol every client can read"
+        );
+        assert_eq!(member.display(false), "@Alice");
+        assert_eq!(member.account, AccountState::Unknown);
+
+        // An extended JOIN carries the account and realname; `*` is an *observed* logout,
+        // which is a different fact from never having looked.
+        state.apply_line(&line(b":Bob!u@h JOIN #room bobacct :Bob Example\r\n"));
+        state.apply_line(&line(b":Carol!u@h JOIN #room * :Carol Example\r\n"));
+        let find = |state: &NetworkState, nick: &str| {
+            state.channels["#room"]
+                .members
+                .iter()
+                .find(|member| member.nick == nick)
+                .expect("member")
+                .clone()
+        };
+        assert_eq!(
+            find(&state, "Bob").account,
+            AccountState::Known(Some("bobacct".into()))
+        );
+        assert_eq!(find(&state, "Bob").realname.as_deref(), Some("Bob Example"));
+        assert_eq!(find(&state, "Carol").account, AccountState::Known(None));
+        // A plain JOIN said nothing, so the account stays unknown rather than becoming an
+        // asserted logout.
+        assert_eq!(find(&state, "Alice").account, AccountState::Unknown);
+
+        // `account-notify` and `setname` apply to every channel the member is in.
+        state.apply_line(&line(b":Bob!u@h ACCOUNT bob2 :Logged in\r\n"));
+        state.apply_line(&line(b":Bob!u@h SETNAME :Bob Renamed\r\n"));
+        assert_eq!(
+            find(&state, "Bob").account,
+            AccountState::Known(Some("bob2".into()))
+        );
+        assert_eq!(find(&state, "Bob").realname.as_deref(), Some("Bob Renamed"));
+        // A `MODE` delta adds to the run rather than replacing it, and removes exactly one symbol.
+        state.apply_line(&line(b":Op!u@h MODE #room +v Alice\r\n"));
+        assert_eq!(
+            find(&state, "Alice").symbols,
+            ['@', '+'],
+            "a delta must widen the run, not replace it with one symbol"
+        );
+        state.apply_line(&line(b":Op!u@h MODE #room -v Alice\r\n"));
+        assert_eq!(find(&state, "Alice").symbols, ['@']);
+        assert_eq!(find(&state, "Bob").symbols, Vec::<char>::new());
+
+        // An away change is observed in both directions, and the bare form means back.
+        state.apply_line(&line(b":Bob!u@h AWAY :lunch\r\n"));
+        assert_eq!(
+            find(&state, "Bob").away,
+            Some(AwayState::Away("lunch".to_owned()))
+        );
+        state.apply_line(&line(b":Bob!u@h AWAY\r\n"));
+        assert_eq!(find(&state, "Bob").away, Some(AwayState::Here));
+
+        // Beyond `NAMELEN`, and beyond the hard ceiling, nothing is retained. Dropping it
+        // leaves the last known value in place, which is stale but not false.
+        state.apply_line(&line(
+            b":Bob!u@h SETNAME :0123456789012345678901234567890123456789\r\n",
+        ));
+        assert_eq!(
+            find(&state, "Bob").realname.as_deref(),
+            Some("Bob Renamed"),
+            "an over-long realname must not be retained or truncate the previous one"
+        );
+
+        // A NAMES entry establishes completeness only when `multi-prefix` was negotiated.
+        let mut negotiated = NetworkState::new("bot", &[]);
+        negotiated.set_upstream_multi_prefix(true);
+        negotiated.apply_line(&line(b":srv 353 bot = #room :@+Alice bot\r\n"));
+        let alice = negotiated.channels["#room"]
+            .members
+            .iter()
+            .find(|member| member.nick == "Alice")
+            .expect("Alice is a member");
+        assert!(alice.symbols_complete);
+        assert_eq!(alice.display(true), "@+Alice");
+        assert_eq!(alice.display(false), "@Alice");
+    }
+
+    #[test]
+    fn an_unusable_account_or_realname_is_omitted_rather_than_retained() {
+        assert_eq!(AccountState::observed("*"), AccountState::Known(None));
+        assert_eq!(
+            AccountState::observed("real"),
+            AccountState::Known(Some("real".into()))
+        );
+        for unusable in [
+            "",
+            "   ",
+            "with space",
+            "with\ttab",
+            "with\nnewline",
+            "with\0nul",
+            &"a".repeat(MAX_ACCOUNT_BYTES + 1),
+        ] {
+            assert_eq!(
+                AccountState::observed(unusable),
+                AccountState::Unknown,
+                "{unusable:?} must not become an account a client could read"
+            );
+        }
+    }
+
+    #[test]
     fn names_visibility_is_never_a_membership_prefix() {
         let mut state = NetworkState::new("bot", &[]);
         // `@` is a visibility field, and a `~` prefix is not in the advertised
         // mapping, so neither may become a member symbol.
         state.apply_line(&line(b":srv 005 bot PREFIX=(ov)@+\r\n"));
         state.apply_line(&line(b":srv 353 bot @ #secret :@Alice ~Someone bot\r\n"));
-        let symbols: Vec<Option<char>> = state.channels["#secret"]
+        let symbols: Vec<Vec<char>> = state.channels["#secret"]
             .members
             .iter()
-            .map(|member| member.symbol)
+            .map(|member| member.symbols.clone())
             .collect();
-        assert_eq!(symbols, [Some('@'), None, None]);
+        assert_eq!(symbols, [vec!['@'], Vec::new(), Vec::new()]);
         assert_eq!(rendered(&state, "#secret"), ["@Alice", "bot", "~Someone"]);
     }
 

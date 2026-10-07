@@ -268,6 +268,23 @@ pub struct SessionCapabilities {
     /// Advertised only when upstream negotiated it, so a session that holds this flag is
     /// one the upstream will actually echo to.
     pub echo_message: bool,
+    /// This session negotiated `extended-join`, so a JOIN may carry an account and a
+    /// realname.
+    ///
+    /// A session without it must never be sent an extended JOIN: the trailing account and
+    /// realname parameters are what makes the command unparseable for it, so relaying one
+    /// verbatim would hand the client a frame it cannot read.
+    pub extended_join: bool,
+    /// This session negotiated `account-notify`, so it receives `ACCOUNT` changes.
+    pub account_notify: bool,
+    /// This session negotiated `away-notify`, so it receives `AWAY` changes.
+    pub away_notify: bool,
+    /// This session negotiated `multi-prefix`, so membership may carry a complete prefix
+    /// run rather than only the highest symbol.
+    pub multi_prefix: bool,
+    /// This session negotiated `setname`, so it receives `SETNAME` changes and may send
+    /// the command itself.
+    pub setname: bool,
 }
 impl Default for SessionCapabilities {
     fn default() -> Self {
@@ -285,6 +302,11 @@ impl Default for SessionCapabilities {
             cap_notify: false,
             no_implicit_names: false,
             echo_message: false,
+            extended_join: false,
+            account_notify: false,
+            away_notify: false,
+            multi_prefix: false,
+            setname: false,
         }
     }
 }
@@ -361,6 +383,31 @@ impl SessionCapabilities {
         self.echo_message
     }
 
+    /// True when this session may receive an extended JOIN.
+    pub fn negotiated_extended_join(&self) -> bool {
+        self.extended_join
+    }
+
+    /// True when this session may receive `ACCOUNT` change notifications.
+    pub fn negotiated_account_notify(&self) -> bool {
+        self.account_notify
+    }
+
+    /// True when this session may receive `AWAY` change notifications.
+    pub fn negotiated_away_notify(&self) -> bool {
+        self.away_notify
+    }
+
+    /// True when this session may be shown complete membership prefix runs.
+    pub fn negotiated_multi_prefix(&self) -> bool {
+        self.multi_prefix
+    }
+
+    /// True when this session may receive `SETNAME` changes and send the command.
+    pub fn negotiated_setname(&self) -> bool {
+        self.setname
+    }
+
     /// The `time` tag must be removed unless this session asked for it.
     ///
     /// This is a *third* tag state, not a smaller version of the second: a session with
@@ -422,6 +469,26 @@ impl SessionCapabilities {
                 || enabled
                     .iter()
                     .any(|name| name == crate::capability::ECHO_MESSAGE),
+            extended_join: self.extended_join
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::MEMBER_EXTENDED_JOIN),
+            account_notify: self.account_notify
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::MEMBER_ACCOUNT_NOTIFY),
+            away_notify: self.away_notify
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::MEMBER_AWAY_NOTIFY),
+            multi_prefix: self.multi_prefix
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::MEMBER_MULTI_PREFIX),
+            setname: self.setname
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::MEMBER_SETNAME),
         }
     }
 }
@@ -588,6 +655,10 @@ impl SessionTask {
             client,
             Some(expected_nick),
             std::collections::BTreeSet::new(),
+            crate::downstream::downstream_supported()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
             stream,
         );
         Self::resume(wiring, events_tx)
@@ -664,11 +735,17 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
     ///
     /// `expected_nick` is `None` when no Network has been selected yet, which is the
     /// control-only case.
+    /// `advertisement` is what this client may negotiate, and it is normally the selected
+    /// Network's own list. The caller is responsible for it being that Network's answer
+    /// rather than a build-wide default: registration is the only moment a client can both
+    /// negotiate a capability and have its projection rendered at the negotiated surface,
+    /// so a list that is merely correct-in-general is not good enough here.
     pub fn new(
         session: SessionId,
         client: ClientId,
         expected_nick: Option<String>,
         bindable: std::collections::BTreeSet<NetworkId>,
+        advertisement: Vec<String>,
         stream: D,
     ) -> Self {
         let (read, write) = tokio::io::split(stream);
@@ -676,12 +753,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         // The reader and the handle share one advertisement cell: the reader answers
         // `CAP LS`/`CAP REQ` from it, and the owner replaces it as the upstream
         // negotiation changes. They cannot disagree because there is only one.
-        let advertised = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::downstream::downstream_supported()
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
-        ));
+        let advertised = std::sync::Arc::new(std::sync::Mutex::new(advertisement));
         let handle = SessionHandle {
             session,
             client,
@@ -1479,6 +1551,34 @@ impl<D: ByteStream> SessionReader<D> {
                     }
                 }
                 return Ok(Some(SessionIntent::Part { channel }));
+            }
+            // `setname` travels on a negotiated surface, and this bouncer's upstream negotiation is
+            // conditional: a server that never offered `setname` means this session was never
+            // offered it either, and its `SETNAME` could not be honoured anywhere upstream.
+            //
+            // The specification's alternative is to handle the command silently, which
+            // leaves the client waiting forever for a confirmation that cannot arrive. This
+            // bouncer says so instead, consistent with how it refuses an unsupported
+            // CHATHISTORY or SEARCH.
+            "SETNAME" => {
+                // `setname` travels on a negotiated surface, and this bouncer's upstream
+                // negotiation is conditional: a server that never offered `setname` means
+                // this session was never offered it either, and its `SETNAME` could not be
+                // honoured anywhere upstream.
+                //
+                // Explicitly refused rather than silently ignored, for the reason
+                // CHATHISTORY is: the client issued the command and needs to learn why
+                // nothing happened. This is not grounds for ending the session.
+                if !self.handle.capabilities().negotiated_setname() {
+                    let nick = self.registered_nick.as_deref().unwrap_or("*");
+                    let line = format!(":bouncer 421 {nick} {command} :Unsupported command\r\n");
+                    self.handle.queue_normal(&line)?;
+                    return Ok(None);
+                }
+                return Ok(Some(SessionIntent::Forward {
+                    wire: message.encode().map_err(|_| RuntimeError::Protocol)?,
+                    class: IntentClass::NonReplayable,
+                }));
             }
             "NOTICE" | "NICK" | "TOPIC" | "MODE" => {
                 return Ok(Some(SessionIntent::Forward {

@@ -6,8 +6,8 @@ use i2pr_irc_core::Casemapping;
 use i2pr_irc_runtime::{
     capability::{
         CapDecision, CapabilityName, DOWNSTREAM_DEFERRED_FOUNDATIONAL, DOWNSTREAM_DEFERRED_HISTORY,
-        DOWNSTREAM_DEFERRED_SERVER_TIME, DownstreamCapabilities, UpstreamCapabilities,
-        upstream_is_client_independent,
+        DOWNSTREAM_DEFERRED_MEMBER, DOWNSTREAM_DEFERRED_SERVER_TIME, DownstreamCapabilities,
+        UpstreamCapabilities, upstream_is_client_independent,
     },
     ircv3::{BatchError, BatchTracker, TagDisposition, mediate_client_tags},
     routing::{
@@ -93,6 +93,10 @@ fn the_upstream_request_set_is_the_reviewed_constant_only() {
         "echo-message",
         "account-tag",
         "extended-join",
+        "account-notify",
+        "setname",
+        "invite-notify",
+        "extended-monitor",
     ]);
     let request = caps.request_set();
     assert_eq!(
@@ -102,12 +106,25 @@ fn the_upstream_request_set_is_the_reviewed_constant_only() {
             "server-time".to_owned(),
             "batch".to_owned(),
             "labeled-response".to_owned(),
-            "echo-message".to_owned()
+            "echo-message".to_owned(),
+            "extended-join".to_owned(),
+            "account-notify".to_owned(),
+            "away-notify".to_owned(),
+            "multi-prefix".to_owned(),
+            "setname".to_owned(),
         ],
         "SASL is requested by the authentication path, and nothing else is mirrored"
     );
-    assert!(!request.iter().any(|name| name == "away-notify"));
-    assert!(!request.iter().any(|name| name == "extended-join"));
+    // A server offered every deferred member capability and none of them are requested.
+    // A capability this build does not mediate upstream must never be requested there: the
+    // server would then send message forms the runtime has no handling for.
+    for deferred in DOWNSTREAM_DEFERRED_MEMBER {
+        assert!(
+            request.iter().all(|name| name != deferred),
+            "{deferred} is deferred and must never be requested upstream"
+        );
+    }
+    assert!(!request.iter().any(|name| name == "sasl"));
 }
 
 #[test]

@@ -219,7 +219,41 @@ impl DownstreamAdmission {
             .map(|entry| entry.network)
             .take(crate::bouncer_networks::MAX_BOUNCER_BATCH)
             .collect();
-        let wiring = ClientWiring::new(self.session, self.client, expected_nick, bindable, stream);
+        // The advertisement this client negotiates against is the selected Network's own,
+        // read live rather than from the last published snapshot. Registration is the only
+        // moment a client can negotiate *and* have the projection rendered for what it
+        // negotiated, because the projection is sent once at attach. Answering from the
+        // build's unconditional list would mean a client could never obtain an extended
+        // projection for itself, because every upstream-conditional capability would be
+        // refused at exactly the moment the client could still have used it.
+        let advertisement = match self.selected.as_ref().map(|selection| selection.network) {
+            Some(network) => self
+                .control
+                .advertisement(network)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        // Empty means the Network has no live owner, or its owner has not finished
+        // negotiating upstream. What the build serves unconditionally is the only honest
+        // answer in that window, and it is what this wiring was seeded with before.
+        let advertisement = if advertisement.is_empty() {
+            crate::downstream::downstream_supported()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        } else {
+            advertisement
+        };
+        let wiring = ClientWiring::new(
+            self.session,
+            self.client,
+            expected_nick,
+            bindable,
+            advertisement,
+            stream,
+        );
+
         // Registration reports no intents upward: nothing has claimed this client yet,
         // and forwarding a pre-registration intent to an owner that does not exist is
         // exactly the coupling admission exists to remove. The ceiling is applied inside

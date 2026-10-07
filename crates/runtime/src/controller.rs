@@ -117,6 +117,14 @@ pub struct ControlNetwork {
     pub attached_sessions: usize,
     /// Fixed classification of the last attach disposition, never a payload.
     pub last_session_disposition: Option<&'static str>,
+    /// The capability names this Network currently advertises to clients.
+    ///
+    /// Published here rather than recomputed by the reader because it is a function of
+    /// the *upstream* negotiation, which only the owner knows. A client that asks for a
+    /// capability during registration is answered before any owner exists for it, so it
+    /// needs this value before registration finishes -- and an empty list here would mean
+    /// "this Network offers nothing", not "this Network has not answered yet".
+    pub advertisement: Vec<String>,
 }
 
 /// A typed mutation or observation the controller performs on behalf of one caller.
@@ -128,6 +136,11 @@ pub enum ControlRequest {
     /// Read the current [`ControlSnapshot`].
     Status {
         reply: oneshot::Sender<ControlSnapshot>,
+    },
+    /// Read one Network's current downstream advertisement.
+    Advertisement {
+        network: NetworkId,
+        reply: oneshot::Sender<Vec<String>>,
     },
     /// Re-read one Network's durable configuration and reconcile it.
     Reconcile {
@@ -228,6 +241,24 @@ impl RuntimeControlHandle {
     pub async fn status(&self) -> Result<ControlSnapshot, RuntimeError> {
         let (reply, response) = oneshot::channel();
         self.send(ControlRequest::Status { reply })?;
+        response.await.map_err(|_| RuntimeError::Stopped)
+    }
+
+    /// Reads the capability names one Network currently advertises.
+    ///
+    /// Read from the live owner rather than from the published snapshot, because the two
+    /// answer different questions. The published snapshot is a copy taken at the last
+    /// controller revision, and an owner negotiates with its upstream moments after it is
+    /// inserted -- so a copy can report an advertisement that is still empty while the
+    /// owner has long since published a real one. A client negotiating during
+    /// registration asks precisely in that window.
+    ///
+    /// Empty means the Network has no live owner yet, or its owner has not finished
+    /// negotiating upstream; the caller falls back to what the build serves
+    /// unconditionally.
+    pub async fn advertisement(&self, network: NetworkId) -> Result<Vec<String>, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::Advertisement { network, reply })?;
         response.await.map_err(|_| RuntimeError::Stopped)
     }
 
@@ -616,6 +647,14 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             ControlRequest::Status { reply } => {
                 let _ = reply.send(self.status.borrow().clone());
             }
+            ControlRequest::Advertisement { network, reply } => {
+                let advertisement = self
+                    .live
+                    .get(&network)
+                    .map(|owner| owner.snapshot.borrow().advertisement.clone())
+                    .unwrap_or_default();
+                let _ = reply.send(advertisement);
+            }
             ControlRequest::Reconcile { network, reply } => {
                 let outcome = match self.live.get(&network) {
                     Some(owner) => owner.handle.reconcile().await,
@@ -907,6 +946,11 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                         phase: gauge.phase.map(|phase| phase.as_str().to_owned()),
                         attached_sessions: gauge.attached_sessions,
                         last_session_disposition: gauge.last_session_disposition,
+                        // Bounded by the reviewed advertisement size, and cloned under the
+                        // same borrow that reads the rest of the gauge. The borrow is
+                        // dropped before `publish` returns, and nothing here writes to the
+                        // snapshot.
+                        advertisement: gauge.advertisement.clone(),
                     }
                 }
                 None => ControlNetwork {
@@ -916,6 +960,14 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                     phase: None,
                     attached_sessions: 0,
                     last_session_disposition: None,
+                    // A Network with no live owner has negotiated nothing. Its clients are
+                    // held in admission until one appears, and the owner replaces this
+                    // value on attach, so the static list is the correct answer here and
+                    // not a placeholder.
+                    advertisement: crate::downstream::downstream_supported()
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect(),
                 },
             };
             networks.push(entry);

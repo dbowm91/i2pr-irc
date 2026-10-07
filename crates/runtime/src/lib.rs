@@ -24,6 +24,7 @@ pub mod ctcp;
 pub mod downstream;
 pub mod ircv3;
 pub mod journal;
+pub mod member;
 pub mod owner;
 pub mod playback;
 pub mod presence;
