@@ -99,6 +99,10 @@ pub enum ServCommand {
     Diag,
     /// Report one Network's bounded diagnostics.
     DiagNetwork { network: NetworkId },
+    /// Write the whole non-secret configuration out as a versioned snapshot.
+    ConfigExport,
+    /// Validate a snapshot and report what applying it would do, without applying it.
+    ConfigPlan,
 }
 
 impl std::fmt::Debug for ServCommand {
@@ -139,6 +143,8 @@ impl std::fmt::Debug for ServCommand {
             Self::SaslReset { network } => return write!(f, "SaslReset({network:?})"),
             Self::Diag => return write!(f, "Diag"),
             Self::DiagNetwork { network } => return write!(f, "DiagNetwork({network:?})"),
+            Self::ConfigExport => return write!(f, "ConfigExport"),
+            Self::ConfigPlan => return write!(f, "ConfigPlan"),
         };
         f.write_str(name)
     }
@@ -169,6 +175,8 @@ pub const HELP_TEXT: &str = concat!(
     " | sasl reset <netid>",
     " | diag",
     " | diag network <netid>",
+    " | config export",
+    " | config plan",
 );
 
 /// Parses one command line.
@@ -324,6 +332,15 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
         // or `detail=` word: a diagnostic surface that could be asked to render *less* would
         // also be one that could be asked to render something else, and this surface has no
         // second mode. Whole-process or one named Network, nothing in between.
+        // `CONFIG` takes a subcommand and nothing else. There is no `import <file>` and no
+        // `path=` attribute: the plan's own stop conditions forbid generic file side effects,
+        // and a format that could read a file would be a format whose input an Operator
+        // cannot see. Import arrives as text the Operator typed, or not at all.
+        "CONFIG" => match word(1).to_ascii_uppercase().as_str() {
+            "EXPORT" => Ok(ServCommand::ConfigExport),
+            "PLAN" => Ok(ServCommand::ConfigPlan),
+            other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+        },
         "DIAG" => match word(1).to_ascii_uppercase().as_str() {
             "" => {
                 if words.len() != 1 {
@@ -389,6 +406,8 @@ mod tests {
             "sasl reset 1",
             "diag",
             "diag network 1",
+            "config export",
+            "config plan",
         ] {
             parse(line).unwrap_or_else(|error| panic!("{line:?} must parse: {error}"));
         }

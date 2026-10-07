@@ -28,6 +28,7 @@
 
 use crate::bouncer_networks::{self, BouncerCommand, BouncerError, SERVICE_NICK};
 use crate::bouncerserv::{self, ServCommand};
+use crate::config_snapshot;
 use crate::controller::{ControlSnapshot, RuntimeControlHandle};
 use crate::diagnostics;
 use crate::session::SessionHandle;
@@ -366,6 +367,60 @@ impl ControlSurface {
             }
             ServCommand::Diag => self.report_diagnostics(None).await,
             ServCommand::DiagNetwork { network } => self.report_diagnostics(Some(network)).await,
+            ServCommand::ConfigExport => self.export_config().await,
+            ServCommand::ConfigPlan => self.plan_config().await,
+        }
+    }
+
+    /// Writes the non-secret configuration as a versioned snapshot.
+    ///
+    /// One `NOTICE` per snapshot line, and never a chunk that spans two of them. The help
+    /// text is delivered in arbitrary byte chunks because a human is reading it; a snapshot
+    /// is not, and a client cannot reassemble a line it cannot see the boundaries of. An
+    /// export that came back as indistinguishable 96-byte fragments would be an export
+    /// nobody could paste anywhere.
+    ///
+    /// Each line is bounded so the `NOTICE` prefix plus the line still fits the wire, which
+    /// is why the ceiling lives in [`config_snapshot`] rather than here.
+    async fn export_config(&mut self) {
+        let snapshot = match self.control.export_config().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return self.fail("CONFIG", &map_control(error)),
+        };
+        for line in config_snapshot::render(&snapshot).lines() {
+            self.notice(line);
+        }
+    }
+
+    /// Validates the live configuration by round-tripping it through the snapshot format.
+    ///
+    /// `CONFIG PLAN` reports whether the durable configuration still parses and validates as
+    /// a snapshot, and what the plan for it would be. It mutates nothing: the point is to
+    /// prove the format can represent this bouncer's own state before an Operator relies on
+    /// an export, and to surface a durable record that the format cannot express.
+    async fn plan_config(&mut self) {
+        let snapshot = match self.control.export_config().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return self.fail("CONFIG", &map_control(error)),
+        };
+        let rendered = config_snapshot::render(&snapshot);
+        // Re-parsing what was just rendered is the whole test. A renderer that emits
+        // something its own parser refuses would be a format that cannot round trip, and
+        // that is exactly the defect this command exists to make visible.
+        match config_snapshot::parse(&rendered) {
+            Ok(back) => {
+                let re_rendered = config_snapshot::render(&back);
+                if re_rendered == rendered {
+                    self.notice(&format!(
+                        "config plan ok networks={} bytes={}",
+                        snapshot.networks.len(),
+                        rendered.len()
+                    ));
+                } else {
+                    self.notice("config plan diverged: the snapshot did not round trip");
+                }
+            }
+            Err(error) => self.notice(&format!("config plan invalid: {error:?}")),
         }
     }
 

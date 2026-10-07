@@ -525,6 +525,29 @@ async fn sync(runtime: &mut Runtime, peer: usize, client: &mut Client) {
     client.await_new(mark, "barrier").await;
 }
 
+/// Sends a `BouncerServ` command and returns everything it said, reassembled.
+///
+/// The export arrives as chunked `NOTICE`s, so the harness has to stitch the chunks back
+/// into lines before anything can be parsed. That stitching is part of what a real client
+/// does, and a test that skipped it would be testing a convenience the Operator does not
+/// have.
+async fn config(client: &mut Client, argument: &str) -> String {
+    let mark = client.mark();
+    client
+        .send(&format!("PRIVMSG BouncerServ :{argument}\r\n"))
+        .await;
+    client.await_new(mark, "realname=").await;
+    client.settle().await;
+    let raw = client.since(mark);
+    // One `NOTICE` per snapshot line, so concatenating the bodies *is* the document. If the
+    // bouncer ever chunked a line across two NOTICEs this would silently produce garbage,
+    // which is why the harness reassembles rather than reaching for a single frame.
+    raw.lines()
+        .filter_map(|line| line.split_once(" :").map(|(_, text)| text))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
 // ------------------------------------------------------- diagnostics tests
 
 /// Asks `BouncerServ` for a report and returns everything it said.
@@ -791,5 +814,226 @@ async fn a_diagnostics_line_is_tagged_and_bounded() {
             "a diagnostic must never be the thing that splits a message: {frame}"
         );
     }
+    runtime.stop().await;
+}
+
+// ------------------------------------------------- configuration snapshot tests
+
+#[tokio::test]
+async fn a_configuration_export_round_trips_through_the_snapshot_format() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let exported = config(&mut client, "config export").await;
+    let parsed = i2pr_irc_runtime::config_snapshot::parse(&exported).unwrap_or_else(|error| {
+        panic!("the bouncer's own export must parse: {error:?} in {exported:?}")
+    });
+
+    assert_eq!(parsed.networks.len(), 1);
+    assert_eq!(parsed.networks[0].network, NetworkId(1));
+    assert_eq!(parsed.networks[0].display_name, "net-1");
+    assert_eq!(parsed.networks[0].desired_channels.len(), 1);
+    assert_eq!(parsed.networks[0].desired_channels[0].target, "#room");
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn a_configuration_export_carries_no_credential() {
+    let mut runtime = Runtime::start().await;
+    runtime.bring_online_credentialed(1, &["#room"]).await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let exported = config(&mut client, "config export").await;
+
+    assert!(!exported.contains("hunter2"), "{exported}");
+    assert!(!exported.contains("bob"), "{exported}");
+    assert!(
+        !exported.contains("sasl"),
+        "not even the name of a field that could hold one: {exported}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn a_live_configuration_is_reported_as_a_valid_snapshot() {
+    // The round trip the format's whole usability rests on: if the bouncer cannot read
+    // back its own export, an Operator's export is worthless.
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#a", "#b"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let mark = client.mark();
+    client.send("PRIVMSG BouncerServ :config plan\r\n").await;
+    client.until("config plan").await;
+
+    assert!(
+        !client.since(mark).contains("invalid"),
+        "a bouncer's own configuration must validate: {}",
+        client.since(mark)
+    );
+    assert!(
+        !client.since(mark).contains("diverged"),
+        "and must round trip exactly: {}",
+        client.since(mark)
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_import_applies_a_snapshot_one_network_at_a_time_and_reports_progress() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+
+    let snapshot = i2pr_irc_runtime::config_snapshot::ConfigSnapshot {
+        networks: vec![i2pr_irc_runtime::config_snapshot::SnapshotNetwork {
+            network: NetworkId(7),
+            display_name: "restored".to_owned(),
+            endpoint: i2pr_irc_core::I2pEndpoint::parse(&b32()).expect("a destination"),
+            nick: "bot".to_owned(),
+            username: "user".to_owned(),
+            realname: "bouncer".to_owned(),
+            auto_away: false,
+            keep_nick: false,
+            desired_channels: vec![i2pr_irc_store::DesiredChannelRecord {
+                target: "#restored".to_owned(),
+                position: 0,
+                detached: false,
+            }],
+            action_count: 0,
+        }],
+    };
+
+    let outcome = runtime
+        .control
+        .import_config(snapshot)
+        .await
+        .expect("the import is accepted");
+
+    assert!(outcome.complete(), "{outcome:?}");
+    assert_eq!(outcome.applied, 1);
+    assert_eq!(outcome.remaining, 0);
+    assert!(outcome.stopped_at.is_none());
+    let exported = runtime.control.export_config().await.expect("an export");
+    assert_eq!(exported.networks.len(), 2);
+    assert!(exported.networks.iter().any(|n| n.network == NetworkId(7)));
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_import_that_names_a_different_network_under_one_identity_stops_without_writing_it() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let before = runtime.control.export_config().await.expect("an export");
+
+    // Same identity, different Operator-chosen name: a snapshot from another bouncer.
+    let mut entry = i2pr_irc_runtime::config_snapshot::SnapshotNetwork {
+        network: NetworkId(1),
+        display_name: "a-different-network".to_owned(),
+        endpoint: i2pr_irc_core::I2pEndpoint::parse(&b32()).expect("a destination"),
+        nick: "bot".to_owned(),
+        username: "user".to_owned(),
+        realname: "bouncer".to_owned(),
+        auto_away: false,
+        keep_nick: false,
+        desired_channels: Vec::new(),
+        action_count: 0,
+    };
+    // Network 2 sorts after Network 1, so this would have been applied had Network 1 not
+    // conflicted. That ordering is what makes "stopped" a meaningful claim.
+    let second = i2pr_irc_runtime::config_snapshot::SnapshotNetwork {
+        network: NetworkId(2),
+        display_name: "second".to_owned(),
+        endpoint: entry.endpoint.clone(),
+        nick: "bot".to_owned(),
+        username: "user".to_owned(),
+        realname: "bouncer".to_owned(),
+        auto_away: false,
+        keep_nick: false,
+        desired_channels: Vec::new(),
+        action_count: 0,
+    };
+    entry.desired_channels = Vec::new();
+
+    let outcome = runtime
+        .control
+        .import_config(i2pr_irc_runtime::config_snapshot::ConfigSnapshot {
+            networks: vec![entry, second],
+        })
+        .await
+        .expect("the plan is accepted");
+
+    assert!(!outcome.complete(), "{outcome:?}");
+    assert_eq!(outcome.stopped_at, Some(NetworkId(1)), "{outcome:?}");
+    assert_eq!(
+        outcome.applied, 0,
+        "a conflict is discovered before any write"
+    );
+    let after = runtime.control.export_config().await.expect("an export");
+    assert_eq!(
+        after, before,
+        "a conflicting import must leave nothing behind"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_import_does_not_erase_a_stored_credential() {
+    // The asymmetry that makes a non-secret export safe to import: applying a snapshot
+    // writes `sasl: None`, and a record whose credential is set must survive that write
+    // rather than being overwritten with the absence of one.
+    let mut runtime = Runtime::start().await;
+    runtime.bring_online_credentialed(1, &["#room"]).await;
+
+    let snapshot = runtime.control.export_config().await.expect("an export");
+    let outcome = runtime
+        .control
+        .import_config(snapshot)
+        .await
+        .expect("the import is accepted");
+
+    assert!(outcome.complete(), "{outcome:?}");
+    let record = runtime
+        .control
+        .network_record(NetworkId(1))
+        .await
+        .expect("a record")
+        .expect("the Network still exists");
+    assert!(
+        record.sasl.is_some(),
+        "an import must not silently clear a credential it could not have exported"
+    );
     runtime.stop().await;
 }

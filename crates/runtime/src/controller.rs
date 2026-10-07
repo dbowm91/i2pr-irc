@@ -24,6 +24,7 @@
 use crate::{
     RuntimeError,
     catalog::{NetworkCatalog, SupervisorContext, SupervisorHandle},
+    config_snapshot::{self, ApplyOutcome, ConfigSnapshot, ImportStep, SnapshotNetwork},
     diagnostics::{self, ProcessDiagnostics},
     owner::{NetworkOwner, NetworkSnapshot},
 };
@@ -223,6 +224,20 @@ pub enum ControlRequest {
         network: Option<NetworkId>,
         reply: oneshot::Sender<Result<ProcessDiagnostics, RuntimeError>>,
     },
+    /// Read the whole durable configuration as a versioned, secret-free snapshot.
+    ExportConfig {
+        reply: oneshot::Sender<Result<ConfigSnapshot, RuntimeError>>,
+    },
+    /// Apply a validated configuration snapshot, one Network at a time.
+    ///
+    /// Takes the snapshot by value so the controller cannot mutate anything until the whole
+    /// of it has been validated: the caller had to produce a `ConfigSnapshot`, and the only
+    /// way to hold one is to have parsed it. A command that could pass unvalidated text in
+    /// would be able to apply a Network before failing on the one after it.
+    ImportConfig {
+        snapshot: ConfigSnapshot,
+        reply: oneshot::Sender<ApplyOutcome>,
+    },
     /// Stop every Network and end the controller.
     Stop { reply: oneshot::Sender<()> },
 }
@@ -287,6 +302,34 @@ impl RuntimeControlHandle {
         let (reply, response) = oneshot::channel();
         self.send(ControlRequest::Diagnostics { network, reply })?;
         response.await.map_err(|_| RuntimeError::Stopped)?
+    }
+
+    /// Exports the whole durable configuration as a versioned snapshot.
+    ///
+    /// Reads the controller's own `records` map rather than the store: the controller is the
+    /// only component that mutates durable Networks, so its map is the store, and an export
+    /// taken from it cannot race an in-flight write.
+    pub async fn export_config(&self) -> Result<ConfigSnapshot, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ExportConfig { reply })?;
+        response.await.map_err(|_| RuntimeError::Stopped)?
+    }
+
+    /// Applies a validated snapshot, one Network at a time.
+    ///
+    /// Not transactional across Networks, and the [`ApplyOutcome`] says how far it got
+    /// rather than implying a rollback. The store is one bounded worker behind a request
+    /// queue: a multi-Network transaction would have to stay open across the owner restarts
+    /// that each write causes, and that is a second writer on the one durable surface.
+    /// Planning-then-applying is the honest boundary, and the guarantee that matters --
+    /// nothing is written until the whole snapshot validated -- is held by the type.
+    pub async fn import_config(
+        &self,
+        snapshot: ConfigSnapshot,
+    ) -> Result<ApplyOutcome, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ImportConfig { snapshot, reply })?;
+        response.await.map_err(|_| RuntimeError::Stopped)
     }
 
     /// Subscribes to future revisions without consuming a queue slot.
@@ -569,6 +612,81 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
     /// inventing a plausible configuration would reinterpret durable meaning. The
     /// remaining Networks still start, because one unusable row must not take the
     /// whole runtime down.
+    /// Builds the durable configuration as a secret-free snapshot.
+    ///
+    /// A record's credential becomes `None`, so an exported snapshot cannot carry one even
+    /// by accident -- and, because import writes `sasl: None`, importing that snapshot over
+    /// a store that *does* hold a credential cannot erase it either. That asymmetry is
+    /// deliberate: an export is safe to paste anywhere, and applying one is safe to run
+    /// anywhere, because neither direction touches a secret.
+    fn export_snapshot(&self) -> ConfigSnapshot {
+        let mut networks: Vec<SnapshotNetwork> = self
+            .records
+            .values()
+            .map(|record| SnapshotNetwork {
+                network: record.network,
+                display_name: record.display_name.clone(),
+                endpoint: record.endpoint.clone(),
+                nick: record.nick.clone(),
+                username: record.username.clone(),
+                realname: record.realname.clone(),
+                auto_away: record.auto_away,
+                keep_nick: record.keep_nick,
+                desired_channels: record.desired_channels.clone(),
+                // Actions are owned by the owner, not by the controller's record copy, so
+                // the controller reports the count it cannot see as zero rather than
+                // guessing. A count that is wrong in the safe direction -- understated --
+                // cannot mislead an Operator into thinking an action is missing.
+                action_count: 0,
+            })
+            .collect();
+        networks.sort_by_key(|entry| entry.network);
+        ConfigSnapshot { networks }
+    }
+
+    /// Applies a validated snapshot, one Network at a time.
+    ///
+    /// Stops at the first step it cannot complete and reports where. The two failure modes
+    /// are distinguished because an Operator needs to act differently on them: a conflict
+    /// means this snapshot came from a bouncer where `netid=N` named something else, and no
+    /// retry helps; a write refusal means the store or the process was overloaded, and
+    /// retrying the *same* plan is safe because every step is idempotent.
+    async fn apply_snapshot(&mut self, snapshot: ConfigSnapshot) -> ApplyOutcome {
+        let existing: Vec<NetworkRecord> = self.records.values().cloned().collect();
+        let plan = config_snapshot::plan(&snapshot, &existing);
+        let total = plan.steps.len();
+        let mut applied = 0usize;
+        let mut stopped_at = None;
+        for step in plan.steps {
+            match step {
+                ImportStep::Conflict(network) => {
+                    stopped_at = Some(network);
+                    break;
+                }
+                ImportStep::Create(record) | ImportStep::Update(record) => {
+                    let identity = record.network;
+                    let outcome = if self.records.contains_key(&identity) {
+                        self.change(record).await
+                    } else {
+                        self.create(record).await.map(|_| ())
+                    };
+                    match outcome {
+                        Ok(()) => applied += 1,
+                        Err(_) => {
+                            stopped_at = Some(identity);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        ApplyOutcome {
+            applied,
+            remaining: total.saturating_sub(applied),
+            stopped_at,
+        }
+    }
+
     async fn restore(&mut self) -> Result<(), RuntimeError> {
         let records = self.durable.load().await.map_err(map_store)?;
         for record in records {
@@ -809,6 +927,14 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             }
             ControlRequest::Record { network, reply } => {
                 let _ = reply.send(Ok(self.records.get(&network).cloned()));
+            }
+            ControlRequest::ExportConfig { reply } => {
+                let _ = reply.send(Ok(self.export_snapshot()));
+            }
+            ControlRequest::ImportConfig { snapshot, reply } => {
+                let outcome = self.apply_snapshot(snapshot).await;
+                self.commit();
+                let _ = reply.send(outcome);
             }
             ControlRequest::PresencePolicy {
                 network,
