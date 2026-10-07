@@ -1,6 +1,6 @@
 # I2P Router Integration Roadmap
 
-Status: proposed / blocked on bouncer-core M005
+Status: proposed — R001 dependency-ready; R002/R003 gated on external contracts
 
 Long-term references:
 

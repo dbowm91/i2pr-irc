@@ -1,6 +1,6 @@
 # Bouncer Core M005-A / Plan 020 — Runtime Control and Downstream Admission Foundation
 
-Status: ready
+Status: closed
 
 Repository baseline: 44c65a7328d29f8a03775c41c4d3cf99c30fa1f3
 

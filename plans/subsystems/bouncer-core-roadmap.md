@@ -132,7 +132,7 @@ Research 005 decomposed M004 and promoted the unresolved response-routing findin
 
 Canonical product/security direction remains unchanged: I2P-only upstream authority through I2pStreamProvider, one live owner per Network, bounded asynchronous behavior, durable DesiredState separate from fresh ObservedState, and no blind replay across ambiguous delivery.
 
-Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. Plans 020-026 are closed and Plan 027 is the only dependency-ready step.
+Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. All nine are closed, M005 is complete, and no bouncer-core implementation plan remains executable.
 
 ## 5. Target architecture
 
@@ -712,7 +712,7 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M004-C / Plan 017 | closed | plans/implementation/bouncer-core/017-m004c-adverse-network-resource-qualification.md | plans/closure/bouncer-core/017-status.md | Plans 015 + 016 closed |
 | M004-D / Plan 018 | closed | plans/implementation/bouncer-core/018-m004d-integrated-anonymity-qualification-and-closure.md | plans/closure/bouncer-core/018-status.md | Plan 017 closure |
 | C019 / Corrective 019 | closed | plans/implementation/bouncer-core/019-m004-findings-corrective.md | plans/closure/bouncer-core/019-status.md | Closed UF-015-1, UF-017-1, UF-018-1; never gated M005 |
-| M005 | active — decomposed; M005-A through M005-H closed, M005-I ready | plans 020-028 | future plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
+| M005 | closed | plans 020-028 | plans/closure/bouncer-core/028-status.md | M004 closed; Research 006 + ADR-0003 accepted |
 | M005-A / Plan 020 | closed | plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md | plans/closure/bouncer-core/020-status.md | M004 + ADR-0003 |
 | M005-B / Plan 021 | closed | plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md | plans/closure/bouncer-core/021-status.md | Plan 020 closure |
 | M005-C / Plan 022 | closed | plans/implementation/bouncer-core/022-m005c-presence-and-preferred-nick-policy.md | plans/closure/bouncer-core/022-status.md | Plan 021 closure |
@@ -720,5 +720,5 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M005-E / Plan 024 | closed | plans/implementation/bouncer-core/024-m005e-indexed-history-search-and-chathistory-completion.md | plans/closure/bouncer-core/024-status.md | Plan 023 closure |
 | M005-F / Plan 025 | closed | plans/implementation/bouncer-core/025-m005f-downstream-ircv3-protocol-polish.md | plans/closure/bouncer-core/025-status.md | Plan 024 closure |
 | M005-G / Plan 026 | closed | plans/implementation/bouncer-core/026-m005g-richer-ircv3-member-state-mediation.md | plans/closure/bouncer-core/026-status.md | Plan 025 closure |
-| M005-H / Plan 027 | ready | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | future plans/closure/bouncer-core/027-status.md | Plan 026 closure |
-| M005-I / Plan 028 | blocked | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | future plans/closure/bouncer-core/028-status.md | Plan 027 closure |
+| M005-H / Plan 027 | closed | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | plans/closure/bouncer-core/027-status.md | Plan 026 closure |
+| M005-I / Plan 028 | closed | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | plans/closure/bouncer-core/028-status.md | Plan 027 closure |

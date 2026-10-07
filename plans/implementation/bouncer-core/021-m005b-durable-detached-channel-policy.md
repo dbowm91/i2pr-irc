@@ -1,6 +1,6 @@
 # Bouncer Core M005-B / Plan 021 — Durable Detached-Channel Policy
 
-Status: blocked
+Status: closed
 
 Blocker:
 

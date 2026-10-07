@@ -1,6 +1,6 @@
 # Bouncer Core M004-B — Global Reconnect Budget and Fair Scheduling
 
-Status: blocked
+Status: closed
 
 Blocker:
 

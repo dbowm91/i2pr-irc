@@ -1,6 +1,6 @@
 # Bouncer Core M004-C — Adverse-Network and Resource Qualification
 
-Status: blocked
+Status: closed
 
 Blockers:
 

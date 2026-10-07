@@ -1,6 +1,6 @@
 # Bouncer Core M004-A — Anonymity Protocol Mediation
 
-Status: blocked
+Status: closed
 
 Blocker:
 

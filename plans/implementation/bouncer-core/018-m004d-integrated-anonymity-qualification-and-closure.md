@@ -1,6 +1,6 @@
 # Bouncer Core M004-D — Integrated Anonymity Qualification and M004 Closure
 
-Status: blocked
+Status: closed
 
 Blocker:
 

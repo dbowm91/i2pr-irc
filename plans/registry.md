@@ -31,14 +31,19 @@ Canonical direction:
 
 ## Active and dependency-ready implementation plans
 
-| Plan | Status | Class | Source | Closure/result |
-|---|---|---|---|---|
-| Bouncer Core M005-E / Plan 024 — Indexed History Search and CHATHISTORY Completion | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/024-status.md |
+**None.** No registered implementation plan is dependency-ready.
+
+Bouncer core has no open plan: all 28 plans under `plans/implementation/bouncer-core/` carry `Status: closed`, and both M004 and M005 are complete. The only dependency-eligible unit is router **R001**, but it exists solely as roadmap prose in `plans/subsystems/i2p-router-integration-roadmap.md` §7 — there is no `plans/implementation/router-integration/` directory and no R001 plan file. Authoring that plan is the next planning step; the milestone is not yet a handoff artifact and must not be started from the roadmap alone.
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M005-I / Plan 028 — Integrated Mature-Bouncer Qualification and M005 Closure | closed | invariant + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/028-status.md |
+| Bouncer Core M005-H / Plan 027 — Operator Diagnostics, Configuration Snapshots, and Constrained Registration Actions | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/027-status.md |
+| Bouncer Core M005-G / Plan 026 — Richer IRCv3 Member-State Mediation | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/026-status.md |
+| Bouncer Core M005-F / Plan 025 — Downstream IRCv3 Protocol Polish | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/025-status.md |
+| Bouncer Core M005-E / Plan 024 — Indexed History Search and CHATHISTORY Completion | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/024-status.md |
 | Bouncer Core M005-D / Plan 023 — Bouncer Networks and Local IRC Administration | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/023-status.md |
 | Bouncer Core M005-C / Plan 022 — Presence and Preferred-Nick Policy | closed | invariant + capability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/022-status.md |
 | Bouncer Core M005-B / Plan 021 — Durable Detached-Channel Policy | closed | invariant + infrastructure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/021-status.md |
@@ -65,14 +70,9 @@ Canonical direction:
 
 ## Blocked implementation plans
 
-| Plan | Status | Blocker |
-|---|---|---|
-| Bouncer Core M005-F / Plan 025 — Downstream IRCv3 Protocol Polish | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/025-status.md |
-| Bouncer Core M005-G / Plan 026 — Richer IRCv3 Member-State Mediation | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/026-status.md |
-| Bouncer Core M005-H / Plan 027 — Operator Diagnostics, Configuration Snapshots, and Constrained Registration Actions | closed | capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/027-status.md |
-| Bouncer Core M005-I / Plan 028 — Integrated Mature-Bouncer Qualification and M005 Closure | closed | invariant + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/028-status.md |
+**None.** No registered implementation plan carries a named hard or interface dependency.
 
-M005 closure is complete and discharges router integration's ordering dependency; R001 is eligible under its own prerequisites, while R002 and R003 remain gated by their existing interface and product conditions. See the subsystem table and plans/subsystems/i2p-router-integration-roadmap.md.
+The router milestones are gated on external conditions rather than on any registered plan, and are tracked in their own roadmap: R002 waits on stable public i2pr app contracts for I2P streams, local accepted streams, and lifecycle; R003 requires a concrete product need plus stable scoped Proposal 170 semantics. See plans/subsystems/i2p-router-integration-roadmap.md.
 
 ## Unplanned later milestones
 
@@ -115,11 +115,14 @@ Important retained conclusions:
 
 ## Immediate handoff
 
-Implement only:
+**Implement nothing from `plans/implementation/bouncer-core/`.** Every registered bouncer-core plan is closed and both milestones are complete.
 
-- plans/implementation/bouncer-core/020-m005a-runtime-control-and-downstream-admission.md
-- plans/implementation/bouncer-core/021-m005b-durable-detached-channel-policy.md
+Closure state:
 
-Research 006 and ADR-0003 freeze the control-session/runtime ownership needed by M005. Plan 020 adds process control and pre-bind admission without moving bound-session or upstream ownership out of NetworkOwner. Plan 021 adds a durable presentation policy for channels the bouncer still holds, without moving membership ownership out of NetworkOwner. Plan 022 adds durable presence and preferred-nick policy, per-session presence classification, and generation-owned reclaim, without moving membership ownership out of NetworkOwner. Plan 023 adds a bouncer control plane — an interop draft and a local administration service — that submits every mutation as a typed controller request, without granting any session a store, supervisor, or owner handle. Plan 024 adds bounded server-side history search and indexed CHATHISTORY references, without replacing HistoryEventId as canonical order and without letting a session reach storage directly: a search is compiled by the owning generation and executed through the one bounded store worker.
+- Plans 020-026 closed with no open findings; Plans 027 and 028 closed with the findings they recorded resolved, withdrawn, or explicitly stated as bounded. Closure records are at `plans/closure/bouncer-core/{020..028}-status.md`.
+- M005 closure is recorded at `plans/closure/bouncer-core/028-status.md`. That record found and fixed three production defects the per-subsystem suites had missed and withdrew the finding Plan 027 carried in.
+- No unresolved high-severity finding remains. Two low-severity boundaries are stated rather than fixed, and both are permitted: a whole-process `DIAG` reports at most two Networks (a consequence of the bounded control queue, and `DIAG NETWORK` always delivers one Network in full), and configuration import is not transactional across Networks (nothing is written until the whole snapshot validates).
 
-Plans 020-026 are closed at plans/closure/bouncer-core/{020,021,022,023,024,025,026}-status.md, all with no open findings; between them they landed the bounded RuntimeController, the pre-bind DownstreamAdmission, the one-shot PreparedSession transfer, schema 3, the typed DesiredChannelRecord, schema 4's durable detached flag, the detach/reattach transitions, schema 5's auto_away and keep_nick policy, per-session active/passive classification with draft/pre-away mediation, owner-scoped manual away, a bounded deterministic nick fallback answered inside the registration window, generation-owned reclaim, the soju.im/bouncer-networks draft, the local BouncerServ service, controller-allocated netids, snapshot-derived notification deltas, the soju.im/search adapter, schema 6's FTS5 side index and effective_time rule, indexed msgid and timestamp reference lookups, the HistoryPosition model for out-of-window references, a two-seek AROUND, the four M005-F capability promotions, the per-session tag surface and refusal form, one live advertisement shared by the owner and the reader, the five accepted member-state capabilities with their upstream-conditional advertisement and per-session mediation, bounded observed member metadata with a three-state account model, per-session reduction of extended JOINs and prefix runs across NAMES and routed WHO and WHOIS, a reviewed deferral list for the four member capabilities this build does not mediate, and registration that reads the Network's live advertisement. Plan 027 is unblocked and dependency-ready. Plan 028 remains registered behind the sequential closure gate. Router integration remains blocked behind M005 closure, and no router-specific implementation is authorized by the M004 closure, the M005 planning handoff, or the Plan 020-025 closures.
+The next unit of work is **planning, not implementation**: author the R001 portable SAM adapter plan under `plans/implementation/router-integration/`. No such plan exists yet. The R001 milestone in `plans/subsystems/i2p-router-integration-roadmap.md` §7 is roadmap prose, not a handoff artifact — `plans/003-planning-process.md` requires a bounded plan carrying readiness and dependencies, current evidence, invariants, scope, ordered work packages, failure and restart semantics, compatibility, tests, verification, documentation, acceptance criteria, stop conditions, and closure evidence before any of it is executed.
+
+Do not begin R001 implementation from the long-term roadmap or from the R001 milestone prose alone. R001 must not add a generic upstream TCP or DNS connector, a clearnet fallback, or any route other than `I2pStreamProvider`; see `plans/adrs/ADR-0001-i2p-only-upstream-and-router-adapter-boundary.md`. R002 and R003 are authorized by nothing in this registry.
