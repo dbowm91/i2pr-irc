@@ -1,6 +1,6 @@
 # I2P Router Integration Roadmap
 
-Status: active — R001-A ready; R001-B-D sequenced; R002/R003 gated on external contracts
+Status: active — R001-A closed; R001-B ready; R001-C-D sequenced; R002/R003 gated on external contracts
 
 Long-term references:
 
@@ -87,7 +87,7 @@ Official SAM guidance supports the selected baseline: 3.1 is stable/recommended,
 
 The i2pr repository has substantial closed SAM 3.1 localhost/server evidence and is a high-value qualification target, but i2pr private crates are not a bouncer dependency. The separate SAM library effort is likewise a future conformance/backend candidate rather than an R001 blocker.
 
-R001 implementation handoffs are registered as Plans 029-032. Plan 029 is the only dependency-ready handoff.
+R001 implementation handoffs are registered as Plans 029-032. Plan 030 is the only dependency-ready handoff; R001-A / Plan 029 is closed.
 
 ## 5. Target architecture
 
@@ -140,7 +140,7 @@ scoped app-authorized Proposal 170 adapter
 bouncer-core M005 [closed]
      |
      v
-R001-A / Plan 029
+R001-A / Plan 029 [closed]
 provider scope + lifecycle + endpoint profile
      |
      v
@@ -164,8 +164,8 @@ integration                 (only if concrete need exists)
 
 Dependency classes:
 
-- Plan 029 is dependency-ready; M005 is closed and ADRs 0004/0005 plus Research 007 freeze its contract.
-- Plan 030 hard-depends on Plan 029 closure.
+- Plan 029 is dependency-ready; M005 is closed and ADRs 0004/0005 plus Research 007 freeze its contract. **Satisfied and closed.**
+- Plan 030 hard-depends on Plan 029 closure. **Satisfied.**
 - Plan 031 hard-depends on Plan 030 closure.
 - Plan 032 hard-depends on Plan 031 closure and operationally depends on live router environments for each portability claim.
 - R002 hard-depends on R001 closure and interface-depends on stable written i2pr app contracts for I2P streams/local accepted streams/lifecycle.
@@ -187,8 +187,8 @@ Hard dependency:
 
 Implementation decomposition:
 
-1. R001-A / Plan 029 — provider scope, lifecycle, and endpoint foundation. **Ready**.
-2. R001-B / Plan 030 — owned SAM 3.1 wire/client foundation. **Blocked on 029**.
+1. R001-A / Plan 029 — provider scope, lifecycle, and endpoint foundation. **Closed**; plans/closure/router-integration/029-status.md.
+2. R001-B / Plan 030 — owned SAM 3.1 wire/client foundation. **Ready**; its hard dependency on 029 is satisfied.
 3. R001-C / Plan 031 — per-Network SAM provider integration. **Blocked on 030**.
 4. R001-D / Plan 032 — cross-router qualification and R001 closure. **Blocked on 031 plus live evidence availability for claims**.
 
@@ -350,9 +350,9 @@ Proposal 170 is not required for completion unless a later canonical product req
 
 | Milestone | Status | Implementation plan | Closure record | Blockers |
 |---|---|---|---|---|
-| R001 | active / planned | Plans 029-032 | future plans/closure/router-integration/032-status.md | Plan 029 ready; later R001 plans sequenced |
-| R001-A / Plan 029 | ready | plans/implementation/router-integration/029-r001a-provider-scope-lifecycle-and-endpoint-foundation.md | future plans/closure/router-integration/029-status.md | none |
-| R001-B / Plan 030 | blocked | plans/implementation/router-integration/030-r001b-owned-sam31-wire-client-foundation.md | future plans/closure/router-integration/030-status.md | Plan 029 closure |
+| R001 | active / in progress | Plans 029-032 | future plans/closure/router-integration/032-status.md | Plan 029 closed; Plan 030 ready; later R001 plans sequenced |
+| R001-A / Plan 029 | closed | plans/implementation/router-integration/029-r001a-provider-scope-lifecycle-and-endpoint-foundation.md | plans/closure/router-integration/029-status.md | none |
+| R001-B / Plan 030 | ready | plans/implementation/router-integration/030-r001b-owned-sam31-wire-client-foundation.md | future plans/closure/router-integration/030-status.md | none |
 | R001-C / Plan 031 | blocked | plans/implementation/router-integration/031-r001c-per-network-sam-provider-integration.md | future plans/closure/router-integration/031-status.md | Plan 030 closure |
 | R001-D / Plan 032 | blocked | plans/implementation/router-integration/032-r001d-sam-cross-router-qualification-and-closure.md | future plans/closure/router-integration/032-status.md | Plan 031 closure + operational live-router evidence |
 | R002 | blocked | future | future | R001 closure + stable i2pr app stream/listener/lifecycle contracts |

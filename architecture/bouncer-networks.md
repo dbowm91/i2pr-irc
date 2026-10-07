@@ -43,7 +43,7 @@ identity the Operator did not ask to publish.
 
 ### One real limitation
 
-A canonical raw `Destination` is 516 characters, and an IRC line is at most 512. No
+A raw `Destination` is at least 516 characters, and an IRC line is at most 512. No
 `BOUNCER ADDNETWORK host=…` line can carry one, so this control surface cannot configure
 that form. `MAX_BOUNCER_LINE_BYTES` is therefore the wire's own constant rather than a
 larger number that would describe a line the decoder has already refused to deliver. The

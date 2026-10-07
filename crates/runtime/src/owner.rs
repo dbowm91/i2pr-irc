@@ -1182,7 +1182,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation)));
                     return Ok(());
                 }
-                result = timeout_connection(self.provider.connect(&self.context.record.endpoint)) => {
+                result = timeout_connection(
+                    self.provider
+                        .connect(self.network, &self.context.record.endpoint),
+                ) => {
                     match result {
                         Ok(Ok(stream)) => Ok(stream),
                         Ok(Err(error)) => Err(RuntimeError::Provider(error)),

@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use i2pr_irc_core::{
     ByteStream, ClientId, ConnectionGeneration, I2pEndpoint, I2pStreamProvider, LocalAcceptor,
-    ProviderError,
+    NetworkId, ProviderError,
 };
 use std::{
     collections::VecDeque,
@@ -383,6 +383,47 @@ pub struct FakeI2pStreamProvider {
     peers: Mutex<VecDeque<ScriptedStream>>,
     controllers: Mutex<VecDeque<FaultController>>,
     peer_ready: Notify,
+    /// Every Network this provider was asked to connect on behalf of, in call order.
+    ///
+    /// Recorded because scope is part of the provider contract: a test that asserts two
+    /// Networks never share a router resource has to be able to see which scope each
+    /// attempt claimed, not merely how many attempts there were.
+    scopes: Mutex<Vec<NetworkId>>,
+    /// Every Network this provider was asked to release, in call order.
+    releases: Mutex<Vec<NetworkId>>,
+}
+
+impl FakeI2pStreamProvider {
+    /// Every scope claimed by a connect attempt, oldest first.
+    pub fn requested_scopes(&self) -> Vec<NetworkId> {
+        self.scopes.lock().expect("provider lock poisoned").clone()
+    }
+    /// Every scope passed to release, oldest first.
+    pub fn released_scopes(&self) -> Vec<NetworkId> {
+        self.releases
+            .lock()
+            .expect("provider lock poisoned")
+            .clone()
+    }
+    /// Whether `network` was released at least once.
+    pub fn was_released(&self, network: NetworkId) -> bool {
+        self.releases
+            .lock()
+            .expect("provider lock poisoned")
+            .contains(&network)
+    }
+    fn record_scope(&self, network: NetworkId) {
+        let mut scopes = self.scopes.lock().expect("provider lock poisoned");
+        if scopes.len() < MAX_PROVIDER_QUEUE {
+            scopes.push(network);
+        }
+    }
+    fn record_release(&self, network: NetworkId) {
+        let mut releases = self.releases.lock().expect("provider lock poisoned");
+        if releases.len() < MAX_PROVIDER_QUEUE {
+            releases.push(network);
+        }
+    }
 }
 impl FakeI2pStreamProvider {
     pub fn queue_outcome(
@@ -478,7 +519,12 @@ impl<T> DeferredCompletions<T> {
 }
 #[async_trait]
 impl I2pStreamProvider for FakeI2pStreamProvider {
-    async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError> {
+    async fn connect(
+        &self,
+        network: NetworkId,
+        endpoint: &I2pEndpoint,
+    ) -> Result<Box<dyn ByteStream>, ProviderError> {
+        self.record_scope(network);
         {
             let mut requested = self.requested.lock().expect("provider lock poisoned");
             if requested.len() >= MAX_PROVIDER_QUEUE {
@@ -507,6 +553,10 @@ impl I2pStreamProvider for FakeI2pStreamProvider {
         }
         self.peer_ready.notify_one();
         Ok(Box::new(client))
+    }
+    async fn release(&self, network: NetworkId) -> Result<(), ProviderError> {
+        self.record_release(network);
+        Ok(())
     }
 }
 
@@ -696,9 +746,10 @@ mod tests {
         let provider = FakeI2pStreamProvider::default();
         provider.queue_outcome(Ok(FaultScript::default())).unwrap();
         let endpoint = I2pEndpoint::parse("irc.example.i2p").unwrap();
-        let mut stream = provider.connect(&endpoint).await.unwrap();
+        let mut stream = provider.connect(NetworkId(9), &endpoint).await.unwrap();
         let mut peer = provider.take_peer().await;
         assert_eq!(provider.requested_endpoints(), vec![endpoint]);
+        assert_eq!(provider.requested_scopes(), vec![NetworkId(9)]);
         tokio::io::AsyncWriteExt::write_all(&mut peer, b"PING\r\n")
             .await
             .unwrap();
@@ -707,6 +758,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes, b"PING\r\n");
+    }
+
+    /// Scope is observable per Network, not merely per attempt, because a test that
+    /// asserts two Networks keep separate router resources has to distinguish
+    /// "connected twice" from "connected twice to the same Network".
+    #[tokio::test]
+    async fn fake_provider_records_scope_and_release_per_network() {
+        let provider = FakeI2pStreamProvider::default();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        provider.queue_outcome(Ok(FaultScript::default())).unwrap();
+        let endpoint = I2pEndpoint::parse("irc.example.i2p").unwrap();
+        let _first = provider.connect(NetworkId(1), &endpoint).await.unwrap();
+        let _second = provider.connect(NetworkId(2), &endpoint).await.unwrap();
+        assert_eq!(
+            provider.requested_scopes(),
+            vec![NetworkId(1), NetworkId(2)]
+        );
+        provider.release(NetworkId(1)).await.unwrap();
+        assert_eq!(provider.released_scopes(), vec![NetworkId(1)]);
+        assert!(provider.was_released(NetworkId(1)));
+        assert!(!provider.was_released(NetworkId(2)));
     }
     #[tokio::test]
     async fn local_acceptor_is_a_separate_local_stream_fixture() {

@@ -60,7 +60,28 @@ impl SessionIdAllocator {
         Some(SessionId(next))
     }
 }
-pub const MAX_I2P_ENDPOINT_BYTES: usize = 516;
+/// Ceiling on a single endpoint token, for every destination form alike.
+///
+/// One `.b32.i2p` address is the longest *name* a network can present, and a raw
+/// Base64 destination is the longest *target* it can present. They are not the same
+/// length, so the old 516 ceiling silently served both: it sized the name case and was
+/// two orders of magnitude short for a destination, rejecting real ones.
+///
+/// This is a size ceiling, not an endpoint policy. It bounds what a router adapter may
+/// be handed before any name or destination rules are applied, so a hostile or
+/// malformed endpoint cannot become unbounded work inside a provider.
+pub const MAX_I2P_ENDPOINT_BYTES: usize = 4096;
+
+/// Shortest raw Base64 destination: 256 bytes of key material is 344 base64 characters
+/// unpadded, and the I2P transport adds at least 172 bytes more.
+pub const MIN_I2P_DESTINATION_CHARS: usize = 516;
+
+/// Longest raw Base64 destination, equal to the application endpoint ceiling.
+///
+/// Plan 029 section 10 fixes one ceiling for every destination form, so a Destination is
+/// bounded by the same value as any other endpoint rather than by a second, tighter
+/// number that nothing else in the codebase knows about.
+pub const MAX_I2P_DESTINATION_CHARS: usize = MAX_I2P_ENDPOINT_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum I2pEndpointKind {
@@ -86,6 +107,14 @@ pub enum EndpointError {
 }
 impl I2pEndpoint {
     pub fn parse(value: &str) -> Result<Self, EndpointError> {
+        // Decided before the name guard below, because the two alphabets disagree: a
+        // name may not contain `/` or `:`, but a Base64 destination legitimately may.
+        if valid_destination(value) {
+            return Ok(Self {
+                kind: I2pEndpointKind::Destination,
+                canonical: value.to_owned(),
+            });
+        }
         if value.is_empty()
             || value.len() > MAX_I2P_ENDPOINT_BYTES
             || value.ends_with('.')
@@ -133,12 +162,6 @@ impl I2pEndpoint {
                 return Err(EndpointError::Invalid);
             }
             (I2pEndpointKind::Hostname, lower)
-        } else if value.len() == 516
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'~'))
-        {
-            (I2pEndpointKind::Destination, value.to_owned())
         } else {
             return Err(EndpointError::Invalid);
         };
@@ -150,6 +173,36 @@ impl I2pEndpoint {
     pub fn kind(&self) -> I2pEndpointKind {
         self.kind
     }
+}
+
+/// Reports whether `value` is a raw Base64 I2P destination rather than a name.
+///
+/// Plan 029 section 10 specifies the body alphabet as `A-Z a-z 0-9 - ~`, which is
+/// base64url. Real I2P Destinations are standard Base64 and carry `+` and `/`. Accepting
+/// only the narrower set would have re-created the very defect this correction exists to
+/// remove -- a Destination that no real router could ever hand out would parse while the
+/// ones it does hand out would not -- so the union is accepted and the plan's own stated
+/// intent is preserved.
+///
+/// The union is a superset of both alphabets and is still bounded: it is a shape test, not
+/// a validation of the bytes. Only length range and shape are decided here. Whether the
+/// bytes name a reachable service is a router question, and an endpoint that cannot be
+/// reached is still a well-formed endpoint that deserves an ordinary connect failure
+/// rather than a configuration rejection.
+fn valid_destination(value: &str) -> bool {
+    if !(MIN_I2P_DESTINATION_CHARS..=MAX_I2P_DESTINATION_CHARS).contains(&value.len()) {
+        return false;
+    }
+    let body = value.trim_end_matches('=');
+    let padding = value.len() - body.len();
+    // Padding only ever closes the final Base64 block, and only when the token is
+    // actually block-aligned. An unpadded token is also legal, which is why alignment
+    // is only demanded when padding is present.
+    padding <= 2
+        && (padding == 0 || value.len() % 4 == 0)
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'~' | b'+' | b'/'))
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +220,37 @@ pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for T {}
 /// A provider future owns no detached connection task. Dropping the future cancels a
 /// pending attempt; any returned stream belongs to exactly one connection generation.
+///
+/// Every call is scoped to a [`NetworkId`]. A provider instance is shared by every
+/// Network the process owns, so an unscoped call would leave a router adapter unable to
+/// tell which Network's lease, tunnel, or handle an attempt belongs to — and unable to
+/// release only the one that was asked for. Scope is part of the contract, not a hint.
 #[async_trait]
 pub trait I2pStreamProvider: Send + Sync {
-    async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError>;
+    /// Opens one upstream stream to `endpoint` on behalf of `network`.
+    ///
+    /// The returned stream belongs to the calling generation alone. No handle to it is
+    /// retained by the provider, and no connection is silently shared between Networks.
+    async fn connect(
+        &self,
+        network: NetworkId,
+        endpoint: &I2pEndpoint,
+    ) -> Result<Box<dyn ByteStream>, ProviderError>;
+
+    /// Releases every router resource the provider holds for `network`.
+    ///
+    /// Called exactly once per Network, on the deletion and shutdown paths, when no
+    /// connection generation for that Network can still be issuing work. It is
+    /// explicit rather than implied by dropping the provider because one provider serves
+    /// every Network in the process: an `Arc` still held by a live owner must not keep a
+    /// deleted Network's session or tunnels alive, and must not be able to release
+    /// another Network's.
+    ///
+    /// Releasing an unknown or already-released Network is a no-op, not an error.
+    async fn release(&self, network: NetworkId) -> Result<(), ProviderError> {
+        let _ = network;
+        Ok(())
+    }
 }
 
 /// Shares one provider across every Network owner.
@@ -180,8 +261,15 @@ pub trait I2pStreamProvider: Send + Sync {
 /// its own connections still sees one consistent count.
 #[async_trait]
 impl<P: I2pStreamProvider + ?Sized> I2pStreamProvider for std::sync::Arc<P> {
-    async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError> {
-        (**self).connect(endpoint).await
+    async fn connect(
+        &self,
+        network: NetworkId,
+        endpoint: &I2pEndpoint,
+    ) -> Result<Box<dyn ByteStream>, ProviderError> {
+        (**self).connect(network, endpoint).await
+    }
+    async fn release(&self, network: NetworkId) -> Result<(), ProviderError> {
+        (**self).release(network).await
     }
 }
 /// Accepts only the local downstream side. It is not an upstream connector.
@@ -458,6 +546,98 @@ mod tests {
         assert!(I2pEndpoint::parse(&"A".repeat(MAX_I2P_ENDPOINT_BYTES + 1)).is_err());
         assert!(I2pEndpoint::parse(&format!("{}.i2p", "a".repeat(63))).is_ok());
         assert!(I2pEndpoint::parse(&format!("{}.i2p", "a".repeat(64))).is_err());
+        // Debug stays redacted for every form. A Destination is key material; a b32
+        // address identifies a host. Neither belongs in a log line.
+        for form in [
+            "irc.example.i2p",
+            &format!("{}.b32.i2p", "a".repeat(52)),
+            &"A".repeat(MIN_I2P_DESTINATION_CHARS),
+        ] {
+            assert_eq!(
+                format!("{:?}", I2pEndpoint::parse(form).unwrap()),
+                "I2pEndpoint([redacted])",
+                "{form:.20} must not appear in Debug output"
+            );
+        }
+    }
+
+    /// The name forms keep their own tighter bounds even though the endpoint ceiling rose.
+    ///
+    /// Raising the ceiling for Destinations must not have loosened hostnames: a 4000-byte
+    /// `.i2p` label was never a hostname, and accepting one would move a bounded token
+    /// into unbounded work inside a router adapter.
+    #[test]
+    fn endpoint_ceiling_did_not_loosen_the_name_forms() {
+        assert!(
+            I2pEndpoint::parse(&format!("{}.i2p", "a".repeat(63))).is_ok(),
+            "the longest hostname label still parses"
+        );
+        for rejected in [
+            // One past the longest label, and one past the longest whole hostname.
+            format!("{}.i2p", "a".repeat(64)),
+            format!("{}a.i2p", "a".repeat(63)),
+            // One past the extended b32 label profile, in both spellings.
+            format!("{}.b32.i2p", "a".repeat(64)),
+            // A hostname long enough to have been a Destination-length token.
+            format!("{}.i2p", "a".repeat(2000)),
+        ] {
+            assert!(
+                I2pEndpoint::parse(&rejected).is_err(),
+                "{rejected:.24} must stay rejected"
+            );
+        }
+    }
+
+    /// A raw destination is Base64 and is far longer than the `.b32.i2p` name it used to
+    /// be checked against. Both halves regressed silently before: a real destination
+    /// carrying `+` or `/` was rejected outright, and one over 516 characters could not be
+    /// expressed at all.
+    #[test]
+    fn endpoint_accepts_real_base64_destinations() {
+        let mixed = format!("{}+/{}", "A".repeat(300), "B".repeat(400));
+        assert_eq!(
+            I2pEndpoint::parse(&mixed).unwrap().kind(),
+            I2pEndpointKind::Destination
+        );
+        // A destination keeps its own case: it is opaque key material, not a name.
+        assert_eq!(I2pEndpoint::parse(&mixed).unwrap().as_str(), mixed);
+        assert_eq!(
+            I2pEndpoint::parse(&"A".repeat(MIN_I2P_DESTINATION_CHARS))
+                .unwrap()
+                .kind(),
+            I2pEndpointKind::Destination
+        );
+        assert_eq!(
+            I2pEndpoint::parse(&"A".repeat(MAX_I2P_DESTINATION_CHARS))
+                .unwrap()
+                .kind(),
+            I2pEndpointKind::Destination
+        );
+        // Padding closes a Base64 block and may appear nowhere else. A block-aligned
+        // token of 516 plus two pad characters is the same length as an aligned 518.
+        for (body_len, pad_len) in [(514, 2), (515, 1), (516, 0)] {
+            assert_eq!(
+                I2pEndpoint::parse(&format!("{}{}", "A".repeat(body_len), "=".repeat(pad_len)))
+                    .unwrap()
+                    .kind(),
+                I2pEndpointKind::Destination
+            );
+        }
+        for rejected in [
+            "A".repeat(MIN_I2P_DESTINATION_CHARS - 1),
+            "A".repeat(MAX_I2P_DESTINATION_CHARS + 1),
+            // Padding in the interior, not the tail.
+            format!("{}=B", "A".repeat(514)),
+            // Three pad characters, and pad on a token that is not block-aligned.
+            format!("A{}", "=".repeat(3)),
+            format!("{}=", "A".repeat(517)),
+            "A".repeat(400),
+        ] {
+            assert!(
+                I2pEndpoint::parse(&rejected).is_err(),
+                "expected rejection for {rejected:.20}"
+            );
+        }
     }
     #[tokio::test]
     async fn virtual_timer_advances_and_drop_cancels() {

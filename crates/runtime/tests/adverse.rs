@@ -96,8 +96,12 @@ struct Shared<P>(Arc<P>);
 
 #[async_trait::async_trait]
 impl<P: I2pStreamProvider> I2pStreamProvider for Shared<P> {
-    async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError> {
-        self.0.connect(endpoint).await
+    async fn connect(
+        &self,
+        _network: i2pr_irc_core::NetworkId,
+        endpoint: &I2pEndpoint,
+    ) -> Result<Box<dyn ByteStream>, ProviderError> {
+        self.0.connect(_network, endpoint).await
     }
 }
 
@@ -166,7 +170,11 @@ impl GateProvider {
 
 #[async_trait::async_trait]
 impl I2pStreamProvider for GateProvider {
-    async fn connect(&self, endpoint: &I2pEndpoint) -> Result<Box<dyn ByteStream>, ProviderError> {
+    async fn connect(
+        &self,
+        _network: i2pr_irc_core::NetworkId,
+        endpoint: &I2pEndpoint,
+    ) -> Result<Box<dyn ByteStream>, ProviderError> {
         self.requested.fetch_add(1, Ordering::SeqCst);
         // Counted on entry, before the park. Counting after it would measure only the
         // instants a connect spends inside the fixture -- which is microseconds -- so
@@ -177,7 +185,7 @@ impl I2pStreamProvider for GateProvider {
         // Parked here until released, so every attempt the scheduler admitted is still
         // open when the next one is admitted.
         self.release.notified().await;
-        let outcome = self.inner.connect(endpoint).await;
+        let outcome = self.inner.connect(_network, endpoint).await;
         self.live.fetch_sub(1, Ordering::SeqCst);
         outcome
     }

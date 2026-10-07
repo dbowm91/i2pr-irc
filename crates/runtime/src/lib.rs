@@ -62,7 +62,9 @@ use crate::{
     state::{LineOutcome, NetworkState},
 };
 #[cfg(test)]
-use i2pr_irc_core::{ByteStream, ClientId, I2pEndpoint, I2pStreamProvider, LocalAcceptor};
+use i2pr_irc_core::{
+    ByteStream, ClientId, I2pEndpoint, I2pStreamProvider, LocalAcceptor, NetworkId,
+};
 #[cfg(test)]
 use i2pr_irc_wire::{LineDecoder, Message, TagDirection};
 #[cfg(test)]
@@ -96,6 +98,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(180);
 pub const CAP_SASL_TIMEOUT: Duration = Duration::from_secs(90);
 pub const MAX_CREDENTIAL_BYTES: usize = 1024;
+/// Ceiling on releasing one Network's provider scope.
+///
+/// Deliberately far below [`CONNECT_TIMEOUT`]: release runs on the deletion and
+/// shutdown paths, where the caller is already waiting for the Network to go away.
+/// Reusing the connect budget would let a wedged router adapter hold a delete open for
+/// two minutes per Network, and shutdown has no timeout of its own at all.
+pub const PROVIDER_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(60);
 pub const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -322,6 +331,14 @@ type AcceptFuture<'a, A> = Pin<
 pub struct NetworkSupervisor<P> {
     provider: P,
     config: UpstreamConfig,
+    /// The only Network this legacy supervisor drives.
+    ///
+    /// [`NetworkOwner`] is the real supervisor and holds a genuine Network. This type
+    /// exists for the in-process generation and registration tests that predate the
+    /// catalog, and it has no catalog entry to name. A fixed scope keeps those tests
+    /// compiling against the same scoped provider contract rather than inventing an
+    /// unowned or shared scope for them.
+    network: NetworkId,
     snapshot: watch::Sender<NetworkSnapshot>,
 }
 #[cfg(test)]
@@ -333,6 +350,7 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
         Ok(Self {
             provider,
             config,
+            network: NetworkId(1),
             snapshot,
         })
     }
@@ -388,7 +406,7 @@ impl<P: I2pStreamProvider> NetworkSupervisor<P> {
             self.set_phase(Phase::Connecting, Some(ConnectionGeneration(generation)));
             let connection = tokio::select! {
                 _ = stopped(&mut stop) => { self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation))); return Ok(()) },
-                result = timeout(CONNECT_TIMEOUT, self.provider.connect(&self.config.endpoint)) => {
+                result = timeout(CONNECT_TIMEOUT, self.provider.connect(self.network, &self.config.endpoint)) => {
                     match result { Ok(Ok(stream)) => Ok(stream), Ok(Err(e)) => Err(RuntimeError::Provider(e)), Err(_) => Err(RuntimeError::Timeout) }
                 }
             };
@@ -1242,9 +1260,13 @@ mod tests {
     impl I2pStreamProvider for SharedProvider {
         async fn connect(
             &self,
+            network: NetworkId,
             endpoint: &I2pEndpoint,
         ) -> Result<Box<dyn i2pr_irc_core::ByteStream>, ProviderError> {
-            self.0.connect(endpoint).await
+            self.0.connect(network, endpoint).await
+        }
+        async fn release(&self, network: NetworkId) -> Result<(), ProviderError> {
+            self.0.release(network).await
         }
     }
     struct SharedAcceptor(Arc<FakeLocalAcceptor>);

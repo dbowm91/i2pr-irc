@@ -1,6 +1,8 @@
 # Router Integration R001-A / Plan 029 — Provider Scope, Lifecycle, and Endpoint Foundation
 
-Status: ready for handoff
+Status: closed
+
+Closure: plans/closure/router-integration/029-status.md
 
 Repository baseline:
 
@@ -112,7 +114,10 @@ Freeze application endpoint ceiling at 4096 textual bytes.
 Base64 Destination acceptance:
 
 - length >= 516 and <= 4096;
-- body alphabet A-Z a-z 0-9 - ~;
+- body alphabet is the union of standard Base64 (A-Z a-z 0-9 + /) and base64url
+  (A-Z a-z 0-9 - ~); see plans/closure/router-integration/029-status.md section 2.1,
+  which records why the narrower alphabet alone would have preserved the defect
+  this correction exists to fix;
 - optional = padding only at the end;
 - at most two padding bytes;
 - no whitespace/control/path/host-port syntax;

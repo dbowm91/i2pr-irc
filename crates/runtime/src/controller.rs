@@ -21,6 +21,7 @@
 //! and no downstream session can reach a supervisor directly, and none can reach
 //! storage. Every mutation is a typed [`ControlRequest`] executed by this one task.
 
+use crate::PROVIDER_RELEASE_TIMEOUT;
 use crate::{
     RuntimeError,
     action::ActionSet,
@@ -894,6 +895,25 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
         }
     }
 
+    /// Releases this Network's provider scope, once the owner task has ended.
+    ///
+    /// Called only after [`Self::stop_owner`] has joined, which is what makes it safe:
+    /// no generation for this Network can still be inside `connect`, so the release
+    /// cannot race a connect that would re-acquire the resources it is tearing down.
+    ///
+    /// Idempotency is the provider's half of this contract, not this component's: a
+    /// release of an unknown or already-released Network succeeds, so retrying a delete
+    /// after a timeout that may or may not have reached the adapter converges instead of
+    /// wedging the Network permanently undeletable.
+    async fn release_provider(&self, network: NetworkId) -> Result<(), RuntimeError> {
+        match crate::timeout_bounded(PROVIDER_RELEASE_TIMEOUT, self.provider.release(network)).await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(RuntimeError::Provider(error)),
+            Err(_) => Err(RuntimeError::Timeout),
+        }
+    }
+
     /// The process-wide values every Network's projection reads.
     ///
     /// Read live, at projection time, rather than taken from the published snapshot for the
@@ -1221,20 +1241,30 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
         commit.map(|_| ()).map_err(map_store)
     }
 
-    /// Stops one Network, then forgets it durably.
+    /// Stops one Network, releases its provider scope, then forgets it durably.
     ///
-    /// Stopping before the durable delete means a failed delete leaves a Network that
-    /// is still configured but temporarily not running, which the operator can retry.
-    /// The reverse order would leave a durable row whose owner is gone and whose
-    /// sessions have silently ended.
+    /// The order is the whole point. Stopping first means a failed step leaves a Network
+    /// that is still configured but not running, which the Operator can retry. Releasing
+    /// before the durable delete means a failed release also leaves it configured, so the
+    /// retry still has a scope it can release. Forgetting the row first would leave a
+    /// durable record whose owner is gone, whose router session is still live, and which
+    /// nothing can ever address again.
     async fn delete(&mut self, network: NetworkId) -> Result<bool, RuntimeError> {
         if !self.records.contains_key(&network) {
             return Ok(false);
         }
         self.stop_owner(network).await?;
-        // Republished before storage is touched, for the same reason as `change`: the
-        // owner is already stopped, and the snapshot must not say otherwise.
+        // Republished before the release, for the same reason as `change`: the owner is
+        // already stopped, and the snapshot must not say otherwise. Republished *before*
+        // release too, so a Network that is quiesced but still configured reads as
+        // stopped rather than as still owning a scope.
         self.commit();
+        // The owner task has ended, so no generation can still be inside `connect` and
+        // the release cannot race one. This happens before storage is touched: a release
+        // that fails leaves the Network configured but stopped, which the Operator can
+        // retry, and retrying calls release again. Forgetting the durable row first
+        // would make the scope unreachable and therefore unreleasable forever.
+        self.release_provider(network).await?;
         let removed = self.durable.remove(network).await.map_err(map_store)?;
         self.records.remove(&network);
         self.catalog.remove(network);
@@ -1253,15 +1283,30 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
         }
     }
 
-    /// Stops every owner and awaits every task.
+    /// Stops every owner, awaits every task, then releases every provider scope.
     ///
     /// Each Network is removed from the live map before its task is awaited, so a
     /// shutdown that is itself observed cannot re-enter and start the same Network
     /// twice.
     async fn shutdown(&mut self) {
-        let networks: Vec<NetworkId> = self.live.keys().copied().collect();
+        let mut networks: Vec<NetworkId> = self.live.keys().copied().collect();
+        // Durable rows with no live owner still hold a provider scope. They are released
+        // here for the same reason the live ones are: "no owner" is not "no resources",
+        // and a shutdown that only walked `live` would leave a router session behind for
+        // every Network that was configured but stopped.
+        networks.extend(
+            self.records
+                .keys()
+                .copied()
+                .filter(|network| !self.live.contains_key(network)),
+        );
+        networks.sort_unstable();
+        networks.dedup();
         for network in networks {
             let _ = self.stop_owner(network).await;
+            // Best-effort and reported nowhere: shutdown has no caller to return an error
+            // to, and it must not abandon the remaining Networks over one release.
+            let _ = self.release_provider(network).await;
             self.catalog.remove(network);
         }
         self.commit();

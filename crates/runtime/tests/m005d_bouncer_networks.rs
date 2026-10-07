@@ -85,9 +85,10 @@ impl Provider {
 impl i2pr_irc_core::I2pStreamProvider for Provider {
     async fn connect(
         &self,
+        _network: i2pr_irc_core::NetworkId,
         endpoint: &I2pEndpoint,
     ) -> Result<Box<dyn ByteStream>, i2pr_irc_core::ProviderError> {
-        self.0.connect(endpoint).await
+        self.0.connect(_network, endpoint).await
     }
 }
 

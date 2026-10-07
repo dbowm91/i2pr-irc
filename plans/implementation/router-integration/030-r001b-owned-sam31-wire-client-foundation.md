@@ -1,6 +1,6 @@
 # Router Integration R001-B / Plan 030 — Owned SAM 3.1 Wire/Client Foundation
 
-Status: blocked
+Status: ready
 
 Hard dependency:
 

@@ -57,9 +57,10 @@ struct Shared(Arc<FakeI2pStreamProvider>);
 impl i2pr_irc_core::I2pStreamProvider for Shared {
     async fn connect(
         &self,
+        _network: i2pr_irc_core::NetworkId,
         _endpoint: &I2pEndpoint,
     ) -> Result<Box<dyn i2pr_irc_core::ByteStream>, i2pr_irc_core::ProviderError> {
-        self.0.connect(_endpoint).await
+        self.0.connect(_network, _endpoint).await
     }
 }
 

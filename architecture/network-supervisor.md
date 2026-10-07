@@ -10,6 +10,8 @@ The Network owner that ships is `owner::NetworkOwner`, driven by `catalog::Netwo
 
 `NetworkOwner::serve` owns one upstream Network across connection generations. It owns provider attempts, the connection-generation counter, backoff, and the upstream generation actor. Attachment is data the generation handles, never a precondition for it.
 
+Each attempt passes the owner's own `NetworkId` to `I2pStreamProvider::connect`, under the existing process-wide reconnect permit. Generation churn never releases the provider scope: the router identity belongs to the durable Network, and releasing it on every failed attempt would churn the identity on every outage. Release happens only on deletion and shutdown, and only through `RuntimeController`. See [provider scope and release](network-boundary.md#provider-scope-and-release).
+
 ```
 NetworkOwner::serve                               (owns generations + backoff)
 └── run_generation(upstream, generation, commands, stop)

@@ -39,6 +39,8 @@ Control-only session <-------------- RuntimeController
 
 RuntimeController never becomes an upstream IRC state owner. NetworkOwner remains the only mutable owner of one Network.
 
+It does own the *lifetime* of each Network's router scope. Because the durable Network is its concern, it is the only component that learns a Network has been deleted, and therefore the only one that can call `I2pStreamProvider::release` at the right moment. It calls it after the owner task has joined and before the durable row is forgotten, so a failed release leaves a configured-but-stopped Network rather than a forgotten row whose router session nothing can reach again. See [provider scope and release](network-boundary.md#provider-scope-and-release).
+
 ## Admission lifetime
 
 Admission allocates SessionId before Network selection and creates the bounded downstream writer immediately.
