@@ -23,6 +23,7 @@
 
 use crate::{
     RuntimeError,
+    action::ActionSet,
     catalog::{NetworkCatalog, SupervisorContext, SupervisorHandle},
     config_snapshot::{self, ApplyOutcome, ConfigSnapshot, ImportStep, SnapshotNetwork},
     diagnostics::{self, ProcessDiagnostics},
@@ -238,6 +239,20 @@ pub enum ControlRequest {
         snapshot: ConfigSnapshot,
         reply: oneshot::Sender<ApplyOutcome>,
     },
+    /// Replace one Network's whole stored registration-action list.
+    ActionSet {
+        network: NetworkId,
+        actions: ActionSet,
+        reply: oneshot::Sender<Result<usize, RuntimeError>>,
+    },
+    /// Read one Network's stored registration actions.
+    ///
+    /// Returns the typed model rather than the durable rows, so a caller cannot bypass the
+    /// replay ceilings by reading storage and writing the frames itself.
+    ActionList {
+        network: NetworkId,
+        reply: oneshot::Sender<Result<ActionSet, RuntimeError>>,
+    },
     /// Stop every Network and end the controller.
     Stop { reply: oneshot::Sender<()> },
 }
@@ -301,6 +316,32 @@ impl RuntimeControlHandle {
     ) -> Result<ProcessDiagnostics, RuntimeError> {
         let (reply, response) = oneshot::channel();
         self.send(ControlRequest::Diagnostics { network, reply })?;
+        response.await.map_err(|_| RuntimeError::Stopped)?
+    }
+
+    /// Reads one Network's stored registration actions.
+    pub async fn action_list(&self, network: NetworkId) -> Result<ActionSet, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ActionList { network, reply })?;
+        response.await.map_err(|_| RuntimeError::Stopped)?
+    }
+
+    /// Replaces one Network's whole stored registration-action list.
+    ///
+    /// Wholesale rather than incremental, because the only thing an Operator means by "set"
+    /// is "this is now the list". An append-only verb would make *removing* an action a
+    /// second operation with its own semantics to get wrong.
+    pub async fn set_actions(
+        &self,
+        network: NetworkId,
+        actions: ActionSet,
+    ) -> Result<usize, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ActionSet {
+            network,
+            actions,
+            reply,
+        })?;
         response.await.map_err(|_| RuntimeError::Stopped)?
     }
 
@@ -612,6 +653,58 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
     /// inventing a plausible configuration would reinterpret durable meaning. The
     /// remaining Networks still start, because one unusable row must not take the
     /// whole runtime down.
+    /// Loads a Network's stored actions into the bounded runtime model.
+    ///
+    /// A stored set that breaches the runtime's ceilings is refused rather than truncated. A
+    /// table written by a future build, or by an older one with looser bounds, must not be
+    /// silently replayed as a prefix of what the Operator configured -- a bouncer that
+    /// identifies on reconnect because it replayed the first of nine stored actions is
+    /// worse than one that says nothing.
+    async fn load_actions(&self, network: NetworkId) -> Result<ActionSet, RuntimeError> {
+        let rows = self
+            .catalog
+            .store()
+            .load_registration_actions(network)
+            .await
+            .map_err(map_store)?;
+        let mut actions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind = match row.kind {
+                i2pr_irc_store::RegistrationActionKind::Mode => crate::action::ActionKind::Mode,
+                i2pr_irc_store::RegistrationActionKind::Message => {
+                    crate::action::ActionKind::Message
+                }
+            };
+            actions.push(
+                crate::action::RegistrationAction::from_parts(kind, row.target, row.payload)
+                    .map_err(|_| RuntimeError::InvalidConfig)?,
+            );
+        }
+        ActionSet::new(actions).map_err(|_| RuntimeError::InvalidConfig)
+    }
+
+    /// Writes a Network's whole action list durably, reporting how many rows it stored.
+    ///
+    /// The count is compared against what was submitted rather than returned blindly: a
+    /// conversion that dropped an action would otherwise report a smaller number than the
+    /// Operator stored and leave them believing the missing one was configured.
+    async fn store_actions(
+        &self,
+        network: NetworkId,
+        actions: &ActionSet,
+    ) -> Result<(), RuntimeError> {
+        let mut rows = Vec::with_capacity(actions.len());
+        for action in actions.actions() {
+            rows.push(action.to_stored().ok_or(RuntimeError::InvalidConfig)?);
+        }
+        self.catalog
+            .store()
+            .save_registration_actions(network, &rows)
+            .await
+            .map_err(map_store)?;
+        Ok(())
+    }
+
     /// Builds the durable configuration as a secret-free snapshot.
     ///
     /// A record's credential becomes `None`, so an exported snapshot cannot carry one even
@@ -619,11 +712,20 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
     /// a store that *does* hold a credential cannot erase it either. That asymmetry is
     /// deliberate: an export is safe to paste anywhere, and applying one is safe to run
     /// anywhere, because neither direction touches a secret.
-    fn export_snapshot(&self) -> ConfigSnapshot {
-        let mut networks: Vec<SnapshotNetwork> = self
-            .records
-            .values()
-            .map(|record| SnapshotNetwork {
+    async fn export_snapshot(&self) -> ConfigSnapshot {
+        let mut networks: Vec<SnapshotNetwork> = Vec::with_capacity(self.records.len());
+        for record in self.records.values() {
+            // Read live rather than from a cache the controller does not keep. A count that
+            // is wrong in the safe direction -- understated -- cannot mislead an Operator
+            // into thinking an action is missing; one that is overstated would send them
+            // looking for an action that is not there.
+            let action_count = self
+                .catalog
+                .store()
+                .load_registration_actions(record.network)
+                .await
+                .map_or(0, |rows| rows.len()) as u32;
+            networks.push(SnapshotNetwork {
                 network: record.network,
                 display_name: record.display_name.clone(),
                 endpoint: record.endpoint.clone(),
@@ -633,13 +735,9 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 auto_away: record.auto_away,
                 keep_nick: record.keep_nick,
                 desired_channels: record.desired_channels.clone(),
-                // Actions are owned by the owner, not by the controller's record copy, so
-                // the controller reports the count it cannot see as zero rather than
-                // guessing. A count that is wrong in the safe direction -- understated --
-                // cannot mislead an Operator into thinking an action is missing.
-                action_count: 0,
-            })
-            .collect();
+                action_count,
+            });
+        }
         networks.sort_by_key(|entry| entry.network);
         ConfigSnapshot { networks }
     }
@@ -928,8 +1026,20 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             ControlRequest::Record { network, reply } => {
                 let _ = reply.send(Ok(self.records.get(&network).cloned()));
             }
+            ControlRequest::ActionList { network, reply } => {
+                let _ = reply.send(self.load_actions(network).await);
+            }
+            ControlRequest::ActionSet {
+                network,
+                actions,
+                reply,
+            } => {
+                let count = actions.len();
+                let stored = self.store_actions(network, &actions).await;
+                let _ = reply.send(stored.map(|()| count));
+            }
             ControlRequest::ExportConfig { reply } => {
-                let _ = reply.send(Ok(self.export_snapshot()));
+                let _ = reply.send(Ok(self.export_snapshot().await));
             }
             ControlRequest::ImportConfig { snapshot, reply } => {
                 let outcome = self.apply_snapshot(snapshot).await;

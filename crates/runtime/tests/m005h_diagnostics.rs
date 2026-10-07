@@ -75,6 +75,17 @@ impl Provider {
         self.0.take_controller().await;
         peer
     }
+
+    /// Takes the next upstream peer *and* the controller that can end it.
+    ///
+    /// A reconnect test has to be able to drop a generation; the controller is the only
+    /// handle that can close one side of the fixture, so it is kept rather than discarded
+    /// the way an ordinary peer does not need it.
+    async fn closable_peer(&self) -> (ScriptedStream, i2pr_irc_testkit::FaultController) {
+        let peer = self.0.take_peer().await;
+        let controller = self.0.take_controller().await;
+        (peer, controller)
+    }
 }
 
 #[async_trait::async_trait]
@@ -92,6 +103,8 @@ struct Runtime {
     provider: Provider,
     task: tokio::task::JoinHandle<Result<(), i2pr_irc_runtime::RuntimeError>>,
     upstreams: Vec<ScriptedStream>,
+    /// Kept only for the peers a test may need to end, to prove a reconnect.
+    upstreams_closable: Vec<Option<i2pr_irc_testkit::FaultController>>,
     _store: Store,
 }
 
@@ -109,6 +122,7 @@ impl Runtime {
             provider,
             task,
             upstreams: Vec::new(),
+            upstreams_closable: Vec::new(),
             _store: store,
         }
     }
@@ -185,6 +199,100 @@ impl Runtime {
             .unwrap_or_else(|error| panic!("create {network}: {error:?}"));
         self.drive_registration(network, channels, cap_ls, isupport, own_join, extra_names)
             .await
+    }
+
+    /// As [`Runtime::bring_online_with_names`], for a Network that already exists.
+    ///
+    /// Used when actions had to be stored before the Network started, which needs the
+    /// Network to exist first. Creating it twice is an explicit duplicate-identity refusal,
+    /// not a silent overwrite.
+    async fn bring_existing_online(
+        &mut self,
+        network: u64,
+        channels: &[&str],
+        cap_ls: &str,
+        isupport: &str,
+        own_join: &str,
+    ) -> usize {
+        self.drive_registration(network, channels, cap_ls, isupport, own_join, "")
+            .await
+    }
+
+    /// Stores actions on a Network *before* it comes online.
+    ///
+    /// Written directly through the controller rather than with `ACTION SET`, because a
+    /// Network has to already exist to be administered and these tests need its actions in
+    /// place before the first generation registers -- which is the only moment a replay can
+    /// be observed without provoking a reconnect.
+    async fn create_with_actions(&self, network: u64, modes: &[&str]) {
+        let actions: Vec<i2pr_irc_runtime::action::RegistrationAction> = modes
+            .iter()
+            .map(|modes| {
+                i2pr_irc_runtime::action::RegistrationAction::mode(modes).expect("an action")
+            })
+            .collect();
+        self.control
+            .create(record(network, &["#room"]))
+            .await
+            .unwrap_or_else(|error| panic!("create {network}: {error:?}"));
+        self.control
+            .set_actions(
+                NetworkId(network),
+                i2pr_irc_runtime::action::ActionSet::new(actions).expect("a bounded set"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("set actions {network}: {error:?}"));
+    }
+
+    /// Takes the upstream peer for the next connection generation.
+    ///
+    /// Reached by having the owner retry: the reconnect scheduler is what decides to come
+    /// back, so a test that simply handed itself a new peer would be testing a fiction.
+    async fn next_peer(&mut self) -> usize {
+        let (upstream, controller) = self.provider.closable_peer().await;
+        let peer = self.upstreams.len();
+        self.upstreams.push(upstream);
+        self.upstreams_closable.push(Some(controller));
+        peer
+    }
+
+    /// Ends one generation's upstream, which is what makes the owner reconnect.
+    ///
+    /// Closing the far side's write is what the owner observes as a disconnect. Dropping
+    /// the local end would instead leave the owner waiting on a fixture whose other half is
+    /// gone, which is a hang rather than a reconnect.
+    async fn drop_generation(&mut self, peer: usize) {
+        if let Some(controller) = self.upstreams_closable[peer].take() {
+            // Side 0 is the upstream end the test holds; closing *its* write is what makes
+            // the owner's read (side 1) return end-of-file. Closing side 1 instead ends the
+            // test's own reads and leaves the owner waiting on a live connection.
+            controller.close_write(0);
+        }
+    }
+
+    async fn upstream(&mut self, peer: usize) -> &mut ScriptedStream {
+        &mut self.upstreams[peer]
+    }
+
+    /// Completes registration on a peer that already received `CAP LS`.
+    ///
+    /// A reconnect has to run the same negotiation the first generation did: acknowledging
+    /// each `CAP REQ` with exactly what was asked for and only then sending `001`. Skipping
+    /// it would leave the generation stuck before it is ever online, which is not a replay
+    /// failure -- the replay simply never had a chance to happen.
+    async fn finish_registration(&mut self, peer: usize) {
+        loop {
+            let line = read_line(self.upstream(peer).await).await;
+            if line.contains("CAP END") {
+                break;
+            }
+            if let Some(request) = line.strip_prefix("CAP REQ :") {
+                let requested = request.trim_end_matches("\r\n");
+                self.send_upstream(peer, &format!(":srv CAP * ACK :{requested}\r\n"))
+                    .await;
+            }
+        }
+        self.send_upstream(peer, ":srv 001 bot :welcome\r\n").await;
     }
 
     async fn drive_registration(
@@ -279,6 +387,7 @@ impl Runtime {
         }
         let peer = self.upstreams.len();
         self.upstreams.push(upstream);
+        self.upstreams_closable.push(None);
         // Liveness alone is not enough. The advertisement is published just after upstream
         // negotiation finishes, and a client that registers in between would be answered
         // against the fallback list -- which is a real ordering this test must not race.
@@ -1035,5 +1144,291 @@ async fn an_import_does_not_erase_a_stored_credential() {
         record.sasl.is_some(),
         "an import must not silently clear a credential it could not have exported"
     );
+    runtime.stop().await;
+}
+
+// ----------------------------------------------- registration action tests
+
+#[tokio::test]
+async fn a_stored_action_is_replayed_after_a_successful_registration() {
+    let mut runtime = Runtime::start().await;
+    // Actions are stored before the Network starts, because the replay happens at
+    // registration and a Network that is already online has already registered.
+    runtime.create_with_actions(1, &["+B", "+i"]).await;
+    let peer = runtime
+        .bring_existing_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+
+    let seen = read_until(runtime.upstream(peer).await, b"MODE bot +B\r\n").await;
+    assert!(seen.contains("MODE bot +B"), "{seen:?}");
+    assert!(
+        seen.contains("MODE bot +i"),
+        "both actions replay, in the order they were written: {seen:?}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_identify_line_with_a_space_replays_whole() {
+    // `IDENTIFY hunter2` is one message containing a space. A parser that took a single
+    // whitespace-separated word would store `IDENTIFY` and drop the password, which fails at
+    // the service while looking exactly like a working configuration.
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+    client
+        .send("PRIVMSG BouncerServ :action set 1 message=NickServ text=IDENTIFY hunter2\r\n")
+        .await;
+    client.until("Set 1 actions").await;
+
+    let stored = runtime
+        .control
+        .action_list(NetworkId(1))
+        .await
+        .expect("actions are readable");
+    let frame = stored.actions()[0].frame("bot").expect("a frame");
+    assert_eq!(
+        frame, "PRIVMSG NickServ :IDENTIFY hunter2\r\n",
+        "the whole message survives, spaces included"
+    );
+    runtime.stop().await;
+}
+
+/// Takes about two minutes of wall clock, and not because of anything this module does:
+/// the bouncer does not begin a new generation until roughly `CONNECT_TIMEOUT` after the
+/// upstream stream ends, which predates Plan 027 and is recorded as a finding in
+/// `plans/closure/bouncer-core/027-status.md`. The test is kept despite the cost because a
+/// replay on reconnect is a claim that only a real reconnect can establish -- asserting it
+/// against a simulated generation would be asserting the fixture, not the bouncer.
+#[tokio::test]
+async fn a_reconnect_replays_the_action_sequence_intentionally() {
+    // The plan's explicit semantics: these are per-generation setup, not an ambiguous user
+    // message. Replaying them on every generation is the feature, and every one is
+    // idempotent, which is what makes that correct.
+    let mut runtime = Runtime::start().await;
+    runtime.create_with_actions(1, &["+B"]).await;
+    let first = runtime
+        .bring_existing_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    read_until(runtime.upstream(first).await, b"MODE bot +B\r\n").await;
+
+    runtime.drop_generation(first).await;
+    // The retry is the reconnect scheduler's decision, so the test waits for the peer the
+    // owner actually asks for rather than handing itself one.
+    let second = runtime.next_peer().await;
+    read_until(
+        runtime.upstream(second).await,
+        b"USER user 0 * :bouncer\r\n",
+    )
+    .await;
+    runtime
+        .send_upstream(second, ":srv CAP * LS :message-tags\r\n")
+        .await;
+    runtime.finish_registration(second).await;
+    let seen = read_until(runtime.upstream(second).await, b"MODE bot +B\r\n").await;
+    assert!(
+        seen.contains("MODE bot +B"),
+        "the second generation replays the sequence from its beginning: {seen:?}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_action_status_reports_a_count_and_never_a_payload() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+    client
+        .send("PRIVMSG BouncerServ :action set 1 message=NickServ text=IDENTIFY hunter2\r\n")
+        .await;
+    client.until("Set 1 actions").await;
+
+    let mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :action status 1\r\n")
+        .await;
+    client.until("actions 1").await;
+
+    let reply = client.since(mark);
+    assert!(!reply.contains("hunter2"), "{reply}");
+    assert!(!reply.contains("NickServ"), "not even the target: {reply}");
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_action_refusal_names_the_problem_without_echoing_the_text() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    // The target is not a service, so the whole action is refused.
+    let mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :action set 1 message=bot text=IDENTIFY hunter2\r\n")
+        .await;
+    client.await_new(mark, "FAIL BOUNCER").await;
+
+    let reply = client.since(mark);
+    assert!(
+        !reply.contains("hunter2"),
+        "a refusal must not echo the text: {reply}"
+    );
+    assert!(
+        reply.contains("NickServ") || reply.contains("service"),
+        "the refusal must say what to change: {reply}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn no_forbidden_command_can_be_reached_through_the_action_surface() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    for attempt in [
+        "action set 1 NICK=other",
+        "action set 1 JOIN=#room",
+        "action set 1 QUIT=bye",
+        "action set 1 CAP=LS",
+        "action set 1 AUTHENTICATE=PLAIN",
+        "action set 1 BOUNCER=LISTNETWORKS",
+        "action set 1 raw=JOIN #room",
+        "action set 1 line=QUIT :bye",
+    ] {
+        let mark = client.mark();
+        client
+            .send(&format!("PRIVMSG BouncerServ :{attempt}\r\n"))
+            .await;
+        client.settle().await;
+        let reply = client.since(mark);
+        assert!(
+            reply.contains("FAIL BOUNCER"),
+            "{attempt} must be refused: {reply}"
+        );
+        assert!(
+            !reply.contains("Set "),
+            "{attempt} must not have been stored: {reply}"
+        );
+    }
+
+    // And the Network still has none.
+    let mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :action status 1\r\n")
+        .await;
+    client.await_new(mark, "actions 0").await;
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_action_count_above_the_ceiling_is_refused_and_stores_nothing() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+
+    let many: Vec<String> = (0..=i2pr_irc_runtime::action::MAX_REGISTRATION_ACTIONS)
+        .map(|_| "mode=+B".to_owned())
+        .collect();
+    let mark = client.mark();
+    client
+        .send(&format!(
+            "PRIVMSG BouncerServ :action set 1 {}\r\n",
+            many.join(" ")
+        ))
+        .await;
+    client.await_new(mark, "FAIL BOUNCER").await;
+
+    let mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :action status 1\r\n")
+        .await;
+    client.await_new(mark, "actions 0").await;
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn an_action_set_replaces_the_previous_list_rather_than_appending() {
+    let mut runtime = Runtime::start().await;
+    runtime.create_with_actions(1, &["+B", "+i"]).await;
+    // Online first: a client cannot register against a Network that has no live owner.
+    runtime
+        .bring_existing_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+    client
+        .send("PRIVMSG BouncerServ :action set 1 mode=+w\r\n")
+        .await;
+    client.until("Set 1 actions").await;
+
+    let stored = runtime
+        .control
+        .action_list(NetworkId(1))
+        .await
+        .expect("actions are readable");
+    assert_eq!(
+        stored.actions().len(),
+        1,
+        "the second write replaced rather than appended: {stored:?}"
+    );
+    assert_eq!(stored.actions()[0].target, "+w");
     runtime.stop().await;
 }

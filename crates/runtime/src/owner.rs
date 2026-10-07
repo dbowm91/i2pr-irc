@@ -1501,6 +1501,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 state.begin_desired_join(&channel);
                 send(&mut uw, &format!("JOIN {channel}\r\n")).await?;
             }
+            // Registration actions are replayed last, after the JOINs. The ordering is not
+            // cosmetic: an identify line addressed to a service that then receives our JOIN
+            // burst is being read while a dozen unrelated frames arrive, whereas replaying
+            // first means the service has the identification before the bouncer's own
+            // chatter. Either order is correct protocol; this one is quieter upstream.
+            //
+            // Emitted here rather than kept across generations because they are *setup*, not
+            // an in-flight message. Nothing here is a user's chat, and nothing here can be
+            // ambiguous: if a generation dies half way through, the next one starts the
+            // sequence from the beginning, which is exactly what the plan requires and
+            // exactly what replaying an ambiguous user message must never do.
+            for frame in self.registration_action_frames(&state.nick).await {
+                send(&mut uw, &frame).await?;
+            }
             Ok::<(), RuntimeError>(())
         };
         tokio::select! {
@@ -3031,6 +3045,38 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             .joined_channels()
             .iter()
             .any(|held| state.same_nick(held, channel))
+    }
+
+    /// The upstream frames this Network's stored registration actions produce.
+    ///
+    /// Loads through the controller rather than from the store directly, so the actions that
+    /// get replayed are the ones that passed the runtime's allowlist and ceilings. Reading
+    /// storage here would make the durable table a second source of truth for what this
+    /// process is willing to send.
+    ///
+    /// Returns nothing when the Network stores none, and never returns a partial list: a
+    /// stored set the runtime refuses produces *no* frames rather than the prefix it could
+    /// accept, because a bouncer that identifies on every reconnect because it replayed
+    /// two of nine actions is worse than one that says nothing and reports the problem.
+    ///
+    /// `nick` is passed in rather than read from state so the frame is built against the
+    /// nick *this* generation registered with. An action rendered against a nick from a
+    /// previous generation would be configuring whichever identity happened to be current.
+    async fn registration_action_frames(&self, nick: &str) -> Vec<String> {
+        // A bouncer with no control plane still registers and still joins; it simply has no
+        // way to read what the Operator asked for. Pretending otherwise would be a lie the
+        // Operator could only detect by noticing their identify line stopped.
+        let Some(control) = self.control.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(actions) = control.action_list(self.context.network).await else {
+            return Vec::new();
+        };
+        actions
+            .actions()
+            .iter()
+            .filter_map(|action| action.frame(nick))
+            .collect()
     }
 
     /// Evaluates presence and returns the upstream `AWAY` frame a transition requires.

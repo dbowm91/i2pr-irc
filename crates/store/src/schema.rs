@@ -1,4 +1,4 @@
-//! Schema versions 1 through 6 and their transactional migration harness.
+//! Schema versions 1 through 7 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -17,8 +17,9 @@ use rusqlite::Connection;
 /// presence policies, `auto_away` and `keep_nick`; see [`NETWORKS_V5`] and
 /// [`migrate_4_to_5`]. Version 6 adds the search side index and the two relational
 /// indexes history reference lookup needs; see [`HISTORY_SEARCH_V6`],
-/// [`HISTORY_REFERENCE_INDEXES_V6`], and [`migrate_5_to_6`].
-pub const SCHEMA_VERSION: i64 = 6;
+/// [`HISTORY_REFERENCE_INDEXES_V6`], and [`migrate_5_to_6`]. Version 7 adds the bounded
+/// registration-action table; see [`REGISTRATION_ACTIONS_V7`] and [`migrate_6_to_7`].
+pub const SCHEMA_VERSION: i64 = 7;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -377,9 +378,9 @@ CREATE VIRTUAL TABLE history_search USING fts5(
 "#;
 
 /// The current schema, created directly when no database exists yet.
-pub(crate) fn schema_v6() -> String {
+pub(crate) fn schema_v7() -> String {
     format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         compose(
             DESIRED_CHANNELS_V4,
             NETWORKS_V5,
@@ -389,6 +390,7 @@ pub(crate) fn schema_v6() -> String {
         HISTORY_EFFECTIVE_TIME_V6,
         HISTORY_REFERENCE_INDEXES_V6,
         HISTORY_SEARCH_V6,
+        REGISTRATION_ACTIONS_V7,
     )
 }
 
@@ -561,7 +563,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v6())
+                .execute_batch(&schema_v7())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -725,6 +727,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             3 => migrate_3_to_4(transaction)?,
             4 => migrate_4_to_5(transaction)?,
             5 => migrate_5_to_6(transaction)?,
+            6 => migrate_6_to_7(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -919,6 +922,43 @@ fn migrate_5_to_6(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     backfill_search_index(tx)?;
     backfill_effective_time(tx)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// The registration-action table schema 7 adds.
+///
+/// The payload is a `TEXT` blob that may hold a service password, which is why it is read
+/// straight into a [`crate::StoredSecret`] and never into an ordinary `String` on the way
+/// out. Storage cannot enforce that; the read path can, and does.
+///
+/// `position` is part of the primary key because replay order is part of the meaning: an
+/// Operator who configures two actions wants them in the order they wrote them, and a row
+/// store that returned them in an unspecified order would replay them in an arbitrary one.
+/// The `CHECK` on `kind` keeps the table to the allowlist's two entries, so a row written by
+/// a future build cannot be read back as an unknown kind and guessed at.
+const REGISTRATION_ACTIONS_V7: &str = r#"
+CREATE TABLE registration_actions (
+    network_id      INTEGER NOT NULL
+                    REFERENCES networks(network_id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('mode', 'message')),
+    target          TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    PRIMARY KEY (network_id, position)
+) STRICT;
+"#;
+
+/// Migrates schema 6 to schema 7 by adding the registration-action table.
+///
+/// Purely additive: no existing table is read, written, or rebuilt. That is why this
+/// migration can be trivially correct -- there is no data to misinterpret -- and it is also
+/// why an older bouncer binary pointed at a migrated database still sees exactly the
+/// configuration it had before, just without the new table's rows being replayed.
+fn migrate_6_to_7(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(REGISTRATION_ACTIONS_V7)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     Ok(())

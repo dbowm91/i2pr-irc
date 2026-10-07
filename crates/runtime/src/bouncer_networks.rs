@@ -535,6 +535,12 @@ pub enum BouncerError {
     BindTooLate,
     /// The Network does not hold that channel as desired intent.
     NoSuchChannel(String),
+    /// A registration-action target is not shaped like a service nick.
+    ///
+    /// Its own variant rather than `ValueOutOfRange`, because the remedy is specific and a
+    /// generic bound message would not name it: the Operator needs to hear that the target
+    /// must be a service, not that a value was wrong somewhere.
+    NotAService,
     /// The controller's own bounded queue refused the request.
     Overloaded,
 }
@@ -568,6 +574,7 @@ impl BouncerError {
             }
             Self::BindTooLate => "a registered session cannot bind to a network".to_owned(),
             Self::NoSuchChannel(channel) => format!("{channel} is not a desired channel"),
+            Self::NotAService => "a message action must target a service".to_owned(),
             Self::Overloaded => "bouncer is busy".to_owned(),
         }
     }

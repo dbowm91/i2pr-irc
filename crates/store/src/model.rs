@@ -3,6 +3,7 @@
 //! Every string, collection, and batch here has an explicit ceiling, because all of
 //! these values can ultimately be influenced by a remote peer through history
 //! ingestion or client configuration.
+use crate::{StoreError, StoreErrorKind};
 use i2pr_irc_core::{
     BufferId, Casemapping, ClientId, HistoryEventId, I2pEndpoint, NetworkId, WallTime,
 };
@@ -1033,3 +1034,78 @@ pub struct NearestEvent {
     /// The reference itself resolved to an event, rather than falling between two.
     pub exact: bool,
 }
+
+/// Durable kind of one stored registration action.
+///
+/// A closed set in the storage layer as well as the runtime: the column is `CHECK`-constrained
+/// to these two spellings, so a row written by a future build is refused by SQLite rather
+/// than read back here as an unknown kind that something downstream would have to guess at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistrationActionKind {
+    /// `MODE` on the bouncer's own nick. The mode string is the target.
+    Mode,
+    /// A message to an explicitly configured service target.
+    Message,
+}
+
+impl RegistrationActionKind {
+    /// The spelling stored in the column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::Message => "message",
+        }
+    }
+
+    /// Parses a stored spelling, refusing anything this build does not define.
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "mode" => Ok(Self::Mode),
+            "message" => Ok(Self::Message),
+            _ => Err(StoreError::new(StoreErrorKind::Corrupt(
+                "registration action kind",
+            ))),
+        }
+    }
+}
+
+/// One stored registration action, as it comes back out of the store.
+///
+/// The payload is a [`StoredSecret`] from the first instruction, not converted into a
+/// `String` on the way. A stored action's text is the one place this bouncer holds text that
+/// is expected to be secret, and a read path that produced an ordinary `String` would put one
+/// step between that value and a `format!` somewhere else.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StoredRegistrationAction {
+    pub kind: RegistrationActionKind,
+    /// The mode string, or the message target.
+    pub target: String,
+    /// The action text, always present in storage even for a `MODE`, where it is empty.
+    pub payload: StoredSecret,
+}
+
+impl std::fmt::Debug for StoredRegistrationAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The kind and the target, because the Operator needs to see which service an
+        // action addresses; never the payload, which may be that service's password.
+        write!(
+            f,
+            "StoredRegistrationAction({:?} target={:?} payload=[redacted])",
+            self.kind, self.target
+        )
+    }
+}
+
+/// Ceiling on stored registration actions per Network.
+///
+/// Enforced here as well as in the runtime model, because the table is a durable surface a
+/// future build could write to directly. A read path that trusted the table's contents
+/// without a ceiling would hand an unbounded list to a generation that then writes all of it
+/// upstream on every reconnect.
+pub const MAX_STORED_ACTIONS: usize = 8;
+
+/// Ceiling on one stored action's payload.
+pub const MAX_STORED_ACTION_PAYLOAD_BYTES: usize = 200;
+
+/// Ceiling on one stored action's target.
+pub const MAX_STORED_ACTION_TARGET_BYTES: usize = 64;

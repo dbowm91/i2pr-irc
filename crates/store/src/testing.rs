@@ -25,7 +25,7 @@ use std::{
 /// The table *set* has been identical across every schema version so far; only the
 /// representation of `history_events.server_time` and `networks.display_name` changed,
 /// and only `desired_channels` gained a column.
-pub const EXPECTED_TABLES: [&str; 9] = [
+pub const EXPECTED_TABLES: [&str; 10] = [
     "buffers",
     "client_cursors",
     "clients",
@@ -38,6 +38,9 @@ pub const EXPECTED_TABLES: [&str; 9] = [
     "network_secrets",
     "networks",
     "read_markers",
+    // Schema 7's registration actions. Bounded and allowlisted upstream of here; the store
+    // only guarantees it can hold and return them in replay order.
+    "registration_actions",
 ];
 
 /// Creates a database at schema version 1 and returns a raw connection to it.

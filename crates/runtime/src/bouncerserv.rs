@@ -27,6 +27,7 @@
 //! reply anywhere in this module or its dispatch path renders it. A refused `SASL SET`
 //! says the *command* was refused; it never echoes the argument that caused the refusal.
 
+use crate::action::{ActionError, ActionSet, RegistrationAction};
 use crate::bouncer_networks::{self, BouncerError, NetworkFields};
 use i2pr_irc_core::NetworkId;
 
@@ -103,6 +104,17 @@ pub enum ServCommand {
     ConfigExport,
     /// Validate a snapshot and report what applying it would do, without applying it.
     ConfigPlan,
+    /// Report how many registration actions a Network stores, and nothing about them.
+    ActionStatus { network: NetworkId },
+    /// Replace one Network's whole registration-action list.
+    ///
+    /// Carries the validated set rather than the raw attributes: by the time a command
+    /// exists, every action in it has passed the allowlist and both ceilings, and nothing
+    /// downstream should have to re-establish that.
+    ActionSet {
+        network: NetworkId,
+        actions: ActionSet,
+    },
 }
 
 impl std::fmt::Debug for ServCommand {
@@ -145,6 +157,12 @@ impl std::fmt::Debug for ServCommand {
             Self::DiagNetwork { network } => return write!(f, "DiagNetwork({network:?})"),
             Self::ConfigExport => return write!(f, "ConfigExport"),
             Self::ConfigPlan => return write!(f, "ConfigPlan"),
+            Self::ActionStatus { network } => return write!(f, "ActionStatus({network:?})"),
+            // Never renders the payloads. An action's text may be a service password, so
+            // this arm is one of the two that has to be right by construction.
+            Self::ActionSet { network, actions } => {
+                return write!(f, "ActionSet({network:?}, {} actions)", actions.len());
+            }
         };
         f.write_str(name)
     }
@@ -177,6 +195,8 @@ pub const HELP_TEXT: &str = concat!(
     " | diag network <netid>",
     " | config export",
     " | config plan",
+    " | action status <netid>",
+    " | action set <netid> [mode=<modes>] [message=<serv> text=<text>]",
 );
 
 /// Parses one command line.
@@ -336,6 +356,65 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
         // `path=` attribute: the plan's own stop conditions forbid generic file side effects,
         // and a format that could read a file would be a format whose input an Operator
         // cannot see. Import arrives as text the Operator typed, or not at all.
+        // `ACTION SET` is the only command in this module whose arguments may contain a
+        // secret. It therefore reads a `text=` attribute straight into a redacting buffer,
+        // bounds it, and never echoes it -- including in a refusal, which names the
+        // attribute rather than repeating its value.
+        "ACTION" => match word(1).to_ascii_uppercase().as_str() {
+            "STATUS" => Ok(ServCommand::ActionStatus { network: netid(2)? }),
+            "SET" => {
+                let network = netid(2)?;
+                // The line is split at a whole-word `text=` before anything is iterated,
+                // because everything after it is one message's text rather than more
+                // attributes. `IDENTIFY hunter2` is a single message containing a space;
+                // word-by-word parsing would store `IDENTIFY` and drop the password, which
+                // fails at the service while looking exactly like a working configuration.
+                let (head, body) = split_at_action_text(text);
+                let mut actions: Vec<RegistrationAction> = Vec::new();
+                let mut pending_message: Option<&str> = None;
+                for param in head.split_whitespace().skip(3) {
+                    let (key, value) = param
+                        .split_once('=')
+                        .ok_or_else(|| BouncerError::MalformedAttribute((*param).to_owned()))?;
+                    if value.len() > bouncer_networks::MAX_ATTRIBUTE_VALUE_BYTES {
+                        return Err(BouncerError::AttributeTooLong((*key).to_owned()));
+                    }
+                    match key {
+                        "mode" => {
+                            if actions.len() >= crate::action::MAX_REGISTRATION_ACTIONS {
+                                return Err(BouncerError::TooManyParameters);
+                            }
+                            actions.push(RegistrationAction::mode(value).map_err(map_action)?);
+                        }
+                        // The target is recorded and the action built when the text arrives,
+                        // so `text=` belongs to the `message=` that precedes it rather than to
+                        // whichever one happens to come later.
+                        "message" => {
+                            if actions.len() >= crate::action::MAX_REGISTRATION_ACTIONS {
+                                return Err(BouncerError::TooManyParameters);
+                            }
+                            pending_message = Some(value);
+                        }
+                        other => return Err(BouncerError::UnknownAttribute((*other).to_owned())),
+                    }
+                }
+                if let Some(target) = pending_message {
+                    actions.push(RegistrationAction::message(target, body).map_err(map_action)?);
+                } else if !body.is_empty() {
+                    // A text with no target is refused rather than ignored: silently dropping
+                    // it would clear the Operator's list while they believed they had written
+                    // a message to a service.
+                    return Err(BouncerError::Usage);
+                }
+                // `ACTION SET <netid>` with nothing named clears the list. That is a real
+                // operation and needs to be expressible, so it is not treated as a usage
+                // error the way an empty `CHANGENETWORK` is: an empty set is built and
+                // written, rather than answered locally.
+                let actions = crate::action::ActionSet::new(actions).map_err(map_action)?;
+                Ok(ServCommand::ActionSet { network, actions })
+            }
+            other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+        },
         "CONFIG" => match word(1).to_ascii_uppercase().as_str() {
             "EXPORT" => Ok(ServCommand::ConfigExport),
             "PLAN" => Ok(ServCommand::ConfigPlan),
@@ -352,6 +431,50 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
             other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
         },
         other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+    }
+}
+
+/// Splits a command line at the first whole-word `text=`.
+///
+/// Returns `(head, body)`, where `body` is everything after `text=` with surrounding
+/// whitespace trimmed, and `head` is everything before it. With no `text=` the whole line
+/// is the head and the body is empty.
+///
+/// A *whole-word* `text=` only: `context=` contains the substring, and splitting there would
+/// send whatever followed it as an identify line.
+///
+/// The body is a borrowed slice of the caller's line rather than an owned `String`,
+/// because the value is expected to be a credential: it goes straight into a `StoredSecret`
+/// and must not be copied into an intermediate owned string on the way.
+fn split_at_action_text(text: &str) -> (&str, &str) {
+    let mut offset = 0usize;
+    while let Some(found) = text[offset..].find("text=") {
+        let start = offset + found;
+        let whole_word =
+            start == 0 || text[..start].ends_with(|c: char| c.is_whitespace() || c == ';');
+        if whole_word {
+            return (&text[..start], text[start + "text=".len()..].trim());
+        }
+        offset = start + "text=".len();
+    }
+    (text, "")
+}
+
+/// Maps an action-model refusal onto the bounded client-facing reason set.
+///
+/// Only the fixed classifications cross this boundary. [`crate::action::ActionError`] is
+/// already a closed set that names what was wrong, so nothing is flattened into a generic
+/// "invalid" -- an Operator who typed a refused action needs to know which part to change.
+fn map_action(error: ActionError) -> BouncerError {
+    match error {
+        ActionError::ForbiddenCommand(name) => BouncerError::UnknownAttribute(name),
+        ActionError::MissingMode | ActionError::EmptyText => BouncerError::Usage,
+        ActionError::InvalidTarget => BouncerError::NotAService,
+        ActionError::TextTooLong => BouncerError::AttributeTooLong("text".to_owned()),
+        ActionError::TooManyActions | ActionError::TooManyBytes => BouncerError::TooManyParameters,
+        ActionError::TagsRefused | ActionError::PrefixedRefused => {
+            BouncerError::MalformedAttribute("prefix-or-tag".to_owned())
+        }
     }
 }
 
@@ -408,6 +531,10 @@ mod tests {
             "diag network 1",
             "config export",
             "config plan",
+            "action status 1",
+            "action set 1 mode=+B",
+            "action set 1 mode=+B message=NickServ text=IDENTIFY hunter2",
+            "action set 1",
         ] {
             parse(line).unwrap_or_else(|error| panic!("{line:?} must parse: {error}"));
         }
@@ -477,5 +604,106 @@ mod tests {
             !format!("{password:?}").contains("hunter2"),
             "a credential must not be renderable by any diagnostic"
         );
+    }
+}
+
+#[cfg(test)]
+mod action_matrix {
+    //! The command matrix the plan asks for, asserted where a command name is first read.
+    //!
+    //! These live here rather than in `action` because `RegistrationAction` has no
+    //! command-name argument to refuse: the allowlist is enforced where a name is parsed,
+    //! and a test of it anywhere else would be testing a copy of the rule.
+
+    use super::*;
+
+    /// `ACTION SET` with a command name in the position an attribute name goes.
+    fn smuggle(command: &str) -> Result<ServCommand, BouncerError> {
+        parse(&format!("ACTION SET 1 {command}=+B"))
+    }
+
+    #[test]
+    fn every_refused_command_is_refused_by_the_parser() {
+        for command in crate::action::FORBIDDEN_COMMANDS {
+            let error = smuggle(command).expect_err(&format!("{command} must be refused"));
+            assert!(
+                matches!(
+                    error,
+                    BouncerError::UnknownAttribute(ref name) if name == command
+                ),
+                "{command} produced {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_permitted_command_is_the_only_one_that_parses() {
+        assert!(parse("ACTION SET 1 mode=+B").is_ok());
+        // `PRIVMSG` reaches the same model through `message=`, not through a verb.
+        assert!(parse("ACTION SET 1 message=NickServ text=IDENTIFY pw").is_ok());
+        // A message with a space in it, which is what an identify line actually is.
+        assert!(parse("ACTION SET 1 message=NickServ text=IDENTIFY hunter2").is_ok());
+    }
+
+    #[test]
+    fn a_client_tag_cannot_be_stored_on_an_action() {
+        // The typed path is unreachable -- there is no attribute for a tag -- and this
+        // asserts the two spellings an Operator might try.
+        for attempt in [
+            "ACTION SET 1 @time=now mode=+B",
+            "ACTION SET 1 message=NickServ @time=now text=IDENTIFY pw",
+        ] {
+            assert!(
+                parse(attempt).is_err(),
+                "{attempt:?} must not parse: a stored action carries no tag"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefixed_or_raw_line_cannot_be_stored() {
+        for attempt in [
+            "ACTION SET 1 :bot!u@h JOIN #channel",
+            "ACTION SET 1 raw=JOIN #channel",
+            "ACTION SET 1 line=PRIVMSG NickServ :IDENTIFY pw",
+            "ACTION SET 1 exec=/bin/sh",
+            "ACTION SET 1 run=sh -c id",
+        ] {
+            assert!(
+                parse(attempt).is_err(),
+                "{attempt:?} must not parse: there is no arbitrary-line path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_action_without_its_text_is_refused() {
+        for attempt in [
+            "ACTION SET 1 message=NickServ",
+            "ACTION SET 1 text=IDENTIFY pw",
+        ] {
+            assert!(parse(attempt).is_err(), "{attempt:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_refusal_never_echoes_the_text_it_refused() {
+        // The one thing a stored action holds that must not escape. A refusal names the
+        // attribute; it does not repeat the value.
+        let refused = parse("ACTION SET 1 message=bot text=IDENTIFY hunter2")
+            .expect_err("a non-service target is refused");
+        assert!(!format!("{refused:?}").contains("hunter2"), "{refused:?}");
+        assert!(
+            !refused.reason().contains("hunter2"),
+            "{}",
+            refused.reason()
+        );
+    }
+
+    #[test]
+    fn the_parsed_command_never_formats_an_action_payload() {
+        let command =
+            parse("ACTION SET 1 message=NickServ text=IDENTIFY hunter2").expect("an action");
+        assert!(!format!("{command:?}").contains("hunter2"), "{command:?}");
     }
 }

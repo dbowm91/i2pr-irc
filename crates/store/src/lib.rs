@@ -35,6 +35,13 @@ pub use model::{
     MAX_RETENTION_DELETE, MAX_SEARCH_BUFFERS, MAX_SEARCH_FIELD_BYTES, MAX_SEARCH_RESULTS,
     MAX_SEARCH_TERM_BYTES, MAX_SEARCH_TERMS,
 };
+// Registration actions, with the ceilings the store enforces on them. A stored action's
+// payload is a `StoredSecret` for the whole way through, so the durable vocabulary and the
+// secret vocabulary are re-exported together.
+pub use model::{
+    MAX_STORED_ACTION_PAYLOAD_BYTES, MAX_STORED_ACTION_TARGET_BYTES, MAX_STORED_ACTIONS,
+    RegistrationActionKind, StoredRegistrationAction,
+};
 // The durable identities below are re-exported so a caller needs one import for the
 // whole storage vocabulary and cannot accidentally mix them up with runtime types.
 pub use i2pr_irc_core::{BufferId, ClientId, HistoryEventId, NetworkId};

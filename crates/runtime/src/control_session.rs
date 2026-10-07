@@ -26,6 +26,7 @@
 //! that fell behind is reconciled against current state rather than replayed, which is
 //! what keeps a slow client's memory bounded however long it stalls.
 
+use crate::action::ActionSet;
 use crate::bouncer_networks::{self, BouncerCommand, BouncerError, SERVICE_NICK};
 use crate::bouncerserv::{self, ServCommand};
 use crate::config_snapshot;
@@ -369,6 +370,45 @@ impl ControlSurface {
             ServCommand::DiagNetwork { network } => self.report_diagnostics(Some(network)).await,
             ServCommand::ConfigExport => self.export_config().await,
             ServCommand::ConfigPlan => self.plan_config().await,
+            ServCommand::ActionStatus { network } => self.action_status(network).await,
+            ServCommand::ActionSet { network, actions } => self.set_actions(network, actions).await,
+        }
+    }
+
+    /// Reports how many registration actions a Network stores.
+    ///
+    /// A count and nothing else. An action's text is expected to be a service password, and
+    /// there is no Operator-facing reason to print it -- `ACTION SET` is how it is written,
+    /// and a status answer that echoed it would put it in a terminal scrollback buffer that
+    /// survives the session.
+    async fn action_status(&mut self, network: NetworkId) {
+        if !self.require_network(network, "ACTION").await {
+            return;
+        }
+        match self.control.action_list(network).await {
+            Ok(actions) => self.notice(&format!("actions {}", actions.len())),
+            Err(error) => self.fail("ACTION", &map_control(error)),
+        }
+    }
+
+    /// Replaces a Network's whole registration-action list.
+    ///
+    /// The parsed, validated, bounded set travels with the command rather than being rebuilt
+    /// at dispatch. The control surface is constructed afresh for each request, so there is
+    /// nothing to carry it in, and re-parsing here would be a second implementation of the
+    /// validation that could disagree with the first.
+    ///
+    /// An empty set is a real request -- "this Network has no actions" -- and is written
+    /// durably as one, so the store is never a Network's real answer while the runtime
+    /// believes otherwise.
+    async fn set_actions(&mut self, network: NetworkId, actions: ActionSet) {
+        if !self.require_network(network, "ACTION").await {
+            return;
+        }
+        let count = actions.len();
+        match self.control.set_actions(network, actions).await {
+            Ok(_) => self.notice(&format!("Set {count} actions")),
+            Err(error) => self.fail("ACTION", &map_control(error)),
         }
     }
 

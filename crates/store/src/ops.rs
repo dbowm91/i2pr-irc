@@ -1604,3 +1604,118 @@ pub(crate) fn search(
     }
     Ok(hits)
 }
+
+/// Reads one Network's stored registration actions, in replay order.
+///
+/// Bounded by the query itself as well as by [`crate::MAX_STORED_ACTIONS`]: the limit is in
+/// the `SQL` so a table written by a future build cannot make this allocate more than the
+/// ceiling even before the returned count is checked.
+pub(crate) fn load_registration_actions(
+    connection: &mut Connection,
+    network: NetworkId,
+) -> Result<Vec<StoredRegistrationAction>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT kind, target, payload FROM registration_actions
+             WHERE network_id=?1 ORDER BY position LIMIT ?2",
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let rows = statement
+        .query_map(
+            params![
+                to_sql_id(network.0)?,
+                i64::try_from(crate::MAX_STORED_ACTIONS).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let mut actions = Vec::new();
+    for row in rows {
+        let (kind, target, payload) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        actions.push(StoredRegistrationAction {
+            kind: RegistrationActionKind::parse(&kind)?,
+            target,
+            payload: StoredSecret::new(payload),
+        });
+    }
+    Ok(actions)
+}
+
+/// Replaces one Network's stored registration actions with exactly `actions`.
+///
+/// A whole-set replace rather than an append or a per-row upsert, because the Operator's
+/// intent is "this is the list", and an incremental write would make the only way to remove
+/// an action a separate delete verb with its own ceiling to bound.
+pub(crate) fn save_registration_actions(
+    connection: &mut Connection,
+    network: NetworkId,
+    actions: &[StoredRegistrationAction],
+) -> Result<usize, StoreError> {
+    if actions.len() > crate::MAX_STORED_ACTIONS {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "registration action count",
+        )));
+    }
+    for action in actions {
+        validate_action(action)?;
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    transaction
+        .execute(
+            "DELETE FROM registration_actions WHERE network_id=?1",
+            params![to_sql_id(network.0)?],
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    for (position, action) in actions.iter().enumerate() {
+        let position = i64::try_from(position).map_err(|_| {
+            StoreError::new(StoreErrorKind::InvalidRequest(
+                "registration action position",
+            ))
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO registration_actions
+                     (network_id, position, kind, target, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    to_sql_id(network.0)?,
+                    position,
+                    action.kind.as_str(),
+                    action.target,
+                    action.payload.expose(),
+                ],
+            )
+            .map_err(|error| sql(error, CommitState::RolledBack))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| sql(error, CommitState::Unknown))?;
+    Ok(actions.len())
+}
+
+/// Refuses one action the shape ceilings do not allow.
+///
+/// Checked on the write path rather than only on read, so a row that violates a ceiling never
+/// exists. A store holding a value its own reader would later have to truncate is a store
+/// whose contents depend on when they are looked at.
+fn validate_action(action: &StoredRegistrationAction) -> Result<(), StoreError> {
+    if action.target.is_empty() || action.target.len() > crate::MAX_STORED_ACTION_TARGET_BYTES {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "registration action target",
+        )));
+    }
+    if action.payload.expose().len() > crate::MAX_STORED_ACTION_PAYLOAD_BYTES {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "registration action payload",
+        )));
+    }
+    Ok(())
+}

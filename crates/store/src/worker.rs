@@ -62,6 +62,17 @@ enum Request {
         channel: String,
         reply: Reply<Result<bool, StoreError>>,
     },
+    /// One Network's stored registration actions, in replay order.
+    LoadRegistrationActions {
+        network: NetworkId,
+        reply: Reply<Result<Vec<StoredRegistrationAction>, StoreError>>,
+    },
+    /// Replaces one Network's stored registration actions wholesale.
+    SaveRegistrationActions {
+        network: NetworkId,
+        actions: Vec<StoredRegistrationAction>,
+        reply: Reply<Result<usize, StoreError>>,
+    },
     CreateClient {
         login: String,
         reply: Reply<Result<(ClientId, bool), StoreError>>,
@@ -211,6 +222,32 @@ impl StoreHandle {
         self.submit(|reply| Request::RemoveNetwork { network, reply })
             .await
     }
+    /// Reads one Network's stored registration actions, in replay order.
+    ///
+    /// Bounded by the store's own ceiling, so a caller replaying them cannot be handed a
+    /// list larger than the runtime is willing to emit.
+    pub async fn load_registration_actions(
+        &self,
+        network: NetworkId,
+    ) -> Result<Vec<StoredRegistrationAction>, StoreError> {
+        self.submit(|reply| Request::LoadRegistrationActions { network, reply })
+            .await
+    }
+
+    /// Replaces one Network's stored registration actions wholesale.
+    pub async fn save_registration_actions(
+        &self,
+        network: NetworkId,
+        actions: &[StoredRegistrationAction],
+    ) -> Result<usize, StoreError> {
+        self.submit(|reply| Request::SaveRegistrationActions {
+            network,
+            actions: actions.to_vec(),
+            reply,
+        })
+        .await
+    }
+
     pub async fn add_desired_channel(
         &self,
         network: NetworkId,
@@ -643,6 +680,17 @@ fn execute(connection: &mut Connection, request: Request) {
         } => answer!(
             reply,
             ops::remove_desired_channel(connection, network, &channel)
+        ),
+        Request::LoadRegistrationActions { network, reply } => {
+            answer!(reply, ops::load_registration_actions(connection, network))
+        }
+        Request::SaveRegistrationActions {
+            network,
+            actions,
+            reply,
+        } => answer!(
+            reply,
+            ops::save_registration_actions(connection, network, &actions)
         ),
         Request::CreateClient { login, reply } => {
             answer!(reply, ops::create_client(connection, &login))

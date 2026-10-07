@@ -8,9 +8,10 @@ use i2pr_irc_core::{BufferId, I2pEndpoint, WallTime};
 use i2pr_irc_store::{
     BufferKind, EventDirection, HistoryAround, HistoryEventId, MAX_DISPLAY_NAME_BYTES,
     MAX_HISTORY_QUERY_EVENTS, MAX_SEARCH_BUFFERS, MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS,
-    MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent, RetentionRequest, SCHEMA_VERSION,
-    STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm, Store, StoreErrorKind,
-    StoreHandle, StoreHealth, StorePath, StoredSecret, attached_channels, fallback_display_name,
+    MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent, RegistrationActionKind,
+    RetentionRequest, SCHEMA_VERSION, STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm,
+    Store, StoreErrorKind, StoreHandle, StoreHealth, StorePath, StoredRegistrationAction,
+    StoredSecret, attached_channels, fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
 use i2pr_irc_wire::IrcTimestamp;
@@ -42,14 +43,14 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
 // ---------------------------------------------------------------- schema/open
 
 #[test]
-fn fresh_database_creates_exactly_schema_version_two() {
+fn fresh_database_creates_exactly_the_current_schema() {
     let dir = testing::temp_dir("fresh");
     let path = dir.db("fresh.sqlite3");
     let store = store_at(&path);
     assert_eq!(
         testing::tables(&path),
         EXPECTED_TABLES.to_vec(),
-        "schema 6 adds exactly one user table: the search side index"
+        "the table list is the schema's own promise, not an incidental detail"
     );
     assert_eq!(
         testing::identity(&path),
@@ -2461,4 +2462,246 @@ async fn a_window_larger_than_the_query_ceiling_is_refused_not_truncated() {
         "an over-wide window is refused rather than served partially, so a caller cannot \
          mistake the ceiling for the whole conversation"
     );
+}
+
+// ------------------------------------------------- registration actions
+
+fn stored_action(
+    kind: RegistrationActionKind,
+    target: &str,
+    payload: &str,
+) -> StoredRegistrationAction {
+    StoredRegistrationAction {
+        kind,
+        target: target.into(),
+        payload: StoredSecret::new(payload.into()),
+    }
+}
+
+#[tokio::test]
+async fn registration_actions_survive_a_restart_in_the_order_they_were_written() {
+    let dir = testing::temp_dir("actions-round-trip");
+    let path = dir.db("actions.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    handle
+        .save_network(&record(1, &[]))
+        .await
+        .expect("the network is durable");
+
+    let wanted = vec![
+        stored_action(RegistrationActionKind::Mode, "+B", ""),
+        stored_action(
+            RegistrationActionKind::Message,
+            "NickServ",
+            "IDENTIFY hunter2",
+        ),
+        stored_action(RegistrationActionKind::Mode, "+i", ""),
+    ];
+    assert_eq!(
+        handle
+            .save_registration_actions(NetworkId(1), &wanted)
+            .await
+            .expect("actions are durable"),
+        3
+    );
+
+    let read = handle
+        .load_registration_actions(NetworkId(1))
+        .await
+        .expect("actions are readable");
+    assert_eq!(read.len(), 3, "replay order is part of the meaning");
+    assert_eq!(read[0].target, "+B");
+    assert_eq!(read[1].target, "NickServ");
+    assert_eq!(
+        read[1].payload.expose(),
+        "IDENTIFY hunter2",
+        "the whole message round trips; only its *rendering* is forbidden"
+    );
+    assert_eq!(read[2].target, "+i");
+
+    // A reopen proves the rows are durable rather than cached in the worker.
+    drop(store);
+    drop(handle);
+    let reopened = store_at(&path);
+    let after = reopened
+        .handle_clone()
+        .load_registration_actions(NetworkId(1))
+        .await
+        .expect("actions survive a restart");
+    assert_eq!(after.len(), 3);
+    assert_eq!(after[1].payload.expose(), "IDENTIFY hunter2");
+    reopened.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn a_stored_action_is_never_rendered_by_its_debug() {
+    // The one thing a stored action holds that must not escape into a log or an error.
+    let action = stored_action(
+        RegistrationActionKind::Message,
+        "NickServ",
+        "IDENTIFY hunter2",
+    );
+    let rendered = format!("{action:?}");
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(
+        rendered.contains("NickServ"),
+        "the target is operational: {rendered}"
+    );
+    assert!(rendered.contains("[redacted]"), "{rendered}");
+}
+
+#[tokio::test]
+async fn registration_actions_are_bounded_on_the_write_path() {
+    let dir = testing::temp_dir("actions-bounds");
+    let path = dir.db("bounds.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    handle.save_network(&record(1, &[])).await.expect("durable");
+
+    let too_many: Vec<_> = (0..=i2pr_irc_store::MAX_STORED_ACTIONS)
+        .map(|_| stored_action(RegistrationActionKind::Mode, "+B", ""))
+        .collect();
+    assert!(
+        matches!(
+            handle
+                .save_registration_actions(NetworkId(1), &too_many)
+                .await
+                .expect_err("the count ceiling is enforced on write")
+                .kind(),
+            StoreErrorKind::InvalidRequest(_)
+        ),
+        "the count ceiling is enforced on write"
+    );
+    assert!(
+        handle
+            .load_registration_actions(NetworkId(1))
+            .await
+            .expect("readable")
+            .is_empty(),
+        "a refused write leaves nothing behind"
+    );
+
+    let long_target = "x".repeat(i2pr_irc_store::MAX_STORED_ACTION_TARGET_BYTES + 1);
+    assert!(
+        matches!(
+            handle
+                .save_registration_actions(
+                    NetworkId(1),
+                    &[stored_action(
+                        RegistrationActionKind::Mode,
+                        &long_target,
+                        ""
+                    )],
+                )
+                .await
+                .expect_err("the target ceiling is enforced on write")
+                .kind(),
+            StoreErrorKind::InvalidRequest(_)
+        ),
+        "the target ceiling is enforced on write"
+    );
+
+    let long_payload = "x".repeat(i2pr_irc_store::MAX_STORED_ACTION_PAYLOAD_BYTES + 1);
+    assert!(
+        matches!(
+            handle
+                .save_registration_actions(
+                    NetworkId(1),
+                    &[stored_action(
+                        RegistrationActionKind::Message,
+                        "NickServ",
+                        &long_payload,
+                    )],
+                )
+                .await
+                .expect_err("the payload ceiling is enforced on write")
+                .kind(),
+            StoreErrorKind::InvalidRequest(_)
+        ),
+        "the payload ceiling is enforced on write"
+    );
+
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn setting_actions_replaces_the_whole_list() {
+    // The Operator's intent is "this is now the list". An append-only store would make
+    // removing an action a second operation with its own semantics.
+    let dir = testing::temp_dir("actions-replace");
+    let path = dir.db("replace.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    handle.save_network(&record(1, &[])).await.expect("durable");
+
+    handle
+        .save_registration_actions(
+            NetworkId(1),
+            &[
+                stored_action(RegistrationActionKind::Mode, "+B", ""),
+                stored_action(RegistrationActionKind::Mode, "+i", ""),
+            ],
+        )
+        .await
+        .expect("durable");
+    handle
+        .save_registration_actions(
+            NetworkId(1),
+            &[stored_action(RegistrationActionKind::Mode, "+w", "")],
+        )
+        .await
+        .expect("durable");
+
+    let read = handle
+        .load_registration_actions(NetworkId(1))
+        .await
+        .expect("readable");
+    assert_eq!(
+        read.len(),
+        1,
+        "the second write replaced rather than appended"
+    );
+    assert_eq!(read[0].target, "+w");
+
+    handle
+        .save_registration_actions(NetworkId(1), &[])
+        .await
+        .expect("an empty set clears");
+    assert!(
+        handle
+            .load_registration_actions(NetworkId(1))
+            .await
+            .expect("readable")
+            .is_empty()
+    );
+
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn deleting_a_network_deletes_its_actions() {
+    let dir = testing::temp_dir("actions-cascade");
+    let path = dir.db("cascade.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle_clone();
+    handle.save_network(&record(1, &[])).await.expect("durable");
+    handle
+        .save_registration_actions(
+            NetworkId(1),
+            &[stored_action(RegistrationActionKind::Mode, "+B", "")],
+        )
+        .await
+        .expect("durable");
+    assert!(handle.remove_network(NetworkId(1)).await.expect("removed"));
+    assert!(
+        handle
+            .load_registration_actions(NetworkId(1))
+            .await
+            .expect("readable")
+            .is_empty(),
+        "a forgotten Network must not leave a credential-bearing row behind"
+    );
+
+    store.shutdown().expect("store shuts down");
 }

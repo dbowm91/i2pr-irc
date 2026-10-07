@@ -12,6 +12,7 @@
 //! `QUIT` fence. Both are now covered against `owner::NetworkOwner` in
 //! `crates/runtime/tests/corrective_019.rs`, so the legacy suite is redundant rather
 //! than load-bearing and the legacy owner and its helpers can be deleted outright.
+pub mod action;
 pub mod admission;
 pub mod bouncer_networks;
 pub mod bouncerserv;
