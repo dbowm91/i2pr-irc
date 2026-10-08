@@ -8,6 +8,16 @@ Rust 1.88 / edition 2024 is the workspace floor. Production dependencies are Tok
 `crates/sam` adds the workspace's only socket authority and its only OS-random dependency.
 Both were reviewed before being added.
 
+### Standalone daemon process lease
+
+Plan 050 adds `fs2` 0.4 for nonblocking advisory exclusive state-directory ownership. Its
+MSRV is below Rust 1.88 and it uses the platform's file-lock API without an unsafe
+first-party boundary. The lock is held by an open file descriptor for the complete
+Store/Runtime lifetime; stale file contents are never treated as ownership. The daemon
+uses Tokio's existing `net` feature only in the already-authorized SAM crate; daemon
+signal handling adds only Tokio's `signal` feature. No listener or generic socket
+authority is introduced by this milestone.
+
 ### `tokio` `net` feature
 
 The SAM crate enables `tokio`'s `net` feature. The workspace `tokio` already carried

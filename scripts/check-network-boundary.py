@@ -25,7 +25,7 @@ import sys
 import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
-CRATES=("core","wire","store","runtime","sam","testkit","fuzz-smoke")
+CRATES=("core","wire","store","runtime","sam","testkit","fuzz-smoke","daemon")
 # R001-B: `crates/sam` is the only production path permitted to open a TCP socket, and
 # only ever to a loopback SAM bridge. It is scanned like every other crate for the generic
 # primitives, and separately for socket authority, because "loopback only" is a claim this

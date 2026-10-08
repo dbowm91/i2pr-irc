@@ -1,0 +1,19 @@
+[package]
+name = "i2pr-irc-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "i2pr-irc"
+path = "src/main.rs"
+
+[dependencies]
+fs2.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+i2pr-irc-runtime = { path = "../runtime" }
+i2pr-irc-sam = { path = "../sam" }
+i2pr-irc-store = { path = "../store" }
+
+[lints]
+workspace = true

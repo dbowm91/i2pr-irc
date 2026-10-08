@@ -1,6 +1,6 @@
 # i2pr-irc
 
-i2pr-irc is a Rust IRC bouncer core for I2P, delivered as library crates.
+i2pr-irc is a Rust IRC bouncer for I2P, with a Rust library core and a process bootstrap.
 
 The product boundary is deliberately narrow: upstream IRC traffic is I2P-only. The bouncer does not provide a clearnet IRC connector, system-DNS fallback, generic proxying, DCC, or an HTTP side channel. Its first priority is correct IRC/IRCv3 bouncer behavior under unstable, high-latency stream conditions. Router integration follows through explicit I2P stream-provider interfaces.
 
@@ -29,14 +29,16 @@ Research lives under plans/research/. Subsystem roadmaps live under plans/subsys
 - Optional whole-database SQLCipher encrypted Store under one injected process-level key, with source-preserving migration and rotation (M008).
 - OTRv3-transparent opaque transport (M009): the bouncer carries OTR query/AKE/data/fragment payloads byte-exactly, holds no OTR keys/session state/plaintext, keeps OTR-bearing chat non-replayable, and retains ciphertext only.
 
-### Not yet a finished standalone product
+### Standalone daemon bootstrap status
 
-- No production executable crate and no production local TCP/Unix listener/bootstrap path.
+- `cargo run -p i2pr-irc-daemon -- --help` exposes the bootstrap CLI. Plan 050 adds an executable that takes an exclusive state lease, opens an explicitly configured existing plaintext store, restores RuntimeController ownership and stops on SIGINT/SIGTERM.
+- The daemon does not activate a listener; configured listener values are rejected with an explicit message. Operator authentication and client access arrive in Plans 051-052.
+- This bootstrap is for a deliberately pre-provisioned plaintext test store only. Secure encrypted initialization and key provisioning are not available until Plan 053. It is not yet a usable standalone IRC bouncer.
 - No production store-key provisioning UX (environment/file/keyring/HSM).
 - No packaging, service, or install layer.
 - No real-client OTR interoperability qualification through a product listener; that waits on the future production listener.
 
-The standalone M010 productization milestone is planned (Research 010, ADR-0007, Plans 050-054); Plan 050 is the sole ready handoff. Planning is not an implementation claim: the executable, production listener, and secure init UX remain absent until their plans close.
+The standalone M010 productization milestone is in progress (Research 010, ADR-0007, Plans 050-054). Track each sequential handoff in `plans/registry.md`; completing Plan 050 does not make a usable standalone bouncer.
 
 Router R002 (i2pr managed-app adapter) remains blocked on stable public i2pr managed-app stream/listener/lifecycle contracts.
 
