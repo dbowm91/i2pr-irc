@@ -26,12 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | maintenance corrective closed | plans/subsystems/bouncer-core-roadmap.md | Corrective 034 closed; M005 remains closed | M004, Corrective 019, and Plans 020-025 are closed. Research 006 and ADR-0003 freeze M005 control-session/runtime ownership. Plan 020 landed the bounded RuntimeController, pre-bind DownstreamAdmission, one-shot PreparedSession transfer, and schema 3. Plan 021 landed the typed DesiredChannelRecord, schema 4's durable detached flag, and the detach/reattach transitions. Plan 022 landed schema 5's auto_away and keep_nick policy, per-session active/passive classification with draft/pre-away mediation, owner-scoped manual away, a bounded deterministic nick fallback answered inside the registration window, and generation-owned reclaim. Plan 023 landed the soju.im/bouncer-networks draft, the local BouncerServ administration service, controller-allocated netids, a single-sourced I2P attribute profile, and snapshot-derived notification deltas. Plan 024 landed the soju.im/search adapter, schema 6's FTS5 side index and effective_time rule, indexed msgid and timestamp reference lookups, the HistoryPosition model for out-of-window references, and a two-seek AROUND. Plan 025 promoted server-time, standard-replies, cap-notify and draft/no-implicit-names, made echo-message conditional on the upstream negotiation, gave the tag surface and the refusal format a per-session third and dual form, and replaced the static capability list with one advertisement shared by the owner and the reader. Plan 026 accepted extended-join, account-notify, away-notify, multi-prefix and setname as a set whose downstream advertisement is conditional on the upstream acknowledgement, recorded account-tag, chghost, invite-notify and extended-monitor as deliberately deferred with stated reasons, added bounded observed member metadata with a three-state account model, mediated extended JOINs and prefix runs per session across NAMES and routed WHO and WHOIS, and made registration read the Network's live advertisement. Plan 027 landed the bounded secret-free diagnostics surface read from the live owners, the versioned local configuration snapshot format with plan-then-apply import and a stored-credential merge, and the bounded allowlisted registration actions with schema 7 and a replay runner that emits them after every successful generation; it also recorded a pre-existing finding that a generation teardown takes about 120 s to be noticed, which Plan 028 resolved. Plan 028 qualified M005 as one integrated product and **closed the milestone**. The integrated pass found three production defects that eight per-subsystem suites had each correctly passed over: the connect rate limiter could hang, because `ReconnectScheduler::acquire` parked on a notification while the token gate frees on a clock that notifies nothing, so every Network past `MAX_CONNECT_BURST` could stay unconnected forever on a cold start; `ControlSnapshot` answered from memory, because `publish()` ran only from `commit()`, so a Network with two live sessions reported `attached=0 phase=idle` until an unrelated edit happened; and `registration_actions`, `clients` and `network_secrets` were missing from `REQUIRED_TABLES`, so a database declaring the current version without them opened successfully and failed later. Plan 028 also **withdrew** Plan 027's teardown finding as a fixture defect -- `drop_generation` silently matched nothing, so the test measured `LIVENESS_DEADLINE` rather than the bouncer, which ends a generation on end-of-stream immediately. Corrective 034 **closed the declared Rust 1.88 verification floor**. The cause was a lint-group change rather than repository drift: `clippy::uninlined_format_args` is a `style` lint (warn by default, hence fatal under `-D warnings`) on 1.88.0 and a `pedantic` lint (allow by default) on 1.89 and later, against a workspace that sets `clippy::all = "warn"`, so the MSRV toolchain was the strict one and the red floor was invisible to current stable. Corrective 034 traced it to exactly two sites, one in `crates/core` and one in `crates/runtime` that Plan 033's crate-scoped check had missed, fixed both with behavior-neutral interpolated-format-argument rewrites in test code only, and added no lint suppression, dependency, script, or production change. `rustup run 1.88.0 sh scripts/verify.sh full` and current-stable `scripts/verify.sh full` now both pass green from one tree at 892 tests. |
-| I2P router integration | R001 conditionally closed | plans/subsystems/i2p-router-integration-roadmap.md | Corrective 033 closed | Corrective 033 closed on 2026-10-07 after a full live pass against i2pd 2.61.0: exact bidirectional application bytes crossed an I2P stream between an independently implemented accepting peer and the production SamProvider, on one provider instance, with one session creation serving both streams and an explicit release leaving zero scope. Plan 032's "no application bytes" finding is **superseded** — its peer never issued STREAM ACCEPT, so it measured a socket arrangement SAM does not define. The corrective also found and fixed a real production defect: the owned client's HELLO classifier rejected the specification's canonical `HELLO REPLY RESULT=OK VERSION=3.1`, so every connect to i2pd failed at the handshake; the scripted bridge answered the Java form and agreed with the bug. R001 is now conditional solely on portability evidence: Java I2P and i2pr are NOT RUN, and cross-router interoperability is not attempted. R002 remains blocked on its own managed-app interface prerequisites plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts; R003 remains research-blocked. |
+| Bouncer core | active prerequisite corrective | plans/subsystems/bouncer-core-roadmap.md | Corrective 035 ready; M006/M007 planned | Research 008 couples IRC capability downgrade and identity resilience. Corrective 035 first fixes the pre-existing reversed IRCv3 MONITOR 730/731 semantics. Then Plans 036-038 close M006, followed by Plans 039-041 for M007. M005 and Corrective 034 remain closed. |
+| I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Research 008 delegates broad Java/i2pd/i2pr and mixed-router SAM conformance to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
-None. Corrective 034 was the only dependency-ready implementation plan and is now closed.
+| Plan | Status | Class | Source | Closure/result |
+|---|---|---|---|---|
+| Bouncer Core Corrective 035 — MONITOR Numeric Conformance | ready | protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/035-status.md |
 
 ## Recently closed implementation plans
 
@@ -76,15 +78,25 @@ None. Corrective 034 was the only dependency-ready implementation plan and is no
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Router R002 — i2pr Managed-App Adapter | blocked | its own managed-app interface prerequisites, plus stable public i2pr app I2P-stream/local-listener/lifecycle contracts | no implementation handoff yet |
+| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | blocked | Corrective 035 closure | plans/implementation/bouncer-core/036-m006a-registration-downgrade-and-legacy-server-baseline.md |
+| Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | blocked | Plan 036 closure | plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md |
+| Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | blocked | Plan 037 closure | plans/implementation/bouncer-core/038-m006c-integrated-irc-interoperability-qualification-and-closure.md |
+| Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery | blocked | Plan 038 / M006 closure | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md |
+| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | blocked | Plan 039 closure | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md |
+| Bouncer Core M007-C / Plan 041 — Eggchaos Multi-Client Adverse Qualification and M007 Closure | blocked | Plan 040 closure | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md |
+| Router R002 — i2pr Managed-App Adapter | blocked | stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts + its own managed-app prerequisites | no implementation handoff yet |
 
 ## Unplanned later milestones
 
-R001 is conditionally closed on corrected evidence. Later router milestones remain outside
-the current handoff:
+M006 and M007 are fully planned and registered. Later product lines remain intentionally unplanned:
 
-- Router R002 — i2pr managed-app adapter, blocked on its own managed-app interface prerequisites plus stable public app stream/listener/lifecycle contracts. It may be authored on the corrected R001 basis: the SAM adapter's ability to carry application bytes is established for i2pd 2.61.0 rather than assumed from an invalid run. It must not treat one router as sufficient for a managed-app data-transfer claim;
+- privacy/encryption at rest: credential-vault and encrypted SQLite/history design;
+- encrypted conversation research: OTR/E2EE endpoint placement, multi-client semantics, and history behavior;
+- standalone daemon/listener/packaging work;
+- Router R002 — i2pr managed-app adapter, blocked on stable public app stream/listener/lifecycle contracts;
 - Router R003 — optional scoped Proposal 170/control integration, research-blocked until a concrete product need exists.
+
+Broad SAM portability matrices are not an open milestone in this repository; the dedicated SAM library project owns that conformance work.
 
 ## Accepted architecture decisions
 
@@ -105,6 +117,7 @@ Current foundation research:
 - plans/research/005-m004-anonymity-and-adverse-network-research.md
 - plans/research/006-m005-mature-bouncer-and-control-session-research.md
 - plans/research/007-r001-owned-sam31-client-and-provider-scope.md
+- plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
 
 Important retained conclusions:
 
@@ -114,49 +127,31 @@ Important retained conclusions:
 - draft/chathistory and draft/read-marker remain draft-isolated wire adapters over internal durable history/cursor semantics.
 - SAM 3.1 STREAM is the conservative first portable router target.
 - R001 uses a small owned SAM 3.1 client while the standalone SAM library matures; third-party SAM crates are conformance/test references, not production dependencies.
+- Corrective 033's real i2pd application-byte pass is sufficient R001 evidence for this repository; broad SAM portability belongs to the dedicated SAM library project.
+- M006 treats no-CAP/no-SASL/plain IRC-over-I2P as first-class compatibility modes while keeping configured SASL fail-closed.
+- M006 promotes account-tag and invite-notify without fabricating live state; chghost and extended-monitor remain explicitly deferred.
+- M007 builds service authentication/recovery from constrained phased actions rather than NickServ prose parsing, and uses Eggchaos only as an external qualification substrate.
 - Provider scope is per durable Network by default so unrelated IRC Networks do not silently share one I2P Destination; transient SAM identity survives IRC reconnects but not provider/router-session recreation or process restart.
 - Proposal 170 is not required for the IRC data path.
 - i2pr managed-app integration waits for public app-scoped I2P stream and local accepted-stream/listener capabilities; it must not import private router internals.
 
 ## Immediate handoff
 
-No implementation plan is ready for handoff. Corrective 034 is closed
-(`plans/closure/bouncer-core/034-status.md`) and the active implementation table is
-empty.
+Implement only:
 
-The repository verification floor is now genuinely dual-toolchain. Both commands pass
-green from one tree:
+- plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md
 
-~~~sh
-rustup run 1.88.0 sh scripts/verify.sh full
-sh scripts/verify.sh full
-~~~
+Corrective 035 fixes the pre-existing IRCv3 MONITOR semantic inversion before any new identity-recovery logic is built: 730 is online, 731 is offline/free evidence, and 303 ISON remains the fallback probe.
 
-Both at 892 tests, 0 failures, with `-D warnings`, `--all-targets`, `--all-features`, and
-`--locked` intact, no lint suppression, no dependency change, and no script change.
+After Corrective 035 closes, execute the registered sequence strictly:
 
-### Standing verification requirement
+1. Plan 036 — legacy/no-CAP/no-SASL registration baseline.
+2. Plan 037 — account-tag and invite-notify mediation.
+3. Plan 038 — integrated M006 qualification/closure.
+4. Plan 039 — phased service actions for non-SASL authentication/recovery.
+5. Plan 040 — preferred-nick/reconnect/multi-client identity resilience.
+6. Plan 041 — Eggchaos process/socket adverse qualification and M007 closure.
 
-A future plan's closure evidence must run the full command under the declared MSRV and let
-it reach completion, not a per-crate or per-touched-file subset. Corrective 034 exists
-because that rule was not followed before it: the lint that broke the floor was stricter
-on 1.88.0 than on current stable, so every narrower check that had been run happened to
-land on the lenient side. "Current toolchain is green" is not evidence for the declared
-floor, and a narrow green is not a floor.
+Do not parallelize Plans 036-040; they modify the same registration/generation/identity state machine.
 
-### Future-plan disposition
-
-Corrective 034 unblocks no plan, and none is recorded as unblocked.
-
-R001 remains conditionally closed only on Java I2P/i2pr/cross-router evidence. Those are
-evidence gaps that require those products; they are not planning work this repository can
-close by itself.
-
-R002 remains blocked on its managed-app/public i2pr interface prerequisites -- a
-managed-app interface, an i2pr integration consuming public managed-app capabilities, and
-stable public app I2P-stream/local-listener/lifecycle contracts. R003 remains
-research-blocked on a concrete product need. Corrective 034 removed a repository-wide
-defect that would otherwise have been copied into any future plan's closure evidence, so
-those plans can now be authored knowing the MSRV floor actually holds, but that is a
-precondition for authoring confidently, not one of their dependencies, and neither status
-changes.
+R001 is closed for this repository on the existing real i2pd product-path evidence. R002 remains independently blocked on upstream i2pr managed-app contracts. Privacy/encryption work is intentionally a later separate line.
