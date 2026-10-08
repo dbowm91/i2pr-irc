@@ -27,7 +27,10 @@
 use crate::{
     RuntimeError,
     downstream::DownstreamDisposition,
-    session::{ClientWiring, RefusedRegistration, SessionHandle, SessionIntent},
+    session::{
+        AbortOnDrop, ClientWiring, PreAuthenticatedRegistration, RefusedRegistration,
+        SessionHandle, SessionIntent,
+    },
 };
 use i2pr_irc_core::{ByteStream, ClientId, NetworkId, SessionId};
 use std::collections::BTreeSet;
@@ -209,6 +212,26 @@ impl DownstreamAdmission {
     /// reason and closed. There is no path that returns while leaving a socket, writer
     /// task, or read half alive with nobody driving them.
     pub async fn run(self, stream: Box<dyn ByteStream>) -> AdmissionOutcome {
+        self.run_inner(stream, None).await
+    }
+
+    /// Runs an authenticated one-shot socket checkpoint through the same canonical
+    /// SessionReader and transfer path as an unauthenticated-to-runtime local session.
+    /// Already answered registration state is seeded once; CAP and IRC frames are not
+    /// replayed or answered a second time.
+    pub async fn run_pre_authenticated(
+        self,
+        stream: Box<dyn ByteStream>,
+        registration: PreAuthenticatedRegistration,
+    ) -> AdmissionOutcome {
+        self.run_inner(stream, Some(registration)).await
+    }
+
+    async fn run_inner(
+        self,
+        stream: Box<dyn ByteStream>,
+        registration: Option<PreAuthenticatedRegistration>,
+    ) -> AdmissionOutcome {
         let expected_nick = self
             .selected
             .as_ref()
@@ -249,14 +272,33 @@ impl DownstreamAdmission {
         } else {
             advertisement
         };
-        let wiring = ClientWiring::new(
-            self.session,
-            self.client,
-            expected_nick,
-            bindable,
-            advertisement,
-            stream,
-        );
+        let wiring = match registration {
+            Some(registration) => match ClientWiring::new_pre_authenticated(
+                self.session,
+                self.client,
+                expected_nick,
+                bindable,
+                advertisement,
+                stream,
+                registration,
+            ) {
+                Ok(wiring) => wiring,
+                Err(refused) => {
+                    refused
+                        .refuse("451", "Registration checkpoint rejected")
+                        .await;
+                    return AdmissionOutcome::Refused;
+                }
+            },
+            None => ClientWiring::new(
+                self.session,
+                self.client,
+                expected_nick,
+                bindable,
+                advertisement,
+                stream,
+            ),
+        };
 
         // Registration reports no intents upward: nothing has claimed this client yet,
         // and forwarding a pre-registration intent to an owner that does not exist is
@@ -380,14 +422,14 @@ async fn serve_unbound(
     // The notification task ends with the connection. It is aborted below rather than
     // left to notice a closed socket on its own: a task that outlives the session it was
     // announcing to is a task writing to a client nobody is reading.
-    let notifier = tokio::spawn(async move {
+    let notifier = AbortOnDrop::new(tokio::spawn(async move {
         loop {
             if status.changed().await.is_err() {
                 return;
             }
             notify.publish_changes().await;
         }
-    });
+    }));
 
     // A bounded, fixed welcome burst. It names no channel, no endpoint, and nothing
     // about the bouncer's upstream identity.
@@ -398,7 +440,7 @@ async fn serve_unbound(
         format!(":bouncer 376 {nick} :End of MOTD\r\n"),
     ] {
         if handle.queue_control(&line).is_err() {
-            notifier.abort();
+            notifier.abort_and_join().await;
             return;
         }
     }
@@ -433,7 +475,7 @@ async fn serve_unbound(
             }
         })
         .await;
-    notifier.abort();
+    notifier.abort_and_join().await;
 }
 
 /// The error a caller reports when admission itself could not run.

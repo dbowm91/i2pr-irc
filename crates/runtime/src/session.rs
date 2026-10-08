@@ -23,6 +23,31 @@ use tokio::{
     task::JoinHandle,
 };
 
+/// Cancels an owned child task if its parent future is dropped, while still allowing
+/// normal shutdown to abort and join it explicitly.
+pub(crate) struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    pub(crate) fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    pub(crate) async fn abort_and_join(mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 /// Maximum complete tagged line accepted from one local client.
 pub const MAX_CLIENT_LINE: usize = i2pr_irc_wire::MAX_TAGGED_LINE_BYTES;
 /// Maximum decoded lines one read may yield before the session is treated as overloaded.
@@ -753,6 +778,14 @@ pub struct ClientWiring<D: ByteStream + 'static = Box<dyn ByteStream>> {
     writer: crate::downstream::SessionWriter,
 }
 
+/// Registration state authenticated by a trusted local access layer before it was
+/// transferred here. The containing value is consumed once; the normal SessionReader
+/// remains the sole authority for the rest of IRC registration and ongoing protocol.
+pub struct PreAuthenticatedRegistration {
+    pub negotiated_capabilities: std::collections::BTreeSet<String>,
+    pub unread: Vec<u8>,
+}
+
 impl<D: ByteStream + 'static> ClientWiring<D> {
     /// Splits `stream` and starts the writer task.
     ///
@@ -799,6 +832,62 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
             handle,
             writer,
         }
+    }
+
+    /// Builds the canonical session reader from an authenticated registration
+    /// checkpoint. Already answered CAP/auth lines are represented as state and never
+    /// replayed; unread IRC frames are fed into the same bounded decoder used normally.
+    pub fn new_pre_authenticated(
+        session: SessionId,
+        client: ClientId,
+        expected_nick: Option<String>,
+        bindable: std::collections::BTreeSet<NetworkId>,
+        advertisement: Vec<String>,
+        stream: D,
+        registration: PreAuthenticatedRegistration,
+    ) -> Result<Self, RefusedRegistration> {
+        let mut wiring = Self::new(
+            session,
+            client,
+            expected_nick,
+            bindable,
+            advertisement,
+            stream,
+        );
+        let runtime_capabilities = registration
+            .negotiated_capabilities
+            .into_iter()
+            .filter(|name| name != "sasl")
+            .collect::<std::collections::BTreeSet<_>>();
+        let valid_capabilities = {
+            let advertised = wiring.reader.advertised.lock().ok();
+            runtime_capabilities.len() <= crate::downstream::MAX_NEGOTIATED_CAPABILITIES
+                && advertised.is_some_and(|offered| {
+                    runtime_capabilities
+                        .iter()
+                        .all(|name| offered.contains(name))
+                })
+        };
+        if !valid_capabilities || registration.unread.len() > 4096 {
+            return Err(RefusedRegistration {
+                handle: wiring.handle,
+                writer: wiring.writer,
+                disposition: DownstreamDisposition::ProtocolViolation,
+                nick: "*".to_owned(),
+            });
+        }
+        wiring.reader.negotiated = runtime_capabilities;
+        let decoded = wiring.reader.decoder.push(&registration.unread);
+        if decoded.len() > MAX_LINES_PER_READ || decoded.iter().any(Result::is_err) {
+            return Err(RefusedRegistration {
+                handle: wiring.handle,
+                writer: wiring.writer,
+                disposition: DownstreamDisposition::ProtocolViolation,
+                nick: "*".to_owned(),
+            });
+        }
+        wiring.reader.pending = decoded.into_iter().map(Result::unwrap).collect();
+        Ok(wiring)
     }
 
     /// The handle a Network owner routes this client through.
@@ -911,7 +1000,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         let (events_tx, mut events_rx) =
             mpsc::channel::<SessionEvent>(SESSION_EVENT_QUEUE_CAPACITY);
         let session = reader.session;
-        let task = tokio::spawn(async move {
+        let task = AbortOnDrop::new(tokio::spawn(async move {
             let disposition = reader.run(&events_tx).await;
             let _ = events_tx
                 .send(SessionEvent::Ended {
@@ -919,7 +1008,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
                     disposition,
                 })
                 .await;
-        });
+        }));
         let mut disposition = DownstreamDisposition::Eof;
         while let Some(event) = events_rx.recv().await {
             match event {
@@ -940,8 +1029,7 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         }
         // The reader must not outlive the handler: it would keep writing to a socket
         // this call is about to close.
-        task.abort();
-        let _ = task.await;
+        task.abort_and_join().await;
         drop(handle);
         writer.shutdown().await;
         disposition
@@ -1098,6 +1186,9 @@ impl<D: ByteStream> SessionReader<D> {
         mut self,
     ) -> Result<SessionReader<D>, DownstreamDisposition> {
         loop {
+            if self.registration_intent() == Some(SessionIntent::RequestProjection) {
+                return Ok(self);
+            }
             let raw = match self.next_line().await {
                 Ok(Some(raw)) => raw,
                 Ok(None) => return Err(DownstreamDisposition::Eof),
@@ -1805,5 +1896,33 @@ mod capability_tests {
         let caps = SessionCapabilities::default().with_negotiated(&enabled);
         assert!(caps.negotiated_tags(), "message-tags must be observable");
         assert!(!SessionCapabilities::default().negotiated_tags());
+    }
+
+    #[tokio::test]
+    async fn authenticated_registration_checkpoint_seeds_one_canonical_reader() {
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let mut capabilities = BTreeSet::new();
+        capabilities.insert(crate::capability::MESSAGE_TAGS.to_owned());
+        let wiring = ClientWiring::new_pre_authenticated(
+            SessionId(9),
+            ClientId(4),
+            None,
+            BTreeSet::new(),
+            vec![crate::capability::MESSAGE_TAGS.to_owned()],
+            stream,
+            PreAuthenticatedRegistration {
+                negotiated_capabilities: capabilities.clone(),
+                unread: b"NICK nick\r\nUSER profile 0 * :after-auth\r\nPING :after-auth\r\n"
+                    .to_vec(),
+            },
+        )
+        .unwrap_or_else(|_| panic!("bounded checkpoint is accepted"));
+        assert_eq!(wiring.negotiated(), &capabilities);
+        let registered = wiring
+            .register(std::time::Duration::from_secs(1))
+            .await
+            .unwrap_or_else(|_| panic!("registered checkpoint avoids a second NICK/USER"));
+        assert!(registered.is_registered());
+        assert_eq!(registered.registered_nick(), Some("nick"));
     }
 }

@@ -1,7 +1,7 @@
 use fs2::FileExt;
 use i2pr_irc_runtime::RuntimeController;
 use i2pr_irc_sam::{SamBridgeEndpoint, SamClientConfig, SamProvider};
-use i2pr_irc_store::{Store, StoreOpenOptions, StorePath};
+use i2pr_irc_store::{NetworkId, Store, StoreOpenOptions, StorePath};
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+pub mod app;
 pub mod listener;
 
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
@@ -21,7 +22,8 @@ struct Config {
     state_dir: PathBuf,
     store_file: PathBuf,
     sam_bridge: SamBridgeEndpoint,
-    listener: Option<String>,
+    listener: Option<std::net::SocketAddr>,
+    default_network: Option<NetworkId>,
 }
 
 impl Config {
@@ -53,6 +55,7 @@ impl Config {
                     | "store_file"
                     | "sam_bridge"
                     | "listener"
+                    | "default_network"
                     | "encryption"
                     | "key_file"
             ) {
@@ -62,7 +65,8 @@ impl Config {
         if values.get("version").map(String::as_str) != Some("1") {
             return Err("unsupported configuration version".to_owned());
         }
-        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let config_dir = fs::canonicalize(path.parent().unwrap_or_else(|| Path::new(".")))
+            .map_err(|_| "cannot resolve configuration directory".to_owned())?;
         let resolve_config_path = |name: &str, default: &str| {
             let candidate = PathBuf::from(values.get(name).map(String::as_str).unwrap_or(default));
             if candidate.is_absolute() {
@@ -84,14 +88,22 @@ impl Config {
             }
             return Err("encrypted key provisioning is not available until secure init".to_owned());
         }
-        let listener = values.get("listener").cloned();
-        if let Some(address) = listener.as_deref() {
-            let parsed = address
-                .parse::<std::net::SocketAddr>()
-                .map_err(|_| "listener must be a numeric loopback address".to_owned())?;
-            if !parsed.ip().is_loopback() || parsed.port() == 0 {
-                return Err("listener must be a numeric loopback address".to_owned());
-            }
+        let listener = values
+            .get("listener")
+            .map(|value| value.parse::<std::net::SocketAddr>())
+            .transpose()
+            .map_err(|_| "listener must be a numeric loopback address".to_owned())?;
+        if listener.is_some_and(|address| listener::validate_loopback(address).is_err()) {
+            return Err("listener must be a numeric loopback address".to_owned());
+        }
+        let default_network = values
+            .get("default_network")
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| "default network id is invalid".to_owned())?
+            .map(NetworkId);
+        if default_network.is_some_and(|network| network.0 == 0) {
+            return Err("default network id is invalid".to_owned());
         }
         let bridge = values
             .get("sam_bridge")
@@ -104,11 +116,15 @@ impl Config {
             .get("store_file")
             .map(|_| resolve_config_path("store_file", "bouncer.sqlite3"))
             .unwrap_or_else(|| state_dir.join("bouncer.sqlite3"));
+        if !store_file.starts_with(&state_dir) {
+            return Err("store file must be inside the state directory".to_owned());
+        }
         Ok(Self {
             state_dir,
             store_file,
             sam_bridge,
             listener,
+            default_network,
         })
     }
 }
@@ -179,8 +195,22 @@ async fn run(config_path: &Path) -> Result<(), String> {
         .map_err(|_| "cannot obtain exclusive state ownership".to_owned())?;
     if let Some(listener) = config.listener.as_ref() {
         return Err(format!(
-            "listener {listener} is configured but not activated in this bootstrap milestone"
+            "listener {listener} is configured but activation waits for secure credential provisioning"
         ));
+    }
+    if config.default_network.is_some() {
+        return Err("default network requires an activated listener".to_owned());
+    }
+    let state_real = fs::canonicalize(&config.state_dir)
+        .map_err(|_| "cannot resolve state directory".to_owned())?;
+    let store_parent = config
+        .store_file
+        .parent()
+        .ok_or_else(|| "store path has no parent".to_owned())?;
+    let store_parent_real = fs::canonicalize(store_parent)
+        .map_err(|_| "store parent directory does not exist".to_owned())?;
+    if !store_parent_real.starts_with(&state_real) {
+        return Err("store file must be inside the leased state directory".to_owned());
     }
     if !config.store_file.is_absolute() {
         return Err("store path must resolve to an absolute path".to_owned());
@@ -302,8 +332,19 @@ mod tests {
         )
         .unwrap();
         let config = Config::parse(&file).unwrap();
-        assert_eq!(config.state_dir, dir.join("private"));
-        assert_eq!(config.store_file, dir.join("private/bouncer.sqlite3"));
+        assert_eq!(
+            config.state_dir,
+            fs::canonicalize(dir.join("private").parent().unwrap())
+                .unwrap()
+                .join("private")
+        );
+        assert_eq!(config.store_file, config.state_dir.join("bouncer.sqlite3"));
+        fs::write(
+            &file,
+            "version=1\nstate_dir=private\nstore_file=other.sqlite3\n",
+        )
+        .unwrap();
+        assert!(Config::parse(&file).is_err());
         fs::write(&file, "version=1\nsam_bridge=router.i2p:7656\n").unwrap();
         assert!(Config::parse(&file).is_err());
         fs::write(&file, "version=1\nlistener=0.0.0.0:6667\n").unwrap();

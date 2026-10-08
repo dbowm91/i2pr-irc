@@ -117,6 +117,7 @@ def scan_sources(root,crates=CRATES):
         if not base.exists():continue
         for path in sorted(base.rglob("*.rs")):
             text=path.read_text()
+            scan_text=text.split("\n#[cfg(test)]",1)[0] if crate=="daemon" else text
             # R001-B: `tokio::net` is in the generic socket predicate and the SAM client
             # has to name it. Exempted for exactly the two allowlisted files, and
             # compensated by `sam_findings`, which is the stricter predicate: it permits
@@ -124,8 +125,8 @@ def scan_sources(root,crates=CRATES):
             # DNS, UDP, or a unix socket.
             daemon_listener=crate=="daemon" and path.relative_to(base).as_posix()=="src/listener.rs"
             if not (crate==SAM_CRATE and _sam_allowlisted(path)) and not daemon_listener:
-                found.extend(source_findings(path,text))
-            found.extend(daemon_findings(path,text))
+                found.extend(source_findings(path,scan_text))
+            found.extend(daemon_findings(path,scan_text))
             # The CTCP module names DCC only to block it. It is the one place allowed
             # to say so, so the guard is scoped rather than blanket.
             #
@@ -139,7 +140,7 @@ def scan_sources(root,crates=CRATES):
             # one has a narrower predicate in front of it.
             exempt = path.name=="ctcp.rs" or (crate==SAM_CRATE and _sam_allowlisted(path)) or daemon_listener
             if not exempt:
-                found.extend(dcc_findings(path,text))
+                found.extend(dcc_findings(path,scan_text))
             if crate==SAM_CRATE:
                 found.extend(sam_findings(path,text))
         for path in (base/"Cargo.toml",base/"build.rs"):

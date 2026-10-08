@@ -112,6 +112,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "fs2",
+ "i2pr-irc-core",
  "i2pr-irc-runtime",
  "i2pr-irc-sam",
  "i2pr-irc-store",

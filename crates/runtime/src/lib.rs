@@ -46,6 +46,7 @@ pub use controller::{
 };
 pub use owner::{ChannelPolicy, StoreChannelPolicy};
 pub use reconnect::ReconnectScheduler;
+pub use session::PreAuthenticatedRegistration;
 
 use i2pr_irc_core::{ConnectionGeneration, ProviderError};
 use std::{fmt, io, time::Duration};

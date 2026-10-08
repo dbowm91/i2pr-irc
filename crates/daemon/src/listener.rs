@@ -14,6 +14,7 @@ pub const MAX_HANDSHAKE_LINE: usize = 512;
 pub const MAX_HANDSHAKE_BUFFER: usize = 4096;
 pub const MAX_HANDSHAKE_LINES: usize = 32;
 pub const MAX_PARALLEL_HANDSHAKES: usize = 64;
+pub const MAX_AUTHENTICATED_HANDOFFS: usize = 64;
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
 pub trait CredentialVerifier: Send + Sync + 'static {
@@ -75,10 +76,13 @@ pub fn validate_loopback(address: SocketAddr) -> Result<(), &'static str> {
 pub async fn serve(
     address: SocketAddr,
     verifier: Arc<dyn CredentialVerifier>,
-    on_authenticated: Arc<dyn Fn(AuthenticatedCheckpoint) + Send + Sync>,
+    handoffs: tokio::sync::mpsc::Sender<AuthenticatedCheckpoint>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), String> {
     validate_loopback(address).map_err(str::to_owned)?;
+    if handoffs.max_capacity() > MAX_AUTHENTICATED_HANDOFFS {
+        return Err("authenticated handoff queue exceeds capacity limit".to_owned());
+    }
     let listener = TcpListener::bind(address)
         .await
         .map_err(|_| "cannot bind local listener".to_owned())?;
@@ -98,14 +102,20 @@ pub async fn serve(
                 if !peer.ip().is_loopback() { drop(stream); continue; }
                 let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
                 let verifier = Arc::clone(&verifier);
-                let on_authenticated = Arc::clone(&on_authenticated);
+                let handoffs = handoffs.clone();
                 let mut child_stop = stop.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _ = tokio::select! {
+                    tokio::select! {
                         biased;
-                        _ = wait_stop(&mut child_stop) => Ok(()),
-                        result = authenticate(stream, verifier) => result.map(|checkpoint| on_authenticated(checkpoint)),
+                        _ = wait_stop(&mut child_stop) => {},
+                        result = authenticate(stream, verifier) => {
+                            if let Ok(checkpoint) = result {
+                                // Admission is bounded independently of the listener task
+                                // count; a full handoff queue refuses this socket promptly.
+                                let _ = handoffs.try_send(checkpoint);
+                            }
+                        },
                     };
                 });
                 while tasks.len() > MAX_PARALLEL_HANDSHAKES {
@@ -133,6 +143,7 @@ pub async fn authenticate(
 ) -> Result<AuthenticatedCheckpoint, HandshakeError> {
     tokio::time::timeout(HANDSHAKE_DEADLINE, async move {
         let mut bytes = Zeroizing::new(Vec::with_capacity(1024));
+        let mut deferred = Zeroizing::new(Vec::new());
         let mut scratch = [0u8; 1024];
         let mut lines = 0usize;
         let mut auth: Option<(String, AuthKind)> = None;
@@ -158,12 +169,12 @@ pub async fn authenticate(
                 if end + 2 > MAX_HANDSHAKE_LINE {
                     return Err(());
                 }
-                let line = Zeroizing::new(bytes.drain(..end + 2).collect::<Vec<u8>>());
+                let raw_line = Zeroizing::new(bytes.drain(..end + 2).collect::<Vec<u8>>());
                 lines += 1;
                 if lines > MAX_HANDSHAKE_LINES {
                     return Err(());
                 }
-                let line = std::str::from_utf8(&line[..line.len() - 2]).map_err(|_| ())?;
+                let line = std::str::from_utf8(&raw_line[..raw_line.len() - 2]).map_err(|_| ())?;
                 let mut fields = line.splitn(3, ' ');
                 let command = fields.next().ok_or(())?.to_ascii_uppercase();
                 let arg = fields.next().unwrap_or("");
@@ -187,29 +198,49 @@ pub async fn authenticate(
                         "REQ" => {
                             let requested = trailing.split_ascii_whitespace().collect::<Vec<_>>();
                             let supported = |name: &str| {
+                                let name = name.to_ascii_lowercase();
                                 name == "sasl"
-                                    || name == "sasl=PLAIN"
+                                    || name == "sasl=plain"
                                     || i2pr_irc_runtime::downstream::DOWNSTREAM_ADVERTISED
-                                        .contains(&name)
+                                        .contains(&name.as_str())
                             };
                             if !requested.is_empty()
-                                && requested.len() <= 8
+                                && requested.len()
+                                    <= i2pr_irc_runtime::downstream::MAX_NEGOTIATED_CAPABILITIES
                                 && requested.iter().all(|name| supported(name))
                             {
                                 let normalized = requested
                                     .iter()
                                     .map(|name| {
-                                        if *name == "sasl=PLAIN" {
+                                        if name.eq_ignore_ascii_case("sasl=plain") {
                                             "sasl".to_owned()
                                         } else {
-                                            (*name).to_owned()
+                                            name.to_ascii_lowercase()
                                         }
                                     })
                                     .collect::<Vec<_>>();
-                                negotiated_capabilities.extend(normalized.iter().cloned());
-                                let line =
-                                    format!(":i2pr-irc CAP * ACK :{}\r\n", normalized.join(" "));
-                                stream.write_all(line.as_bytes()).await.map_err(|_| ())?;
+                                let updated = negotiated_capabilities
+                                    .iter()
+                                    .cloned()
+                                    .chain(normalized.iter().cloned())
+                                    .collect::<std::collections::BTreeSet<_>>();
+                                if updated.len()
+                                    <= i2pr_irc_runtime::downstream::MAX_NEGOTIATED_CAPABILITIES
+                                {
+                                    negotiated_capabilities = updated;
+                                    let line = format!(
+                                        ":i2pr-irc CAP * ACK :{}\r\n",
+                                        normalized.join(" ")
+                                    );
+                                    stream.write_all(line.as_bytes()).await.map_err(|_| ())?;
+                                } else {
+                                    stream
+                                        .write_all(
+                                            b":i2pr-irc CAP * NAK :too many capabilities\r\n",
+                                        )
+                                        .await
+                                        .map_err(|_| ())?;
+                                }
                             } else {
                                 stream
                                     .write_all(b":i2pr-irc CAP * NAK :unsupported\r\n")
@@ -308,8 +339,18 @@ pub async fn authenticate(
                             return Err(());
                         }
                     }
-                    "NICK" => nick = Some(arg.to_owned()),
-                    "USER" => user = Some(arg.to_owned()),
+                    "NICK" => {
+                        nick = Some(arg.to_owned());
+                        defer_line(&mut deferred, &raw_line)?;
+                    }
+                    "USER" => {
+                        if arg.is_empty() {
+                            return Err(());
+                        }
+                        user = Some(arg.to_owned());
+                        defer_line(&mut deferred, &raw_line)?;
+                    }
+                    _ if authenticated.is_some() => defer_line(&mut deferred, &raw_line)?,
                     _ => return Err(()),
                 }
                 if let (Some(profile), Some(nick), Some(user)) =
@@ -321,7 +362,14 @@ pub async fn authenticate(
                         profile: profile.clone(),
                         nick: nick.clone(),
                         user: user.clone(),
-                        unread: std::mem::take(&mut *bytes),
+                        unread: {
+                            if deferred.len().saturating_add(bytes.len()) > MAX_HANDSHAKE_BUFFER {
+                                return Err(());
+                            }
+                            let mut unread = std::mem::take(&mut *deferred);
+                            unread.extend(std::mem::take(&mut *bytes));
+                            unread
+                        },
                         negotiated_capabilities: negotiated_capabilities.into_iter().collect(),
                     });
                 }
@@ -334,6 +382,14 @@ pub async fn authenticate(
     .await
     .map_err(|_| HandshakeError::Deadline)?
     .map_err(|_| HandshakeError::Rejected)
+}
+
+fn defer_line(buffer: &mut Vec<u8>, line: &[u8]) -> Result<(), ()> {
+    if buffer.len().saturating_add(line.len()) > MAX_HANDSHAKE_BUFFER {
+        return Err(());
+    }
+    buffer.extend_from_slice(line);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -416,7 +472,10 @@ mod tests {
         assert_eq!(state.profile, "test");
         assert_eq!(state.nick, "nick");
         assert_eq!(state.user, "user");
-        assert_eq!(state.unread, b"PRIVMSG #x :not consumed\r\n");
+        assert_eq!(
+            state.unread,
+            b"NICK nick\r\nUSER user 0 * :fixture\r\nPRIVMSG #x :not consumed\r\n"
+        );
     }
 
     #[tokio::test]
@@ -447,7 +506,7 @@ mod tests {
         let checkpoint = server.await.unwrap();
         let (_stream, state) = checkpoint.into_parts();
         assert_eq!(state.nick, "n");
-        assert!(state.unread.is_empty());
+        assert_eq!(state.unread, b"NICK n\r\nUSER u 0 * :f\r\n");
     }
 
     #[tokio::test]
