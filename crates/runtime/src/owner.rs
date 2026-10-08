@@ -677,6 +677,12 @@ pub struct NetworkSnapshot {
     pub phase: Option<Phase>,
     pub generation: Option<ConnectionGeneration>,
     pub nick: Option<String>,
+    pub preferred_nick: Option<String>,
+    pub fallback_active: bool,
+    pub reclaim_suspended: bool,
+    pub reclaim_cooldown_ms: u64,
+    pub reclaim_writes: u64,
+    pub reclaim_refusals: u64,
     /// What this bouncer currently advertises to an attached client.
     ///
     /// Derived from the upstream negotiation, so it is a function of what the server
@@ -994,6 +1000,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             state.network = Some(context.network);
             state.phase = Some(Phase::Idle);
             state.nick = Some(context.record.nick.clone());
+            state.preferred_nick = Some(context.record.nick.clone());
         });
         // An owner task exists from construction, so it is counted from construction. The
         // `Drop` below is what makes the count return to baseline.
@@ -1063,6 +1070,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     fn publish_state(&self, state: &NetworkState) {
         self.snapshot.send_modify(|snapshot| {
             snapshot.nick = Some(state.nick.clone());
+            snapshot.fallback_active = snapshot
+                .preferred_nick
+                .as_deref()
+                .is_some_and(|preferred| !state.same_nick(&state.nick, preferred));
             // Observed membership only, so a reader cannot mistake an outstanding or
             // rejected attempt for a live channel.
             snapshot.channels = state.joined_channels();
@@ -1233,20 +1244,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             });
                             return Err(RuntimeError::Registration);
                         }
-                        // Terminal for the same reason: a refused sequence will be
-                        // refused identically on a retry, and each retry would spend a
-                        // process-wide connect permit to produce identical upstream
-                        // traffic. Configuration or a reconcile is the only thing that
-                        // can change the answer.
-                        Err(RuntimeError::NickExhausted) => {
-                            self.reconnect.mark_terminal(self.network);
-                            self.snapshot.send_modify(|state| {
-                                state.phase = Some(Phase::Stopped);
-                                state.attached_sessions = 0;
-                                state.last_error = Some("nick exhausted");
-                            });
-                            return Err(RuntimeError::NickExhausted);
-                        }
+                        Err(RuntimeError::NickExhausted) => Err(RuntimeError::NickExhausted),
                         Err(error) => Err(error),
                     }
                 }
@@ -1264,7 +1262,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 self.reconnect.mark_terminal(self.network);
             }
             let entropy = jitter_entropy(self.network, generation, self.reconnect.entropy_seed());
-            let delay = backoff.next_delay(entropy);
+            let delay = if matches!(&outcome, Err(RuntimeError::NickExhausted)) {
+                crate::presence::nick_collision_retry_delay(entropy)
+            } else {
+                backoff.next_delay(entropy)
+            };
             self.snapshot.send_modify(|state| {
                 state.phase = Some(Phase::Backoff);
                 state.attached_sessions = 0;
@@ -1516,6 +1518,22 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             used_fallback_nick = true;
                             send(&mut uw, &format!("NICK {next}\r\n")).await?;
                         }
+                        "437"
+                            if params
+                                .get(1)
+                                .is_some_and(|nick| state.same_nick(nick, &state.nick)) =>
+                        {
+                            let Some(next) = fallback.next_candidate() else {
+                                return Err(RuntimeError::NickExhausted);
+                            };
+                            if !crate::presence::valid_nick(&next) {
+                                return Err(RuntimeError::NickExhausted);
+                            }
+                            state.nick = next.clone();
+                            used_fallback_nick = true;
+                            send(&mut uw, &format!("NICK {next}\r\n")).await?;
+                        }
+                        "432" => return Err(RuntimeError::Registration),
                         "001" => {
                             if self.context.record.sasl.is_some() && !sasl_authenticated {
                                 return Err(RuntimeError::Registration);
@@ -1783,6 +1801,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &buffers,
                             &mut reconcile,
                             advertised_downstream.iter().cloned().collect(),
+                            used_fallback_nick,
+                            &fallback,
                         )
                         .await;
                     }
@@ -1807,6 +1827,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         &upstream_caps,
                         &mut presence,
                         &mut presence_of,
+                        &mut reclaim_attempt,
                     )
                     .await
                     {
@@ -2129,12 +2150,27 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         // follows is a request, and only the server's own frame confirms
                         // it. Treating either as confirmation would let the bouncer
                         // believe it holds a nick it is still queued to claim.
+                        let reclaim_refused = matches!(message.command.as_slice(), b"433" | b"436" | b"437")
+                            && message.params.get(1).is_some_and(|nick| {
+                                state.same_nick(&String::from_utf8_lossy(nick), &self.context.record.nick)
+                            });
+                        if reclaim_refused {
+                            if let Some(attempt) = reclaim_attempt.as_mut() {
+                                crate::presence::note_reclaim_refusal(attempt, reclaim_started.elapsed());
+                                self.snapshot.send_modify(|snapshot| {
+                                    snapshot.reclaim_refusals = attempt.refusals as u64;
+                                    snapshot.reclaim_cooldown_ms =
+                                        crate::presence::RECLAIM_REFUSAL_COOLDOWN.as_millis() as u64;
+                                });
+                            }
+                        } else {
                         self.note_reclaim_evidence(
                             &state,
                             &message,
                             &mut reclaim_attempt,
                             &reclaim_wake,
                         );
+                        }
                         // Resolve a channel to its durable buffer *after* this line has
                         // been applied, because the line that creates membership is the
                         // self JOIN itself. Checking before applying would mean the very
@@ -2255,6 +2291,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // writes, and attaching writes to that same snapshot, so a borrow held across the
         // attach would deadlock on itself.
         advertised: Vec<String>,
+        fallback_active: bool,
+        fallback_sequence: &crate::presence::NickFallback,
     ) {
         match command {
             SupervisorCommand::Attach {
@@ -2302,9 +2340,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 // Captured before the value is consumed: adoption takes the session by
                 // value, and presence classification is keyed by its id.
                 let session_id = session.session_id();
+                let current_is_generated_fallback = fallback_active
+                    && fallback_sequence
+                        .generated_fallbacks()
+                        .any(|candidate| state.same_nick(&candidate, &state.nick));
                 let accepted = adopt_prepared_session(
                     session,
                     &state.nick,
+                    &self.context.record.nick,
+                    current_is_generated_fallback,
                     session_tx,
                     sessions,
                     &self.snapshot,
@@ -2714,6 +2758,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         upstream_caps: &UpstreamCapabilities,
         presence: &mut PresenceState,
         presence_of: &mut BTreeMap<SessionId, SessionPresence>,
+        reclaim_attempt: &mut Option<ReclaimAttempt>,
     ) -> Result<(), RuntimeError> {
         match event {
             SessionEvent::Ended {
@@ -2845,6 +2890,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     SessionIntent::Forward { wire, class } => {
                         let class_label = class.as_str();
+                        if let Some(message) = Message::parse(&wire).ok()
+                            && message.command.eq_ignore_ascii_case(b"NICK")
+                            && message.params.first().is_some_and(|requested| {
+                                !state.same_nick(
+                                    &String::from_utf8_lossy(requested),
+                                    &self.context.record.nick,
+                                )
+                            })
+                            && let Some(attempt) = reclaim_attempt.as_mut()
+                        {
+                            attempt.suspended = true;
+                            self.snapshot
+                                .send_modify(|snapshot| snapshot.reclaim_suspended = true);
+                        }
                         // Privacy mediation runs before anything is queued upstream and
                         // before any durable or diagnostic side effect, so a blocked
                         // frame is never transmitted, fanned out, or recorded as sent.
@@ -3330,6 +3389,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             });
             return None;
         }
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.reclaim_writes = attempt.writes as u64;
+            snapshot.reclaim_suspended = attempt.suspended;
+        });
         Some(format!("NICK {}\r\n", attempt.preferred))
     }
 
@@ -4107,6 +4170,8 @@ fn attach_session<D: ByteStream + 'static>(
 fn adopt_prepared_session(
     prepared: Box<crate::admission::PreparedSession>,
     expected_nick: &str,
+    preferred_nick: &str,
+    fallback_active: bool,
     session_tx: &mpsc::Sender<SessionEvent>,
     sessions: &mut BTreeMap<SessionId, SessionTask>,
     snapshot: &watch::Sender<NetworkSnapshot>,
@@ -4120,9 +4185,11 @@ fn adopt_prepared_session(
         // not a session, and admitting it would project a network to nobody.
         None => return Err(RuntimeError::Protocol),
     };
-    if i2pr_irc_core::Casemapping::Rfc1459.fold(claimed.as_bytes())
-        != i2pr_irc_core::Casemapping::Rfc1459.fold(expected_nick.as_bytes())
-    {
+    let mapping = i2pr_irc_core::Casemapping::Rfc1459;
+    let current_claim = mapping.fold(claimed.as_bytes()) == mapping.fold(expected_nick.as_bytes());
+    let preferred_alias = fallback_active
+        && mapping.fold(claimed.as_bytes()) == mapping.fold(preferred_nick.as_bytes());
+    if !current_claim && !preferred_alias {
         // The client is told, on its own socket, that its nickname is not available
         // here. Silently closing would be indistinguishable from a network fault, and
         // would leave a client that reconnected on the same stale selection with no way
@@ -4131,6 +4198,14 @@ fn adopt_prepared_session(
             ":bouncer 433 {claimed} :Nickname unavailable on this network\r\n"
         ));
         return Err(RuntimeError::InvalidConfig);
+    }
+    let mut prepared = prepared;
+    if preferred_alias && !current_claim {
+        prepared.set_registered_nick(expected_nick);
+        prepared
+            .handle()
+            .queue_normal(&format!(":{claimed} NICK :{expected_nick}\r\n"))
+            .map_err(|_| RuntimeError::QueueOverloaded)?;
     }
     let session = prepared.session_id();
     if sessions.contains_key(&session) {

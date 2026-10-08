@@ -37,7 +37,7 @@ Canonical direction:
 | Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | closed | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/036-status.md |
 | Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | closed | IRCv3 capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/037-status.md |
 | Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | closed | qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/038-status.md |
-| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | active | identity state machine + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md |
+| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | closing | identity state machine + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md |
 
 ## Recently closed implementation plans
 

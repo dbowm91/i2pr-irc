@@ -82,6 +82,16 @@ pub const RECLAIM_INTERVAL: Duration = Duration::from_secs(300);
 /// client stuck in a loop. The cap turns that into a diagnostic and a quiet bouncer,
 /// which is strictly better than either silence about it or unlimited traffic.
 pub const MAX_RECLAIM_WRITES_PER_GENERATION: usize = 8;
+/// Minimum quiet period after the server refuses a reclaim attempt.
+pub const RECLAIM_REFUSAL_COOLDOWN: Duration = Duration::from_secs(300);
+/// Floor for retrying a registration after every bounded fallback collides.
+pub const NICK_COLLISION_RETRY_FLOOR: Duration = Duration::from_secs(900);
+
+/// Deterministic per-network collision cooldown with only positive jitter above its floor.
+pub fn nick_collision_retry_delay(entropy: u64) -> Duration {
+    let jitter_ms = entropy % 180_001;
+    NICK_COLLISION_RETRY_FLOOR + Duration::from_millis(jitter_ms)
+}
 
 /// Ceiling on monitored nicks in one `MONITOR` request.
 ///
@@ -337,6 +347,12 @@ impl NickFallback {
         self.attempts
     }
 
+    /// Generated fallback names already offered in this generation, excluding the
+    /// durable preferred nickname. The iterator is bounded by the attempt ceiling.
+    pub fn generated_fallbacks(&self) -> impl Iterator<Item = String> + '_ {
+        (1..self.attempts).map(|index| self.candidate(index))
+    }
+
     /// Records that the preferred nick has already been offered.
     ///
     /// Registration offers it first, so the sequence's *first* candidate has been used
@@ -484,6 +500,12 @@ pub struct ReclaimAttempt {
     pub writes: usize,
     /// Whether this generation has evidence the preferred nick is free.
     pub evidence: bool,
+    /// Refusals received while the generation remained online.
+    pub refusals: usize,
+    /// Earliest elapsed generation time at which another attempt is allowed.
+    pub cooldown_until: Duration,
+    /// Operator explicitly chose another nick for this generation.
+    pub suspended: bool,
 }
 
 impl ReclaimAttempt {
@@ -493,6 +515,9 @@ impl ReclaimAttempt {
             current: current.to_owned(),
             writes: 0,
             evidence: false,
+            refusals: 0,
+            cooldown_until: Duration::ZERO,
+            suspended: false,
         }
     }
 
@@ -502,11 +527,21 @@ impl ReclaimAttempt {
     /// immediately. Without evidence, a write happens on the bounded schedule, never on
     /// a client's activity.
     pub fn should_write(&self, elapsed: Duration, interval: Duration) -> bool {
-        if self.current.eq_ignore_ascii_case(&self.preferred) {
+        if self.suspended
+            || elapsed < self.cooldown_until
+            || self.current.eq_ignore_ascii_case(&self.preferred)
+        {
             return false;
         }
         self.evidence || elapsed >= interval
     }
+}
+
+/// Records an online refusal and suppresses retries until the fixed cooldown expires.
+pub fn note_reclaim_refusal(attempt: &mut ReclaimAttempt, elapsed: Duration) {
+    attempt.refusals = attempt.refusals.saturating_add(1);
+    attempt.evidence = false;
+    attempt.cooldown_until = elapsed.saturating_add(RECLAIM_REFUSAL_COOLDOWN);
 }
 
 /// Records whether a reclaim write was accepted for this generation.
@@ -720,6 +755,28 @@ mod tests {
             !attempt.should_write(Duration::from_secs(1), RECLAIM_INTERVAL),
             "holding the nick already means there is nothing to reclaim"
         );
+    }
+
+    #[test]
+    fn reclaim_refusal_clears_evidence_and_applies_testable_cooldown() {
+        let mut attempt = ReclaimAttempt::new("bot", "bot_1");
+        attempt.evidence = true;
+        note_reclaim_refusal(&mut attempt, Duration::from_secs(7));
+        assert_eq!(attempt.refusals, 1);
+        assert!(!attempt.evidence);
+        assert_eq!(attempt.cooldown_until, Duration::from_secs(307));
+        assert!(!attempt.should_write(Duration::from_secs(306), Duration::from_secs(300)));
+        assert!(attempt.should_write(Duration::from_secs(307), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn collision_retry_jitter_never_falls_below_its_floor() {
+        let minimum = nick_collision_retry_delay(0);
+        let maximum = nick_collision_retry_delay(u64::MAX);
+        assert_eq!(minimum, NICK_COLLISION_RETRY_FLOOR);
+        assert!(maximum >= NICK_COLLISION_RETRY_FLOOR);
+        assert!(maximum <= NICK_COLLISION_RETRY_FLOOR + Duration::from_secs(180));
+        assert_ne!(minimum, nick_collision_retry_delay(1));
     }
 
     #[test]

@@ -864,6 +864,11 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         self.reader.registered_nick()
     }
 
+    /// Reconciles an admitted preferred alias to the Network's observed fallback nick.
+    pub(crate) fn set_registered_nick(&mut self, nick: &str) {
+        self.reader.registered_nick = Some(nick.to_owned());
+    }
+
     /// The capabilities this client negotiated during registration.
     pub fn negotiated(&self) -> &std::collections::BTreeSet<String> {
         self.reader.negotiated()

@@ -70,6 +70,12 @@ pub struct NetworkDiagnostics {
     pub generation: Option<u64>,
     /// The nick currently in use, if any.
     pub nick: Option<String>,
+    pub preferred_nick: Option<String>,
+    pub fallback_active: bool,
+    pub reclaim_suspended: bool,
+    pub reclaim_cooldown_ms: u64,
+    pub reclaim_writes: u64,
+    pub reclaim_refusals: u64,
     pub away: AwayClass,
     /// How many desired channels are currently presented downstream.
     pub channels_visible: u64,
@@ -216,6 +222,12 @@ pub fn project_network(
         phase: snapshot.phase.map(|phase| phase.as_str().to_owned()),
         generation: snapshot.generation.map(|generation| generation.0),
         nick: snapshot.nick.clone(),
+        preferred_nick: snapshot.preferred_nick.clone(),
+        fallback_active: snapshot.fallback_active,
+        reclaim_suspended: snapshot.reclaim_suspended,
+        reclaim_cooldown_ms: snapshot.reclaim_cooldown_ms,
+        reclaim_writes: snapshot.reclaim_writes,
+        reclaim_refusals: snapshot.reclaim_refusals,
         away: away_class(snapshot.away.as_deref(), snapshot.away_origin),
         channels_visible: snapshot.channels.len() as u64,
         channels_detached: snapshot.detached_channels.len() as u64,
@@ -417,7 +429,7 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
         tagged(
             "state",
             &format!(
-                "netid={netid} name={} phase={} generation={} away={} attached={} active={} \
+                "netid={netid} name={} phase={} generation={} nick={} preferred_nick={} fallback={} reclaim_suspended={} reclaim_cooldown_ms={} reclaim_writes={} reclaim_refusals={} away={} attached={} active={} \
                  passive={} attempt={} in_flight={} waiters={} next_retry_delay={} \
                  last_disposition={} last_error={}",
                 report.display_name,
@@ -425,6 +437,13 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
                 report
                     .generation
                     .map_or_else(|| "none".to_owned(), |generation| generation.to_string()),
+                report.nick.as_deref().unwrap_or("none"),
+                report.preferred_nick.as_deref().unwrap_or("none"),
+                report.fallback_active,
+                report.reclaim_suspended,
+                report.reclaim_cooldown_ms,
+                report.reclaim_writes,
+                report.reclaim_refusals,
                 report.away.as_str(),
                 report.sessions_attached,
                 report.sessions_active,
@@ -643,6 +662,12 @@ mod tests {
                 phase: Some("online".to_owned()),
                 generation: Some(1),
                 nick: Some("bot".to_owned()),
+                preferred_nick: Some("bot".to_owned()),
+                fallback_active: false,
+                reclaim_suspended: false,
+                reclaim_cooldown_ms: 0,
+                reclaim_writes: 0,
+                reclaim_refusals: 0,
                 away: AwayClass::Present,
                 channels_visible: count as u64,
                 channels_detached: 0,

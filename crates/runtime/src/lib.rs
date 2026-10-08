@@ -146,11 +146,8 @@ pub enum RuntimeError {
     /// Every bounded fallback nick was refused, or the sequence produced something that
     /// is not a legal nick.
     ///
-    /// Terminal, like [`RuntimeError::Registration`]: the next candidate in a sequence
-    /// that has already been refused `MAX_FALLBACK_NICK_ATTEMPTS` times is not evidence
-    /// that a later attempt would differ. Retrying would spend a shared connect permit
-    /// and produce identical upstream traffic, so the Network is marked terminal until
-    /// configuration or a reconcile changes it.
+    /// Retryable after a dedicated collision cooldown. The bounded sequence is retried
+    /// only after the occupancy may have changed.
     #[error("preferred nick exhausted every bounded fallback")]
     NickExhausted,
     #[error("invalid network configuration")]
@@ -1064,7 +1061,7 @@ pub(crate) fn error_class(error: &Result<(), RuntimeError>) -> &'static str {
         // A collision that exhausted every bounded fallback is reported as its own
         // class, not folded into "registration": the credentials were fine and the
         // Operator's nick is what the server refused.
-        Err(RuntimeError::NickExhausted) => "nick-exhausted",
+        Err(RuntimeError::NickExhausted) => "nick-collision-retry",
         Err(RuntimeError::Io(_)) => "io",
         Err(RuntimeError::Stopped) => "stopped",
         Err(RuntimeError::InvalidConfig) => "configuration",

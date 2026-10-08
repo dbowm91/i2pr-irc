@@ -826,6 +826,53 @@ async fn a_selected_client_is_bound_to_its_network() {
 }
 
 #[tokio::test]
+async fn a_preferred_alias_attaches_to_a_generated_fallback_and_receives_nick_transition() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .control
+        .create(record(1, "bot"))
+        .await
+        .expect("Network creates");
+    let mut upstream = runtime.provider.plain_peer().await;
+    read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :\r\n:srv 433 * bot :Nickname is already in use\r\n")
+        .await
+        .expect("preferred nick is occupied");
+    read_until(&mut upstream, b"NICK bot_1\r\n").await;
+    upstream
+        .write_all(b":srv 001 bot_1 :welcome\r\n")
+        .await
+        .expect("fallback registers");
+    runtime.upstreams.push(upstream);
+    runtime.wait_live(NetworkId(1)).await;
+
+    let mut client = admit(
+        &runtime.control,
+        Some(NetworkSelection {
+            network: NetworkId(1),
+            expected_nick: "bot".to_owned(),
+        }),
+        SessionId(707),
+    );
+    client
+        .end
+        .write_all(b"NICK bot\r\nUSER user 0 * :client\r\n")
+        .await
+        .expect("client registers under preferred alias");
+    let projected = read_until(&mut client.end, b"NICK :bot_1").await;
+    assert!(projected.contains(":bot NICK :bot_1"), "{projected}");
+    assert_eq!(
+        client.outcome().await,
+        AdmissionOutcome::Bound {
+            network: NetworkId(1),
+            session: SessionId(707),
+        }
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
 async fn a_bound_client_keeps_one_identity_across_the_transfer() {
     let mut runtime = Runtime::start().await;
     runtime.create_online(1, "bot").await;

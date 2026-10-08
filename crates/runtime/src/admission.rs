@@ -93,6 +93,10 @@ impl PreparedSession {
         self.wiring.registered_nick()
     }
 
+    pub(crate) fn set_registered_nick(&mut self, nick: &str) {
+        self.wiring.set_registered_nick(nick);
+    }
+
     /// The capabilities this client negotiated during registration.
     pub fn negotiated(&self) -> &BTreeSet<String> {
         &self.negotiated

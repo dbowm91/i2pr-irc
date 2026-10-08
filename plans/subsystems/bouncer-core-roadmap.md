@@ -667,7 +667,7 @@ Accepted deliverables:
 Implementation decomposition:
 
 1. M007-A / Plan 039 — phased service actions for non-SASL authentication and recovery. **Closed**.
-2. M007-B / Plan 040 — preferred-nick, reconnect, and multi-client identity resilience. **Active**.
+2. M007-B / Plan 040 — preferred-nick, reconnect, and multi-client identity resilience. **Closing**.
 3. M007-C / Plan 041 — Eggchaos multi-client adverse qualification and M007 closure. **Blocked on 040**.
 
 Eggchaos is an external qualification tool only. It is not a production/Cargo dependency and its Rust 1.89+ toolchain requirement does not change this repository's Rust 1.88 floor.

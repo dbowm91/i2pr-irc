@@ -926,6 +926,63 @@ async fn a_nick_collision_is_answered_rather_than_waited_out() {
 }
 
 #[tokio::test]
+async fn qualified_437_for_the_attempted_nick_uses_the_fallback_sequence() {
+    let (mut harness, _) = Harness::build(&[], Policy::default(), "").await;
+    let mut upstream = harness.provider.take_peer().await;
+    read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :\r\n:srv 437 * bot :Resource temporarily unavailable\r\n")
+        .await
+        .expect("upstream reports temporary nick unavailability");
+    let seen = read_until(&mut upstream, b"NICK bot_1\r\n").await;
+    assert!(seen.contains("NICK bot_1"), "{seen}");
+    harness.upstreams.push(upstream);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn nick_collision_numeric_436_uses_the_fallback_sequence() {
+    let (mut harness, _) = Harness::build(&[], Policy::default(), "").await;
+    let mut upstream = harness.provider.take_peer().await;
+    read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :\r\n:srv 436 * bot :Nickname collision\r\n")
+        .await
+        .expect("upstream reports collision");
+    let seen = read_until(&mut upstream, b"NICK bot_1\r\n").await;
+    assert!(seen.contains("NICK bot_1"), "{seen}");
+    harness.upstreams.push(upstream);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn erroneous_nick_is_a_permanent_registration_error() {
+    let (mut harness, _) = Harness::build(&[], Policy::default(), "").await;
+    let mut upstream = harness.provider.take_peer().await;
+    read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :\r\n:srv 432 * bot :Erroneous nickname\r\n")
+        .await
+        .expect("upstream rejects the configured nick");
+    harness.upstreams.push(upstream);
+    tokio::time::timeout(CEILING, async {
+        loop {
+            if harness.snapshot.borrow().phase == Some(i2pr_irc_runtime::owner::Phase::Stopped) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permanent registration error stops the owner");
+    assert_eq!(
+        harness.snapshot.borrow().last_error,
+        Some("registration rejected")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_fallback_sequence_is_bounded_deterministic_and_distinct() {
     let (mut harness, _) = Harness::build(&[], Policy::default(), "").await;
     let attempts = collide(&mut harness, 3).await;
@@ -942,7 +999,7 @@ async fn the_fallback_sequence_is_bounded_deterministic_and_distinct() {
 }
 
 #[tokio::test]
-async fn exhausting_the_fallback_is_terminal_rather_than_a_retry_storm() {
+async fn exhausting_the_fallback_schedules_a_long_collision_retry() {
     let (mut harness, _) = Harness::build(&[], Policy::default(), "").await;
     let attempts = collide(
         &mut harness,
@@ -955,27 +1012,31 @@ async fn exhausting_the_fallback_is_terminal_rather_than_a_retry_storm() {
         "one attempt per candidate and no more"
     );
 
-    let deadline = tokio::time::Instant::now() + CEILING;
-    loop {
-        if harness.snapshot.borrow().phase == Some(i2pr_irc_runtime::owner::Phase::Stopped) {
-            break;
+    tokio::time::timeout(CEILING, async {
+        loop {
+            if harness.snapshot.borrow().phase == Some(i2pr_irc_runtime::owner::Phase::Backoff) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "exhaustion stops the Network: it does not retry a sequence that has already \
-             been refused once per candidate"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .expect("collision exhaustion schedules a retry");
     assert_eq!(
         harness.snapshot.borrow().last_error,
-        Some("nick exhausted"),
-        "and the reason an operator would look for is recorded"
+        Some("nick-collision-retry"),
+        "and collision exhaustion is distinguishable from permanent registration errors"
     );
+    let delay = harness
+        .snapshot
+        .borrow()
+        .next_retry_delay
+        .expect("retry is scheduled");
+    assert!((Duration::from_secs(900)..=Duration::from_secs(1080)).contains(&delay));
     let later = drain(harness.upstream(0), Duration::from_millis(400)).await;
     assert!(
         !later.contains("NICK"),
-        "a terminal Network writes nothing further upstream: {later}"
+        "the collision cooldown prevents an immediate retry: {later}"
     );
     harness.shutdown().await;
 }
@@ -1109,6 +1170,82 @@ async fn monitor_evidence_reclaims_the_preferred_nick() {
         !after.contains("NICK bot"),
         "having reclaimed it, the bouncer stops asking: {after}"
     );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reclaim_collision_keeps_generation_online_and_enters_cooldown() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :bot\r\n")
+        .await
+        .expect("server reports preferred nick free");
+    read_until(harness.upstream(0), b"NICK bot\r\n").await;
+    harness
+        .upstream(0)
+        .write_all(b":srv 433 bot bot :Nickname is already in use\r\n")
+        .await
+        .expect("server refuses reclaim");
+    tokio::time::timeout(CEILING, async {
+        loop {
+            if harness.snapshot.borrow().reclaim_refusals == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refusal is counted");
+    assert_eq!(
+        harness.snapshot.borrow().phase,
+        Some(i2pr_irc_runtime::owner::Phase::Online)
+    );
+    assert_eq!(harness.snapshot.borrow().reclaim_cooldown_ms, 300_000);
+    let later = drain(harness.upstream(0), Duration::from_millis(400)).await;
+    assert!(
+        !later.contains("NICK bot"),
+        "cooldown blocks a tight retry: {later}"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn manual_nick_is_shared_and_suspends_automatic_reclaim_for_the_generation() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+    let mut first = harness.attach(1, &[]).await;
+    let mut second = harness.attach(2, &[]).await;
+    first.send("NICK alice\r\n").await;
+    read_until(harness.upstream(0), b"NICK alice\r\n").await;
+    harness
+        .upstream(0)
+        .write_all(b":bot_1!user@host NICK :alice\r\n")
+        .await
+        .expect("server confirms shared nick change");
+    second.until("NICK :alice").await;
+    assert!(harness.snapshot.borrow().reclaim_suspended);
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 alice :bot\r\n")
+        .await
+        .expect("preferred nick becomes available");
+    let later = drain(harness.upstream(0), Duration::from_millis(400)).await;
+    assert!(
+        !later.contains("NICK bot"),
+        "manual nick prevents reclaim fight: {later}"
+    );
+    drop(harness.upstreams.remove(0));
+    let mut replacement = harness.provider.take_peer().await;
+    let reconnect = read_until(&mut replacement, b"NICK bot\r\n").await;
+    assert!(
+        reconnect.contains("NICK bot\r\n"),
+        "the next generation resumes from durable preferred identity: {reconnect}"
+    );
+    harness.upstreams.push(replacement);
     harness.shutdown().await;
 }
 

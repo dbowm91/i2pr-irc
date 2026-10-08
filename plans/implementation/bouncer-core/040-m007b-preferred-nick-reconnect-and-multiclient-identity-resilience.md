@@ -1,6 +1,6 @@
 # Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience
 
-Status: active
+Status: closing
 
 Hard dependency:
 
@@ -48,6 +48,8 @@ Required policy:
 - do not mark Network permanently terminal solely because nicks are currently occupied.
 
 Recommended collision retry floor: 15 minutes, with Network-specific deterministic jitter and the existing global scheduler still governing connect admission.
+
+Implemented cooldown: 15 minutes plus deterministic positive jitter up to three minutes. The delay is a pure duration helper, so boundary behavior is directly testable.
 
 The exact cooldown must be injected/testable.
 

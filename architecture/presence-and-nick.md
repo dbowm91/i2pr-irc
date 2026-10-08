@@ -62,7 +62,7 @@ bot -> bot_1 -> bot_2 -> bot_3
 
 truncated to the advertised length, clamped to `[1, 64]`, capped at `MAX_FALLBACK_NICK_ATTEMPTS`. There is no random component and no host input of any kind — no hostname, username, OS or router version, local path, process id, or machine identifier. `NickFallback::prime()` is required: registration already offered the preferred nick, so the first refusal must be answered with a *different* name rather than the same one twice.
 
-Exhaustion is a typed terminal failure (`RuntimeError::NickExhausted`). It marks the Network terminal rather than retrying, because a sequence already refused once per candidate will produce identical upstream traffic on every retry while consuming a process-wide connect permit each time. Configuration or a reconcile is the only thing that can change the answer.
+Exhaustion is a typed retryable failure (`RuntimeError::NickExhausted`). The owner ends that generation and waits at least 15 minutes, with deterministic Network-specific positive jitter, before trying the bounded sequence again. The wait happens before reacquiring the shared reconnect scheduler, so occupied nicks do not make the Network permanently terminal or hold a global permit.
 
 ## Reclaim: evidence, on a clock that clients cannot move
 
@@ -84,6 +84,17 @@ Evidence moves the *timing* of a write, never its permission. Accepted evidence 
 MONITOR target lists are comma-separated; the parser compares nicknames using the current casemapping and ignores the optional `!user@host` suffix on 730 targets. Every other line is recorded as nothing rather than as negative evidence that would suppress a future write.
 
 A `NICK <preferred>` is a request. Only the server's own frame confirms it, so the bouncer never treats its own write as success.
+
+If an online reclaim request receives 433, 436, or a 437 that names the preferred target, the
+generation remains online. The owner clears free evidence and waits at least five minutes
+before another reclaim write. A local `NICK` to an alternate identity suspends reclaim for
+that generation; it never changes the durable preferred nick. Diagnostics show both nicks,
+fallback state, suspension, cooldown, and bounded write/refusal counts.
+
+Admission accepts the observed current nick, or the durable preferred nick while the observed
+nick is a generated fallback in this generation. The latter receives an immediate NICK
+transition to the observed nick before the ordinary projection, and its transferred reader
+uses the observed identity thereafter.
 
 Reclaim state is a plain local in `run_generation` and is dropped when the generation is replaced. A probe scheduled by a connection that has since died cannot act on the connection that replaced it, and `MAX_RECLAIM_WRITES_PER_GENERATION` bounds how often one generation may claim at all.
 

@@ -32,7 +32,9 @@ has to know which half a line came from:
 @bouncer-diag :BouncerServ NOTICE bot :lists=acknowledged=… sample=#one,#two reasons=none …
 ```
 
-* `state` — identity, phase, away class, session counts, reconnect state, last disposition.
+* `state` — preferred/current nickname, generated fallback and reclaim status, away class,
+  session counts, reconnect state, and last disposition. Reclaim writes/refusals and the
+  cooldown duration are counters, not protocol payloads.
 * `counts` — every scalar counter. **Always before the lists.** A Network with a hundred
   channels pushes the counters off a shared line, and the counters are what an Operator
   opened diagnostics to find.
