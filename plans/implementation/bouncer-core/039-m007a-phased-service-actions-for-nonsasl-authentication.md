@@ -1,6 +1,6 @@
 # Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery
 
-Status: blocked
+Status: ready
 
 Hard dependency:
 

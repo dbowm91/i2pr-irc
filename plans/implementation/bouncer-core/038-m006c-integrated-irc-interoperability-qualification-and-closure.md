@@ -1,6 +1,6 @@
 # Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure
 
-Status: blocked
+Status: closed
 
 Hard dependency:
 

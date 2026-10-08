@@ -23,3 +23,11 @@ The I2P stream provider supplies an ordered byte stream. IRC is sent directly ov
 ## Verification surface
 
 The production-owner registration tests cover modern CAP, no-CAP welcome, `421 CAP`, optional NAK, bare SASL, explicit mechanism refusal, required-SASL NAK/failure, early welcome, and continued failure classification. No client attachment participates in upstream negotiation.
+
+The integrated qualification now also drives a fragmented multi-line CAP LS exchange and
+attaches legacy, basic IRCv3, modern IRCv3, and history/passive clients to one live
+generation. The same modern upstream tagged message and invite events are projected per
+client; each downstream capability choice leaves the upstream registration policy fixed.
+The modern client requests account-tag and invite-notify only after the live generation
+has acknowledged them. Compatibility coverage is split across these production-owner and
+integrated suites so each profile can assert its own byte transcript and downstream view.

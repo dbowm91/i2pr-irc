@@ -622,7 +622,7 @@ Implementation decomposition:
 1. Corrective 035 — MONITOR numeric conformance. **Closed**.
 2. M006-A / Plan 036 — registration downgrade and legacy-server baseline. **Closed**.
 3. M006-B / Plan 037 — account-tag and invite-notify mediation. **Closed**.
-4. M006-C / Plan 038 — integrated IRC interoperability qualification and M006 closure. **Ready**.
+4. M006-C / Plan 038 — integrated IRC interoperability qualification and M006 closure. **Closed**.
 
 Exit:
 
@@ -645,7 +645,7 @@ Make long-running bouncer identity stable under collisions, split-like disconnec
 
 Dependencies:
 
-- M006 closed.
+- M006 closed by Plan 038.
 
 Research authority:
 
@@ -666,7 +666,7 @@ Accepted deliverables:
 
 Implementation decomposition:
 
-1. M007-A / Plan 039 — phased service actions for non-SASL authentication and recovery. **Blocked on M006 closure**.
+1. M007-A / Plan 039 — phased service actions for non-SASL authentication and recovery. **Ready**.
 2. M007-B / Plan 040 — preferred-nick, reconnect, and multi-client identity resilience. **Blocked on 039**.
 3. M007-C / Plan 041 — Eggchaos multi-client adverse qualification and M007 closure. **Blocked on 040**.
 
@@ -827,11 +827,11 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M005-I / Plan 028 | closed | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | plans/closure/bouncer-core/028-status.md | Plan 027 closure |
 | C034 / Corrective 034 | closed | plans/implementation/bouncer-core/034-rust-1-88-verification-corrective.md | plans/closure/bouncer-core/034-status.md | none; maintenance-only MSRV verification repair |
 | C035 / Corrective 035 | closed | plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md | plans/closure/bouncer-core/035-status.md | none |
-| M006 | planned / gated | Plans 036-038 | future plans/closure/bouncer-core/038-status.md | Corrective 035 closure |
+| M006 | closed | Plans 036-038 | plans/closure/bouncer-core/038-status.md | Corrective 035 and Plans 036-037 closed |
 | M006-A / Plan 036 | closed | plans/implementation/bouncer-core/036-m006a-registration-downgrade-and-legacy-server-baseline.md | plans/closure/bouncer-core/036-status.md | Corrective 035 closure |
 | M006-B / Plan 037 | closed | plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md | plans/closure/bouncer-core/037-status.md | Plan 036 closure |
-| M006-C / Plan 038 | ready | plans/implementation/bouncer-core/038-m006c-integrated-irc-interoperability-qualification-and-closure.md | future plans/closure/bouncer-core/038-status.md | Plan 037 closure |
+| M006-C / Plan 038 | closed | plans/implementation/bouncer-core/038-m006c-integrated-irc-interoperability-qualification-and-closure.md | plans/closure/bouncer-core/038-status.md | Plan 037 closure |
 | M007 | planned / gated | Plans 039-041 | future plans/closure/bouncer-core/041-status.md | M006 closure |
-| M007-A / Plan 039 | blocked | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md | future plans/closure/bouncer-core/039-status.md | Plan 038 closure |
+| M007-A / Plan 039 | ready | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md | future plans/closure/bouncer-core/039-status.md | M006 closed by Plan 038 |
 | M007-B / Plan 040 | blocked | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md | future plans/closure/bouncer-core/040-status.md | Plan 039 closure |
 | M007-C / Plan 041 | blocked | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | future plans/closure/bouncer-core/041-status.md | Plan 040 closure |

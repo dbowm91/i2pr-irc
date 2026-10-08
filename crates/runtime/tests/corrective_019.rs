@@ -512,6 +512,55 @@ async fn optional_capability_nak_does_not_abort_registration() {
 }
 
 #[tokio::test]
+async fn fragmented_multiline_cap_ls_is_accumulated_before_the_request() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, None).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+
+    // Stream boundaries have no IRC meaning: deliver one chunk a byte at a time, and use
+    // the CAP LS continuation marker to prove capability collection waits for the final
+    // chunk before producing a request.
+    for chunk in [
+        b":srv CAP * LS * :message-tags\r\n".as_slice(),
+        b":srv CAP * LS :server-time account-tag invite-notify\r\n".as_slice(),
+    ] {
+        for byte in chunk {
+            upstream
+                .write_all(std::slice::from_ref(byte))
+                .await
+                .unwrap();
+        }
+    }
+    let request = read_until(
+        upstream,
+        b"CAP REQ :message-tags server-time account-tag invite-notify\r\n",
+    )
+    .await;
+    let request = String::from_utf8_lossy(&request);
+    assert!(request.contains("message-tags"), "{request}");
+    assert!(request.contains("account-tag"), "{request}");
+    assert!(request.contains("invite-notify"), "{request}");
+
+    upstream
+        .write_all(b":srv CAP * ACK :message-tags server-time account-tag invite-notify\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP END\r\n").await;
+    upstream
+        .write_all(b":srv 001 bot :welcome\r\n")
+        .await
+        .unwrap();
+    harness.wait_phase(Phase::Online).await;
+    let (outcome, _) = harness.stop_explicitly().await;
+    assert!(
+        outcome.is_ok(),
+        "fragmented modern registration succeeds: {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn cap_without_sasl_completes_without_authentication_when_none_is_configured() {
     let (_store, handle) = store();
     let mut harness = Harness::start(handle, None).await;

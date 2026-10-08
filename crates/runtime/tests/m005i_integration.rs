@@ -464,6 +464,72 @@ async fn invite_notify_filters_third_party_invites_but_preserves_self_invites() 
     runtime.stop().await;
 }
 
+#[tokio::test]
+async fn legacy_basic_modern_and_history_clients_share_one_generation_truthfully() {
+    let mut runtime = Runtime::start().await;
+    let peer = runtime.bring_online(1, &["#room"]).await;
+    let mut legacy = register(&runtime, NetworkId(1), SessionId(1), "").await;
+    let mut basic = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(2),
+        "message-tags server-time",
+    )
+    .await;
+    let mut modern = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(3),
+        "message-tags server-time account-tag invite-notify extended-join account-notify away-notify multi-prefix setname cap-notify standard-replies draft/no-implicit-names",
+    )
+    .await;
+    let mut history_passive = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(4),
+        "message-tags draft/chathistory draft/read-marker draft/pre-away",
+    )
+    .await;
+    for client in [&legacy, &basic, &modern, &history_passive] {
+        assert!(client.seen.contains("001 bot"));
+    }
+    assert!(!legacy.seen.contains("CAP * ACK"));
+    assert!(modern.seen.contains("account-tag") && modern.seen.contains("invite-notify"));
+    history_passive.send("PASSIVE\r\n").await;
+
+    let marks = [
+        legacy.mark(),
+        basic.mark(),
+        modern.mark(),
+        history_passive.mark(),
+    ];
+    runtime.upstreams[peer]
+        .write_all(b"@account=alice;time=2026-01-02T03:04:05.000Z :alice!u@h PRIVMSG #room :profile-check\r\n:alice!u@h INVITE other #room\r\n:alice!u@h INVITE bot #room\r\n")
+        .await
+        .expect("modern upstream emits tagged chat and both invite forms");
+    for client in [&mut legacy, &mut basic, &mut modern, &mut history_passive] {
+        client.until("INVITE bot #room").await;
+        client.settle().await;
+    }
+    let views = [
+        legacy.since(marks[0]),
+        basic.since(marks[1]),
+        modern.since(marks[2]),
+        history_passive.since(marks[3]),
+    ];
+    assert!(views[0].contains("PRIVMSG #room :profile-check"));
+    assert!(!views[0].contains("@account=") && !views[0].contains("@time="));
+    assert!(views[1].contains("@time=2026-01-02T03:04:05.000Z"));
+    assert!(!views[1].contains("account="));
+    assert!(views[2].contains("@account=alice;time=2026-01-02T03:04:05.000Z"));
+    assert!(views[2].contains("INVITE other #room"));
+    assert!(!views[0].contains("INVITE other #room"));
+    assert!(!views[1].contains("INVITE other #room"));
+    assert!(!views[3].contains("INVITE other #room"));
+    assert!(views.iter().all(|view| view.contains("INVITE bot #room")));
+    runtime.stop().await;
+}
+
 struct Client {
     end: ScriptedStream,
     _script: FaultController,
