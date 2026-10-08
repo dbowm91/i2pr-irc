@@ -26,7 +26,7 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | M009 active | plans/subsystems/bouncer-core-roadmap.md | Plan 048 ready | Plans 044-047 are closed through OTRv3 opaque-carriage invariants. Plan 048 is ready for integrated privacy qualification and M009 closure. |
+| Bouncer core | M009 closed | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | Plans 043-048 are closed. External real-client OTR interoperability awaits a future standalone-listener product path; Router R002 remains independently blocked upstream. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -36,12 +36,12 @@ Canonical direction:
 | Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization | closed | verification/test-harness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/043-status.md |
 | Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation | closed | security infrastructure + persistence | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/044-status.md |
 | Bouncer Core M008-B / Plan 045 — Encrypted Store Migration and Key Rotation | closed | security migration + durability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/045-status.md |
-| Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure | ready | privacy qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure | closed | privacy qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/048-status.md |
 | Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | closed | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/042-status.md |
 | Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure | closed | security qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/046-status.md |
 | Bouncer Core M009-A / Plan 047 — OTRv3 Opaque-Carriage and Multi-Client Invariants | closed | privacy invariant + protocol compatibility | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/047-status.md |
@@ -153,12 +153,8 @@ Important retained conclusions:
 
 ## Latest closure and handoff
 
-Corrective 043 and M008 Plans 044-046 are closed; see their closure records under `plans/closure/bouncer-core/`.
+Corrective 043 and M008/M009 Plans 044-048 are closed; see their closure records under `plans/closure/bouncer-core/`.
 
-The current dependency-ready handoff is:
-
-- plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md
-
-Plan 048 remains blocked until Plan 047 closes. Preserve the sequence through M009 closure.
+No Bouncer Core implementation plan is currently registered as dependency-ready. External real-client OTR interoperability awaits a future standalone-listener product path, which is not currently planned. Router R002 remains independently blocked on stable public i2pr managed-app contracts.
 
 M006, M007, Corrective 042, and R001 remain product closures. R002 remains independently blocked on upstream i2pr managed-app contracts.

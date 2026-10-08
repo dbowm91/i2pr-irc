@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: M009 active — Plan 047 closed; Plan 048 ready
+Status: M009 closed — Plans 047-048 closed; no registered successor plan
 
 Long-term references:
 
@@ -757,7 +757,7 @@ Research/architecture authority:
 
 Dependencies:
 
-- M008 closed; Plan 047 is ready.
+- M008 closed; Plans 047-048 closed.
 
 Accepted direction:
 
@@ -773,7 +773,7 @@ Accepted direction:
 Implementation decomposition:
 
 1. M009-A / Plan 047 — OTRv3 opaque-carriage and multi-client invariants. **Closed**.
-2. M009-B / Plan 048 — integrated OTR privacy qualification and M009 closure. **Ready**.
+2. M009-B / Plan 048 — integrated OTR privacy qualification and M009 closure. **Closed**; see `plans/closure/bouncer-core/048-status.md`.
 
 Exit:
 
@@ -945,6 +945,6 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M008-A / Plan 044 | closed | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md | plans/closure/bouncer-core/044-status.md | Corrective 043 closure |
 | M008-B / Plan 045 | closed | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md | plans/closure/bouncer-core/045-status.md | Plan 044 closure |
 | M008-C / Plan 046 | closed | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md | plans/closure/bouncer-core/046-status.md | Plan 045 closure |
-| M009 | active | Plans 047-048 | future plans/closure/bouncer-core/048-status.md | Plan 047 ready |
+| M009 | closed | Plans 047-048 | plans/closure/bouncer-core/048-status.md | Plans 047-048 closed |
 | M009-A / Plan 047 | closed | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md | plans/closure/bouncer-core/047-status.md | M008 closure |
-| M009-B / Plan 048 | ready | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md | future plans/closure/bouncer-core/048-status.md | Plan 047 closure |
+| M009-B / Plan 048 | closed | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md | plans/closure/bouncer-core/048-status.md | Plan 047 closure |
