@@ -70,12 +70,18 @@ impl Policy {
     };
 }
 
-fn record(network: u64, channels: &[DesiredChannelRecord]) -> NetworkRecord {
+/// A durable record with an explicit preferred nick.
+///
+/// The nick is a parameter rather than a constant because nick *identity* is not this
+/// build's to decide: the server's casemapping decides whether `BoT` and `bot` are one
+/// nick, and only a nick that actually contains a casemapped character can show that the
+/// bouncer reads the server's answer rather than its own.
+fn record_as(network: u64, channels: &[DesiredChannelRecord], nick: &str) -> NetworkRecord {
     NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
-        nick: "bot".into(),
+        nick: nick.into(),
         username: "user".into(),
         realname: "bouncer".into(),
         auto_away: false,
@@ -158,6 +164,8 @@ struct Harness {
     upstreams: Vec<ScriptedStream>,
     /// The ISUPPORT block the fake server advertises at registration.
     isupport: String,
+    /// The nick this Network is configured to get back.
+    preferred: String,
     /// The nickname attached clients claim.
     ///
     /// A client is projected under the nick the bouncer actually holds, so a Network that
@@ -179,8 +187,21 @@ impl Harness {
         policy: Policy,
         extra: &str,
     ) -> (Self, Arc<Mutex<usize>>) {
+        Self::build_as("bot", channels, policy, extra).await
+    }
+
+    /// Builds an owner whose durable preferred nick is `nick`.
+    ///
+    /// Same shape as [`Harness::build`], with the nick as a parameter so a test can
+    /// choose one the server's casemapping actually distinguishes from another spelling.
+    async fn build_as(
+        nick: &str,
+        channels: &[DesiredChannelRecord],
+        policy: Policy,
+        extra: &str,
+    ) -> (Self, Arc<Mutex<usize>>) {
         let (store, handle) = store();
-        let mut subject = record(1, channels);
+        let mut subject = record_as(1, channels, nick);
         subject.auto_away = policy.auto_away;
         subject.keep_nick = policy.keep_nick;
         handle
@@ -236,7 +257,8 @@ impl Harness {
                 } else {
                     format!(":srv 005 bot {extra}\r\n")
                 },
-                downstream_nick: "bot".to_owned(),
+                preferred: nick.to_owned(),
+                downstream_nick: nick.to_owned(),
                 channels: channels.to_vec(),
             },
             ambiguous,
@@ -301,7 +323,7 @@ impl Harness {
         let opening = read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
         assert_eq!(
             nick_written(&opening),
-            "bot",
+            self.preferred.clone(),
             "the server refuses the *preferred* nick, not one the bouncer picked"
         );
         let isupport = self.isupport.clone();
@@ -1053,8 +1075,14 @@ async fn register_under_collision(harness: &mut Harness) {
     let index = harness.bring_online_collision().await;
     let frame = read_until(harness.upstream(index), b"NICK ").await;
     let landed = nick_written(&frame);
+    // The expected fallback is derived from the configured nick rather than written out,
+    // so a test using a different preferred nick still asserts the real sequence: the
+    // first fallback is a function of the configured nick alone.
+    let mut expected = i2pr_irc_runtime::presence::NickFallback::new(&harness.preferred, None);
+    expected.prime();
     assert_eq!(
-        landed, "bot_1",
+        landed,
+        expected.next_candidate().expect("a first fallback exists"),
         "the first fallback is a function of the configured nick alone"
     );
     harness
@@ -1280,12 +1308,324 @@ async fn monitor_online_is_not_free_evidence_and_offline_lists_match_by_nick() {
     harness.shutdown().await;
 }
 
+// -------------------------------------------- C042: event versus snapshot evidence
+//
+// The three reclaim commands answer three different questions, and the defect this
+// block exists for was reading them as one presence/absence rule:
+//
+// - `731` *names* the targets that went offline, so naming the preferred nick is free
+//   evidence and its absence from the list is nothing;
+// - `730` is an *event* about targets that came online. Its silence about the preferred
+//   nick is not a statement at all, so it can never manufacture free evidence -- while
+//   naming the preferred nick retracts evidence that is already pending;
+// - `303` is the *answer to a query*, so absence from the returned online set is free
+//   evidence -- but only on a generation that actually sent the `ISON` it answers.
+//
+// `reclaim_writes` is asserted as well as the frames: it is the counter the owner
+// increments on every reclaim write, so a write that happened and was then drained is
+// still visible. A negative frame assertion alone could pass simply because the write
+// had not been produced yet.
+
+#[tokio::test]
+async fn an_unrelated_monitor_online_event_never_claims_the_preferred_nick() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+
+    // One unrelated nick, then several in the comma-separated form a multi-target server
+    // uses. `:srv 730 bot :alice` says alice is online; it is not a snapshot and says
+    // nothing at all about whether `bot` is free.
+    for frame in [
+        &b":srv 730 bot :alice\r\n"[..],
+        &b":srv 730 bot :carol,dave,erin\r\n"[..],
+        &b":srv 730 bot :frank!u@h\r\n"[..],
+    ] {
+        harness
+            .upstream(0)
+            .write_all(frame)
+            .await
+            .expect("server reports an unrelated nick online");
+        let seen = drain(harness.upstream(0), Duration::from_millis(250)).await;
+        assert!(
+            !seen.contains("NICK bot"),
+            "an online event about other nicks cannot reclaim the preferred one: {seen}"
+        );
+        assert_eq!(
+            harness.snapshot.borrow().reclaim_writes,
+            0,
+            "no reclaim write may be produced by an unrelated 730"
+        );
+    }
+
+    // The mechanism is still live afterwards: a real offline event still reclaims, so the
+    // negative results above are the semantic answer rather than a dead code path.
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :bot\r\n")
+        .await
+        .expect("server reports the preferred nick offline");
+    let seen = read_until(harness.upstream(0), b"NICK bot\r\n").await;
+    assert!(
+        seen.contains("NICK bot"),
+        "a genuine 731 still reclaims after unrelated online events: {seen}"
+    );
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 1);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_monitor_online_event_retracts_free_evidence_the_server_has_just_withdrawn() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+
+    // Both frames arrive in one write, so the owner applies the whole batch before the
+    // wake it was just given can run a reclaim pass. The 730 therefore lands while the
+    // 731's evidence is still pending, which is exactly the ordering this claims about.
+    // A `NICK` here would mean the bouncer claimed a nick the same server had just said
+    // was in use.
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :bot\r\n:srv 730 bot :bot!user@host\r\n")
+        .await
+        .expect("server reports the nick free and then online again");
+    let seen = drain(harness.upstream(0), Duration::from_millis(500)).await;
+    assert!(
+        !seen.contains("NICK bot"),
+        "a 730 naming the preferred nick retracts evidence that is already pending: {seen}"
+    );
+    assert_eq!(
+        harness.snapshot.borrow().reclaim_writes,
+        0,
+        "the retracted evidence must not produce a write"
+    );
+
+    // A later genuine offline event still works, so the retraction cleared the pending
+    // claim rather than disabling the mechanism.
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :bot\r\n")
+        .await
+        .expect("server reports the nick offline again");
+    read_until(harness.upstream(0), b"NICK bot\r\n").await;
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 1);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ison_snapshot_reclaims_only_as_the_answer_to_this_generations_probe() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"ISON bot\r\n").await;
+
+    // The probe this generation sent comes back without the preferred nick in the online
+    // set. Absence from a snapshot you asked for is the evidence.
+    harness
+        .upstream(0)
+        .write_all(b":srv 303 bot :alice,carol\r\n")
+        .await
+        .expect("server answers the probe");
+    read_until(harness.upstream(0), b"NICK bot\r\n").await;
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 1);
+
+    // The preferred nick being present in the online set is the opposite statement, and it
+    // must not add a second write.
+    harness
+        .upstream(0)
+        .write_all(b":srv 303 bot :bot,carol\r\n")
+        .await
+        .expect("server reports the preferred nick online");
+    let seen = drain(harness.upstream(0), Duration::from_millis(300)).await;
+    assert!(
+        !seen.contains("NICK bot"),
+        "a snapshot naming the preferred nick is not free evidence: {seen}"
+    );
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 1);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ison_reply_nobody_asked_for_is_not_a_snapshot() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+
+    // This generation asked through MONITOR, so it has no ISON outstanding and no
+    // snapshot question is pending. Reading absence out of an unsolicited reply would
+    // reclaim a nick on the strength of a query the bouncer never sent.
+    harness
+        .upstream(0)
+        .write_all(b":srv 303 bot :alice\r\n")
+        .await
+        .expect("server sends an unsolicited ISON reply");
+    let seen = drain(harness.upstream(0), Duration::from_millis(400)).await;
+    assert!(
+        !seen.contains("NICK bot"),
+        "an unsolicited 303 answers no question this generation asked: {seen}"
+    );
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 0);
+
+    // The generation's own evidence path is unaffected.
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :bot\r\n")
+        .await
+        .expect("server reports the preferred nick offline");
+    read_until(harness.upstream(0), b"NICK bot\r\n").await;
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 1);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reclaim_evidence_is_compared_under_the_servers_own_casemapping() {
+    // `[bot]` is the interesting nick: rfc1459 folds `[]\^` together with `{}|~`, while
+    // ascii folds neither. The bouncer has no casemapping of its own to prefer, so the
+    // server's answer is what decides whether a reported target is the preferred nick.
+    let (mut harness, _) = Harness::build_as("[bot]", &[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + [bot]\r\n").await;
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :{bot}\r\n")
+        .await
+        .expect("server names the nick through the rfc1459 bracket fold");
+    let seen = read_until(harness.upstream(0), b"NICK [bot]\r\n").await;
+    assert!(
+        seen.contains("NICK [bot]"),
+        "under rfc1459 casemapping {{bot}} is [bot], so the reclaim is due: {seen}"
+    );
+    harness.shutdown().await;
+
+    // The same frame under ascii casemapping names a different nick entirely, so nothing
+    // the server said was about the preferred one and no write may follow.
+    let (mut harness, _) = Harness::build_as(
+        "[bot]",
+        &[],
+        Policy::KEEP_NICK,
+        "CASEMAPPING=ascii MONITOR=4",
+    )
+    .await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + [bot]\r\n").await;
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :{bot}\r\n")
+        .await
+        .expect("server names a nick the ascii mapping does not fold");
+    let seen = drain(harness.upstream(0), Duration::from_millis(400)).await;
+    assert!(
+        !seen.contains("NICK [bot]"),
+        "under ascii casemapping {{bot}} is not [bot], so nothing was said about it: {seen}"
+    );
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 0);
+
+    // Case still folds under ascii, so the server's own answer continues to decide: only
+    // the characters it does not fold become distinct.
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :[BOT]\r\n")
+        .await
+        .expect("server names the nick in another case");
+    let seen = read_until(harness.upstream(0), b"NICK [bot]\r\n").await;
+    assert!(
+        seen.contains("NICK [bot]"),
+        "ascii casemapping still folds case, so [BOT] is [bot]: {seen}"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_usable_monitor_advertisement_watches_the_preferred_nick() {
+    // MONITOR 3.2 gives the token three spellings. Any of them that permits at least one
+    // target is usable for a bouncer that watches exactly one nick, however large the
+    // server's advertised ceiling happens to be.
+    for advertised in ["MONITOR", "MONITOR=1", "MONITOR=4", "MONITOR=100"] {
+        let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, advertised).await;
+        register_under_collision(&mut harness).await;
+        let seen = read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+        assert!(
+            seen.contains("MONITOR + bot"),
+            "{advertised} permits the one target this bouncer watches: {seen}"
+        );
+        assert!(
+            !seen.contains("ISON"),
+            "{advertised} is a usable MONITOR, so the bouncer must not also probe: {seen}"
+        );
+        harness.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn an_unusable_monitor_advertisement_falls_back_to_a_bounded_probe() {
+    // Disabled, unparsable, and absent all resolve to ISON. Waiting for notifications a
+    // disabled feature never sends would wait forever, and guessing at a malformed value
+    // would be worse than asking the question every server understands.
+    for advertised in ["MONITOR=0", "MONITOR=abc", ""] {
+        let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, advertised).await;
+        register_under_collision(&mut harness).await;
+        let seen = read_until(harness.upstream(0), b"ISON bot\r\n").await;
+        assert!(
+            seen.contains("ISON bot"),
+            "{advertised:?} is not a usable MONITOR advertisement: {seen}"
+        );
+        assert!(
+            !seen.contains("MONITOR +"),
+            "{advertised:?} must not be answered by waiting for MONITOR events: {seen}"
+        );
+        harness.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn reclaim_evidence_from_a_dead_generation_cannot_reach_its_replacement() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+
+    // The generation is replaced mid-reclaim. Dropping the scripted peer ends it exactly
+    // as a real disconnect would.
+    harness.upstreams.clear();
+    let mut next = harness.provider.take_peer().await;
+    read_until(&mut next, b"USER user 0 * :bouncer\r\n").await;
+    next.write_all(b":srv CAP * LS :\r\n:srv 001 bot :welcome\r\n")
+        .await
+        .expect("upstream accepts registration");
+    harness.upstreams.push(next);
+
+    // This generation was given the nick it asked for, so it owns no reclaim attempt at
+    // all. Every reclaim command, in every direction, must stay silent: a surviving
+    // attempt would leave one Network holding two live claims for the same nick.
+    for frame in [
+        &b":srv 731 bot :bot\r\n"[..],
+        &b":srv 730 bot :bot\r\n"[..],
+        &b":srv 730 bot :alice\r\n"[..],
+        &b":srv 303 bot :alice\r\n"[..],
+    ] {
+        harness
+            .upstream(0)
+            .write_all(frame)
+            .await
+            .expect("server sends reclaim traffic to the replacement");
+    }
+    let seen = drain(harness.upstream(0), Duration::from_millis(500)).await;
+    assert!(
+        !seen.contains("NICK") && !seen.contains("MONITOR") && !seen.contains("ISON"),
+        "reclaim state is generation-owned and dies with the connection that created it: {seen}"
+    );
+    assert_eq!(harness.snapshot.borrow().reclaim_writes, 0);
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn reclaim_writes_are_capped_per_generation() {
     use i2pr_irc_runtime::presence::{
         MAX_RECLAIM_WRITES_PER_GENERATION, RECLAIM_INTERVAL, ReclaimAttempt, note_reclaim_write,
     };
-    let mut attempt = ReclaimAttempt::new("bot", "bot_1");
+    let mut attempt = ReclaimAttempt::new(
+        "bot",
+        "bot_1",
+        i2pr_irc_runtime::presence::ReclaimStrategy::Monitor,
+    );
     let mut writes = 0;
     for _ in 0..MAX_RECLAIM_WRITES_PER_GENERATION + 3 {
         if attempt.should_write(RECLAIM_INTERVAL, RECLAIM_INTERVAL)

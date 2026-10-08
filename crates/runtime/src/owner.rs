@@ -1755,12 +1755,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let reclaim_wake = tokio::sync::Notify::new();
         // Generation-local reclaim state. It exists only when the policy is on *and* the
         // server did not give us the nick we asked for, so a Network that holds its
-        // configured nick allocates nothing.
+        // configured nick allocates nothing. The strategy is chosen here, once, from
+        // what the server advertised at registration, and the attempt carries it.
         let mut reclaim_attempt = (presence.policy().keep_nick
             && !state.nick.eq_ignore_ascii_case(&self.context.record.nick))
-        .then(|| ReclaimAttempt::new(&self.context.record.nick, &state.nick));
+        .then(|| {
+            let strategy = crate::presence::reclaim_strategy(state.monitor_support());
+            ReclaimAttempt::new(&self.context.record.nick, &state.nick, strategy)
+        });
         if reclaim_attempt.is_some() {
-            self.begin_reclaim(&mut reclaim_attempt, &state, &control_tx);
+            self.begin_reclaim(&mut reclaim_attempt, &control_tx);
         }
         // Presence is evaluated *after* the waiting attachments are applied, so a
         // generation that came up with a client already waiting does not declare itself
@@ -2152,12 +2156,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         }
                         // Reclaim evidence.
                         //
-                        // `730` (MONITOR OFFLINE) names the nicks that became free, and
-                        // a `303` whose list omits the preferred nick says the same thing
-                        // for the `ISON` path. Neither is authoritative: the `NICK` that
-                        // follows is a request, and only the server's own frame confirms
-                        // it. Treating either as confirmation would let the bouncer
-                        // believe it holds a nick it is still queued to claim.
+                        // `731` (MONITOR OFFLINE) names the nicks that became free, and
+                        // a `303` answering this generation's own `ISON` omits the
+                        // preferred nick when it is free. Neither is authoritative: the
+                        // `NICK` that follows is a request, and only the server's own
+                        // frame confirms it. Treating either as confirmation would let
+                        // the bouncer believe it holds a nick it is still queued to
+                        // claim. A `730` is an *online* event and never creates free
+                        // evidence: it says nothing about targets it did not name.
                         let reclaim_refused = matches!(message.command.as_slice(), b"433" | b"436" | b"437")
                             && message.params.get(1).is_some_and(|nick| {
                                 state.same_nick(&String::from_utf8_lossy(nick), &self.context.record.nick)
@@ -2172,12 +2178,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 });
                             }
                         } else {
-                        self.note_reclaim_evidence(
-                            &state,
-                            &message,
-                            &mut reclaim_attempt,
-                            &reclaim_wake,
-                        );
+                            self.note_reclaim_evidence(
+                                &state,
+                                &message,
+                                &mut reclaim_attempt,
+                                &reclaim_wake,
+                            );
                         }
                         // Resolve a channel to its durable buffer *after* this line has
                         // been applied, because the line that creates membership is the
@@ -3284,20 +3290,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     /// Opens this generation's reclaim: `MONITOR` when the server offered a usable
     /// limit, bounded `ISON` probing when it did not.
     ///
-    /// The strategy is chosen once per generation from what the server advertised rather
-    /// than per pass, so a server that drops `MONITOR` mid-connection cannot make the
-    /// bouncer alternate between two mechanisms on consecutive ticks.
+    /// The strategy is recorded on the attempt and read back from there, rather than
+    /// re-derived from ISUPPORT on every use. Two properties follow from that: a server
+    /// that drops `MONITOR` mid-connection cannot make the bouncer alternate between two
+    /// mechanisms on consecutive ticks, and a `303` can be read as an answer only on a
+    /// generation that actually sent the `ISON` it answers.
     fn begin_reclaim(
         &self,
         attempt: &mut Option<ReclaimAttempt>,
-        state: &NetworkState,
         control_tx: &mpsc::Sender<Vec<u8>>,
     ) {
         let Some(attempt) = attempt.as_mut() else {
             return;
         };
-        let _ = state;
-        match crate::presence::reclaim_strategy(state.monitor_limit()) {
+        match attempt.strategy {
             crate::presence::ReclaimStrategy::Monitor => {
                 let _ = queue_control(control_tx, &format!("MONITOR + {}\r\n", attempt.preferred));
             }
@@ -3309,17 +3315,22 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
 
     /// Reads one upstream line for reclaim evidence.
     ///
-    /// The two replies mean opposite things, and reading them the same way is how a
-    /// bouncer ends up convinced a free nick is taken:
+    /// Three commands carry reclaim meaning, and each means something different, so the
+    /// classification lives in one table ([`crate::presence::reclaim_evidence`]) rather
+    /// than in one shared presence/absence rule:
     ///
-    /// * `303` (RPL_ISON) lists the nicks that are **online**, so the preferred one being
-    ///   *absent* from the answer is the evidence that it is free.
-    /// * `731` (RPL_MONOFFLINE) names the nick that just went **offline**, so the
-    ///   preferred one being *named* is the evidence that it is free.
+    /// * `731` (RPL_MONOFFLINE) *names* the targets that just went offline, so the
+    ///   preferred nick being named is the evidence that it is free.
+    /// * `730` (RPL_MONONLINE) reports targets that just came online. It never makes
+    ///   free evidence, because `:srv 730 bot :alice` says alice is online and says
+    ///   nothing whatsoever about bot. Naming the preferred nick instead *retracts*
+    ///   pending free evidence: the nick is demonstrably in use right now.
+    /// * `303` (RPL_ISON) is the answer to a query, so the preferred nick being absent
+    ///   from the online set returned is the evidence — but only as an answer to an
+    ///   `ISON` this generation actually sent.
     ///
-    /// Only those two commands are evidence at all. Every other line -- including a
-    /// `730` reporting the preferred nick on-line -- is recorded as nothing rather than
-    /// as negative evidence that would suppress a future write.
+    /// Every other line is recorded as nothing rather than as negative evidence that
+    /// would suppress a future write.
     ///
     /// Accepted evidence wakes the reclaim clock rather than waiting out the interval. A
     /// server that says the preferred nick just came free has answered the question the
@@ -3336,37 +3347,26 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             return;
         };
         // Both replies are addressed to the bouncer, so the nick list starts after the
-        // recipient parameter.
-        let offline = if message.command.eq_ignore_ascii_case(b"731") {
-            Some(true)
-        } else if message.command.eq_ignore_ascii_case(b"730")
-            || message.command.eq_ignore_ascii_case(b"303")
-        {
-            Some(false)
-        } else {
-            None
-        };
-        let Some(offline) = offline else {
-            return;
-        };
+        // recipient parameter. Targets are compared by nick only: some servers report
+        // `nick!user@host` in a `730`, and the host says nothing about which nick it is.
         let preferred_listed = message.params.iter().skip(1).any(|param| {
             String::from_utf8_lossy(param).split(',').any(|target| {
-                let nick = if message.command.eq_ignore_ascii_case(b"730") {
-                    target.split_once('!').map_or(target, |(nick, _)| nick)
-                } else {
-                    target
-                };
+                let nick = target.split_once('!').map_or(target, |(nick, _)| nick);
                 state.same_nick(nick, &attempt.preferred)
             })
         });
-        let free = if offline {
-            preferred_listed
-        } else {
-            !preferred_listed
-        };
-        if free {
-            attempt.evidence = true;
-            wake.notify_one();
+        let evidence = crate::presence::reclaim_evidence(
+            &String::from_utf8_lossy(&message.command),
+            preferred_listed,
+            attempt.probe_outstanding(),
+        );
+        match evidence {
+            crate::presence::ReclaimEvidence::Free => {
+                attempt.evidence = true;
+                wake.notify_one();
+            }
+            crate::presence::ReclaimEvidence::Taken => attempt.evidence = false,
+            crate::presence::ReclaimEvidence::Unrelated => {}
         }
     }
 

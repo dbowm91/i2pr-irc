@@ -37,10 +37,23 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
+def reserve_ports(count: int) -> tuple[list[socket.socket], list[int]]:
+    """Pick free ports and hold them until the caller is about to bind them.
+
+    A port chosen by binding and immediately closing is free for the next allocation
+    too, and the process that claims it next is usually one of this test's own outbound
+    connections. eggchaos then cannot bind that proxy port, and the failure surfaces much
+    later as a connection refusal against a fault this run never touched. Holding the
+    reservations until the instant before spawn shrinks that window to the spawn itself.
+    """
+    reservations: list[socket.socket] = []
+    ports: list[int] = []
+    for _ in range(count):
+        sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        reservations.append(sock)
+        ports.append(sock.getsockname()[1])
+    return reservations, ports
 
 
 def recv_all(sock: socket.socket, expected: int, timeout: float = 8.0) -> bytes:
@@ -71,16 +84,22 @@ def main() -> None:
         ("disconnect", '[[proxy.fault]]\nid="cut"\ndirection="upstream"\ntype="disconnect"\ndelay="5ms"\n'),
         ("stream-loss", '[[proxy.fault]]\nid="loss"\ndirection="upstream"\ntype="stream-loss"\nloss_rate=1.0\ncorrelation=1.0\n'),
     ]
+    reservations, allocated = reserve_ports(len(definitions) + 1)
+    admin_port = allocated[-1]
     blocks = []
     ports = {}
-    for name, fault in definitions:
-        port = free_port()
+    for (name, fault), port in zip(definitions, allocated[:-1]):
         ports[name] = port
         blocks.append(f'[[proxy]]\nname="{name}"\nlisten="127.0.0.1:{port}"\nupstream="{target}"\n{fault}')
-    config = "version=1\nseed=410041\n[admin]\nbind=\"127.0.0.1:{0}\"\n".format(free_port()) + "\n".join(blocks)
+    config = (
+        f"version=1\nseed=410041\n[admin]\nbind=\"127.0.0.1:{admin_port}\"\n"
+        + "\n".join(blocks)
+    )
     with tempfile.TemporaryDirectory(prefix="i2pr-irc-eggchaos-") as directory:
         path = pathlib.Path(directory) / "scenarios.toml"
         path.write_text(config)
+        for reservation in reservations:
+            reservation.close()
         child = subprocess.Popen([binary, "serve", "--config", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 10

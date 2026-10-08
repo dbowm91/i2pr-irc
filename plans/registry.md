@@ -26,19 +26,19 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | corrective active | plans/subsystems/bouncer-core-roadmap.md | Corrective 042 ready | M006 and M007 remain historically closed. Corrective 042 is the strict current readiness authority for remaining MONITOR event semantics, MONITOR ISUPPORT interpretation, destructive Eggchaos product-path evidence, and planning reconciliation. |
+| Bouncer core | no active plan | plans/subsystems/bouncer-core-roadmap.md | Corrective 042 closed | M006, M007, and Corrective 042 are all closed. 042 fixed the `730` event/snapshot distinction, accepted standards-compliant bare and positive-limit `MONITOR`, and replaced the generic echo-peer destructive evidence with product-path Eggchaos scenarios. No plan is open; a successor must be raised explicitly. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
-| Plan | Status | Class | Source | Closure/result |
-|---|---|---|---|---|
-| Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | ready | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/042-status.md |
+None. No plan is open on this control surface; a successor must be registered here
+before implementation begins.
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | closed | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/042-status.md |
 | Bouncer Core M007-C / Plan 041 — Eggchaos Multi-Client Adverse Qualification and M007 Closure | closed | external qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/041-status.md |
 | Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | closed | identity state machine + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/040-status.md |
 | Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | closed | IRCv3 capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/037-status.md |
@@ -139,10 +139,10 @@ Important retained conclusions:
 
 ## Latest closure and handoff
 
-Implement only:
+There is no active handoff. The most recent closure is:
 
-- plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md
+- plans/closure/bouncer-core/042-status.md — Corrective 042
 
-Corrective 042 is the sole dependency-ready handoff. It fixes the remaining MONITOR event/snapshot distinction, accepts standards-compliant bare and positive-limit MONITOR support for the one-target keep-nick watch, strengthens disruptive Eggchaos qualification through the real SamProvider path, and reconciles stale planning metadata.
+Corrective 042 fixed the MONITOR event/snapshot distinction (a `730` RPL_MONONLINE event no longer implies anything about a nick it did not name), accepted standards-compliant bare and positive-limit `MONITOR` for the one-target keep-nick watch, and replaced the generic echo-peer destructive evidence with product-path Eggchaos scenarios running the real `SamProvider`.
 
 M006 and M007 remain historical closures; Corrective 042 supersedes only the affected readiness claims. R001 remains closed for this repository. R002 remains independently blocked on upstream i2pr managed-app contracts. Privacy/encryption and standalone-daemon work remain intentionally unplanned pending their own research gates.

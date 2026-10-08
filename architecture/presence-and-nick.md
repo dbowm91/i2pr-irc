@@ -68,20 +68,26 @@ Exhaustion is a typed retryable failure (`RuntimeError::NickExhausted`). The own
 
 When the current nick differs from the configured one and `keep_nick` is on, the generation opens a reclaim attempt and chooses one mechanism, once:
 
-- `MONITOR + <preferred>` when ISUPPORT advertises a usable `MONITOR` limit, read from `MONITOR=<limit>` rather than from CAP so the upstream capability fingerprint stays client-independent;
+- `MONITOR + <preferred>` when ISUPPORT advertises a usable `MONITOR`, read from ISUPPORT rather than from CAP so the upstream capability fingerprint stays client-independent;
 - otherwise a bounded `ISON <preferred>` probe, which is the standard query every server understands.
 
-`MONITOR=0` means the feature is advertised and *disabled*, so it falls back to probing. Waiting for notifications a disabled feature never sends would wait forever. A limit above `MAX_MONITOR_TARGETS` also falls back: the bouncer will not watch more nicks than its own ceiling allows, and the bouncer only ever watches one.
+MONITOR 3.2 gives the token three spellings, and they are not interchangeable. A bare `MONITOR` means *no explicit limit*, which is a usable feature rather than a missing one. `MONITOR=<n>` with `n >= 1` permits at least `n` targets. `MONITOR=0` means the server advertised the feature and disabled it. Absent, disabled, and unparsable all fall back to probing, because waiting for notifications a disabled feature never sends would wait forever, and guessing at a value this build cannot parse would be worse than asking the question every server understands.
+
+A large advertised limit is *not* a reason to fall back. `MAX_MONITOR_TARGETS` is a ceiling on what one `MONITOR` request may contain, not on what the server offers; this bouncer watches exactly one nick, so a server permitting a hundred has permitted the one that will be asked for. Rejecting `MONITOR=100` because the local implementation would never monitor a hundred targets is a refusal to use a feature that is available.
+
+The strategy is recorded on the generation's reclaim attempt at the moment it is opened, rather than re-derived from ISUPPORT on every use. Two properties follow: a server that drops `MONITOR` mid-connection cannot make the bouncer alternate between two mechanisms on consecutive ticks, and a `303` can be read as an answer only on a generation that actually sent the `ISON` it answers.
 
 The clock is a generation-owned `tokio::time::interval` and nothing else moves it. A client attaching does not poll upstream faster — if it did, the bouncer's upstream behaviour would depend on which local sessions happen to exist.
 
-Evidence moves the *timing* of a write, never its permission. Accepted evidence wakes the reclaim select arm through a generation-local `Notify`, so a server that has just told the bouncer the preferred nick came free is not made to wait out the interval:
+Evidence moves the *timing* of a write, never its permission. Accepted evidence wakes the reclaim select arm through a generation-local `Notify`, so a server that has just told the bouncer the preferred nick came free is not made to wait out the interval. The three commands answer three different questions, and the classification lives in one table (`presence::reclaim_evidence`) precisely so they cannot drift into a shared presence/absence rule:
 
-- `731` (RPL_MONOFFLINE) names the nick that went **offline**, so the preferred one being *named* is the evidence;
-- `730` (RPL_MONONLINE) reports nicks that are **online**, so it is never free evidence;
-- `303` (RPL_ISON) lists nicks that are **online**, so the preferred one being *absent* is the evidence.
+- `731` (RPL_MONOFFLINE) **names** the targets that went offline. The preferred nick being named is the evidence; its absence from the list says nothing.
+- `730` (RPL_MONONLINE) is an **event** about targets that came online. Absence from it says nothing at all: `:srv 730 bot :alice` means alice is online and carries no statement about bot. An unrelated `730` is therefore not free evidence. A `730` that *names* the preferred nick retracts free evidence that is already pending, because the nick is demonstrably in use at that moment.
+- `303` (RPL_ISON) is the **answer to a query**. The preferred nick being absent from the returned online set is evidence that it is free — but only as an answer to an `ISON` this generation sent. Absence inside a snapshot nobody requested is not an answer to anything.
 
-MONITOR target lists are comma-separated; the parser compares nicknames using the current casemapping and ignores the optional `!user@host` suffix on 730 targets. Every other line is recorded as nothing rather than as negative evidence that would suppress a future write.
+That `730` distinction is the whole reason the three are not read alike. Treating it as a snapshot of "who is online" lets any unrelated online event start a reclaim of a nick the server never said anything about.
+
+MONITOR target lists are comma-separated; the parser compares nicknames using the server's current casemapping and ignores the optional `!user@host` suffix on 730 targets. Every other line is recorded as nothing rather than as negative evidence that would suppress a future write.
 
 A `NICK <preferred>` is a request. Only the server's own frame confirms it, so the bouncer never treats its own write as success.
 

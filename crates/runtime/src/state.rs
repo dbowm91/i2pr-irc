@@ -782,17 +782,14 @@ impl NetworkState {
         }
         true
     }
-    /// The `MONITOR` limit the server advertised, if any.
+    /// What the server advertised about `MONITOR`, if anything.
     ///
     /// Read from ISUPPORT rather than negotiated, so the upstream CAP fingerprint stays
-    /// independent of which clients happen to be attached. `MONITOR=0` is reported as
-    /// `Some(0)`: the server did advertise the feature and disabled it, which is a
-    /// different answer from never mentioning it.
-    pub fn monitor_limit(&self) -> Option<usize> {
-        self.isupport
-            .iter()
-            .find_map(|token| token.strip_prefix("MONITOR="))
-            .and_then(|value| value.parse::<usize>().ok())
+    /// independent of which clients happen to be attached. The three spellings are kept
+    /// apart: a bare `MONITOR`, a positive `MONITOR=<n>`, and `MONITOR=0` answer different
+    /// questions, and the reclaim strategy can only be chosen correctly from the real one.
+    pub fn monitor_support(&self) -> crate::presence::MonitorSupport {
+        crate::presence::parse_monitor_support(self.isupport.iter().map(String::as_str))
     }
 
     /// Casemapped identities of every detached channel, whether or not it is currently

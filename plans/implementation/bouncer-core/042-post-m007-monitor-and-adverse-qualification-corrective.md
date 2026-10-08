@@ -1,6 +1,8 @@
 # Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective
 
-Status: ready for handoff
+Status: closed
+
+Closure record: plans/closure/bouncer-core/042-status.md
 
 Repository baseline:
 

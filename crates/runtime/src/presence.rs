@@ -95,8 +95,10 @@ pub fn nick_collision_retry_delay(entropy: u64) -> Duration {
 
 /// Ceiling on monitored nicks in one `MONITOR` request.
 ///
-/// The bouncer watches at most its own preferred nick. The ceiling exists so a
-/// mis-parsed limit cannot make the bouncer ask the server about an unbounded set.
+/// The bouncer watches at most its own preferred nick, so this is a ceiling on what a
+/// single request may contain rather than on what the server advertises. A server that
+/// advertises `MONITOR=100` is usable and is not rejected for offering more than the
+/// bouncer would ever ask for; see [`reclaim_strategy`].
 pub const MAX_MONITOR_TARGETS: usize = 8;
 
 /// One Operator's durable presence policy, read from the Network record.
@@ -472,16 +474,145 @@ pub enum ReclaimStrategy {
     Probe,
 }
 
-/// Chooses the reclaim strategy from the server's advertised `MONITOR` limit.
+/// What the server said about `MONITOR` in its `005` block.
 ///
-/// `MONITOR=0` means the feature is disabled; a missing token means it is not advertised.
-/// Both fall back to probing, which is slower but is a standard query every server
-/// understands. Choosing `MONITOR` because it is merely *mentioned* would leave the
-/// bouncer waiting forever for notifications a disabled feature never sends.
-pub fn reclaim_strategy(monitor_limit: Option<usize>) -> ReclaimStrategy {
-    match monitor_limit {
-        Some(limit) if (1..=MAX_MONITOR_TARGETS).contains(&limit) => ReclaimStrategy::Monitor,
-        _ => ReclaimStrategy::Probe,
+/// MONITOR 3.2 gives the token three spellings, and they answer different questions, so
+/// collapsing them into one optional number loses exactly the distinctions that decide
+/// whether the feature can be used:
+///
+/// - a bare `MONITOR` means *no explicit limit* — not a missing feature;
+/// - `MONITOR=<n>` with `n >= 1` means the server permits at least `n` targets;
+/// - `MONITOR=0` means the server advertised the feature and disabled it.
+///
+/// [Absent] and [Disabled] both mean "do not use `MONITOR`", but they stay distinct
+/// because they are different answers: one server never mentioned the feature and the
+/// other refused to serve it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MonitorSupport {
+    /// The server never mentioned `MONITOR`.
+    Absent,
+    /// The server mentioned `MONITOR` with no usable target allowance.
+    ///
+    /// Covers both the specified `MONITOR=0` and a value that is not a count at all. A
+    /// value this build cannot parse is treated as unusable rather than guessed at: the
+    /// only safe reading of a malformed advertisement is the one that does not depend on
+    /// what it means.
+    Disabled,
+    /// A bare `MONITOR`: the server sets no explicit target limit.
+    Unlimited,
+    /// `MONITOR=<n>` with `n >= 1`: at least this many targets may be monitored.
+    Limited(usize),
+}
+
+impl MonitorSupport {
+    /// Whether at least one `MONITOR` slot is available.
+    ///
+    /// The only question the one-target preferred-nick watch asks. A server permitting
+    /// more targets than this build would ever request is still permitting the one it
+    /// does request.
+    pub fn allows_target(self) -> bool {
+        matches!(self, Self::Unlimited) || matches!(self, Self::Limited(limit) if limit >= 1)
+    }
+}
+
+/// Reads `MONITOR` support out of raw ISUPPORT tokens.
+///
+/// Token names are matched case-insensitively, as ISUPPORT requires. The first `MONITOR`
+/// token in iteration order decides, which keeps the answer deterministic when a
+/// malformed server repeats the key; a set with one entry per key is the normal case.
+pub fn parse_monitor_support<'a>(tokens: impl IntoIterator<Item = &'a str>) -> MonitorSupport {
+    for token in tokens {
+        if token.eq_ignore_ascii_case("MONITOR") {
+            return MonitorSupport::Unlimited;
+        }
+        let Some(value) = token
+            .split_once('=')
+            .filter(|(key, _)| key.eq_ignore_ascii_case("MONITOR"))
+            .map(|(_, value)| value)
+        else {
+            continue;
+        };
+        return match value.parse::<usize>() {
+            Ok(0) => MonitorSupport::Disabled,
+            Ok(limit) => MonitorSupport::Limited(limit),
+            Err(_) => MonitorSupport::Disabled,
+        };
+    }
+    MonitorSupport::Absent
+}
+
+/// Chooses the reclaim strategy from what the server advertised about `MONITOR`.
+///
+/// Only [MonitorSupport::Absent] and [MonitorSupport::Disabled] fall back to probing,
+/// which is slower but is a standard query every server understands. Choosing `MONITOR`
+/// because it is merely *mentioned* would leave the bouncer waiting forever for
+/// notifications a disabled feature never sends; rejecting it because the advertised
+/// limit exceeds [MAX_MONITOR_TARGETS] would be just as wrong, because this bouncer
+/// watches exactly one nick and never intends to ask about the other slots.
+pub fn reclaim_strategy(support: MonitorSupport) -> ReclaimStrategy {
+    if support.allows_target() {
+        ReclaimStrategy::Monitor
+    } else {
+        ReclaimStrategy::Probe
+    }
+}
+
+/// What one upstream line tells a reclaim about the preferred nick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimEvidence {
+    /// The line proves the preferred nick is free and a `NICK` write is due now.
+    Free,
+    /// The line proves the preferred nick is in use, retracting any pending free
+    /// evidence.
+    Taken,
+    /// The line says nothing about the preferred nick; existing evidence is left alone.
+    Unrelated,
+}
+
+/// Classifies one upstream line as reclaim evidence.
+///
+/// The three commands mean three different things, and reading them as one rule is how a
+/// bouncer ends up convinced a taken nick is free:
+///
+/// - `731` RPL_MONOFFLINE *names* the targets that went offline, so the preferred nick
+///   being named is the evidence. Its absence from the list says nothing.
+/// - `730` RPL_MONONLINE is an *event* reporting targets that came online. Absence from
+///   it says nothing at all: `:srv 730 bot :alice` means alice is online and carries no
+///   statement about bot. So an unrelated `730` is [ReclaimEvidence::Unrelated] rather
+///   than free evidence, and a `730` naming the preferred nick retracts whatever free
+///   evidence was pending, because the nick is demonstrably in use right now.
+/// - `303` RPL_ISON is the *answer to a query*. The preferred nick being absent from the
+///   online set the server returned is evidence it is free — but only as an answer to an
+///   `ISON` this generation actually sent, which is what `probe_outstanding` records.
+///   Absence in a snapshot nobody asked for is not an answer to anything.
+///
+/// `preferred_listed` is the caller's casemapped match against the nick targets the
+/// frame listed.
+pub fn reclaim_evidence(
+    command: &str,
+    preferred_listed: bool,
+    probe_outstanding: bool,
+) -> ReclaimEvidence {
+    if command.eq_ignore_ascii_case("731") {
+        if preferred_listed {
+            ReclaimEvidence::Free
+        } else {
+            ReclaimEvidence::Unrelated
+        }
+    } else if command.eq_ignore_ascii_case("730") {
+        if preferred_listed {
+            ReclaimEvidence::Taken
+        } else {
+            ReclaimEvidence::Unrelated
+        }
+    } else if command.eq_ignore_ascii_case("303") {
+        match (preferred_listed, probe_outstanding) {
+            (true, _) => ReclaimEvidence::Taken,
+            (false, true) => ReclaimEvidence::Free,
+            (false, false) => ReclaimEvidence::Unrelated,
+        }
+    } else {
+        ReclaimEvidence::Unrelated
     }
 }
 
@@ -496,6 +627,13 @@ pub struct ReclaimAttempt {
     pub preferred: String,
     /// The nick we currently hold.
     pub current: String,
+    /// The mechanism this generation opened its reclaim with.
+    ///
+    /// Recorded once, at the point the generation actually issued its query, because
+    /// `303` is only evidence as an *answer*. A generation that asked through `MONITOR`
+    /// has outstanding no `ISON`, so a `303` arriving on that connection answers a
+    /// question nobody asked and must not be read as a snapshot.
+    pub strategy: ReclaimStrategy,
     /// How many `NICK` writes this generation has made.
     pub writes: usize,
     /// Whether this generation has evidence the preferred nick is free.
@@ -509,16 +647,22 @@ pub struct ReclaimAttempt {
 }
 
 impl ReclaimAttempt {
-    pub fn new(preferred: &str, current: &str) -> Self {
+    pub fn new(preferred: &str, current: &str, strategy: ReclaimStrategy) -> Self {
         Self {
             preferred: preferred.to_owned(),
             current: current.to_owned(),
+            strategy,
             writes: 0,
             evidence: false,
             refusals: 0,
             cooldown_until: Duration::ZERO,
             suspended: false,
         }
+    }
+
+    /// Whether an `ISON` this generation sent is still the question a `303` would answer.
+    pub fn probe_outstanding(&self) -> bool {
+        self.strategy == ReclaimStrategy::Probe
     }
 
     /// Whether a `NICK` write is due now.
@@ -713,24 +857,170 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_uses_monitor_only_when_the_server_offers_it() {
-        assert_eq!(reclaim_strategy(Some(4)), ReclaimStrategy::Monitor);
+    fn reclaim_uses_monitor_for_bare_and_positive_advertisements() {
+        // Every spelling that permits at least one target is usable for the one nick this
+        // bouncer watches. The server's ceiling is not this build's ceiling.
         assert_eq!(
-            reclaim_strategy(Some(0)),
-            ReclaimStrategy::Probe,
-            "MONITOR=0 means the feature is disabled, not unlimited"
+            parse_monitor_support(["MONITOR"]),
+            MonitorSupport::Unlimited,
+            "a bare MONITOR means no explicit limit, not no feature"
         );
-        assert_eq!(reclaim_strategy(None), ReclaimStrategy::Probe);
         assert_eq!(
-            reclaim_strategy(Some(MAX_MONITOR_TARGETS + 1)),
-            ReclaimStrategy::Probe,
-            "a limit beyond anything this build will use is not a usable one"
+            reclaim_strategy(MonitorSupport::Unlimited),
+            ReclaimStrategy::Monitor
+        );
+        for advertised in [1usize, 4, 8, 100, 4_096] {
+            let token = format!("MONITOR={advertised}");
+            assert_eq!(
+                parse_monitor_support([token.as_str()]),
+                MonitorSupport::Limited(advertised)
+            );
+            assert_eq!(
+                reclaim_strategy(MonitorSupport::Limited(advertised)),
+                ReclaimStrategy::Monitor,
+                "MONITOR={advertised} permits the single target this bouncer watches"
+            );
+        }
+    }
+
+    #[test]
+    fn reclaim_falls_back_to_probing_whenever_monitor_is_unusable() {
+        for tokens in [
+            vec!["MONITOR=0"],
+            vec!["MONITOR=abc"],
+            vec!["MONITOR="],
+            vec!["MONITOR=-1"],
+            vec!["NETWORK", "CASEMAPPING=ascii"],
+            vec![],
+        ] {
+            let support = parse_monitor_support(tokens.iter().copied());
+            assert_eq!(
+                reclaim_strategy(support),
+                ReclaimStrategy::Probe,
+                "{tokens:?} must not be read as a usable MONITOR advertisement"
+            );
+        }
+        assert_eq!(
+            parse_monitor_support(["MONITOR=0"]),
+            MonitorSupport::Disabled,
+            "advertised-and-disabled is a different answer from never-mentioned"
+        );
+        assert_eq!(
+            parse_monitor_support(["CHANTYPES=#"]),
+            MonitorSupport::Absent
+        );
+        assert_ne!(
+            parse_monitor_support(["MONITOR=0"]),
+            parse_monitor_support(["CHANTYPES=#"]),
+            "both fall back to probing but they are not the same fact about the server"
+        );
+    }
+
+    #[test]
+    fn monitor_token_names_are_matched_case_insensitively() {
+        // ISUPPORT names are case-insensitive, so a server that writes `monitor=4` has
+        // advertised the feature just as plainly as one that writes `MONITOR=4`.
+        assert_eq!(
+            parse_monitor_support(["monitor=4"]),
+            MonitorSupport::Limited(4)
+        );
+        assert_eq!(
+            parse_monitor_support(["monitor"]),
+            MonitorSupport::Unlimited
+        );
+        assert_eq!(
+            parse_monitor_support(["MoNiToR=0"]),
+            MonitorSupport::Disabled
+        );
+    }
+
+    #[test]
+    fn a_monitor_online_event_is_never_free_evidence() {
+        // The regression this table exists for: `730` lists targets that came online.
+        // Being absent from that list says nothing about the preferred nick, so treating
+        // absence as free evidence would let any unrelated online event start a reclaim.
+        assert_eq!(
+            reclaim_evidence("730", false, true),
+            ReclaimEvidence::Unrelated,
+            "an unrelated 730 carries no statement about the preferred nick"
+        );
+        assert_eq!(
+            reclaim_evidence("730", true, true),
+            ReclaimEvidence::Taken,
+            "a 730 naming the preferred nick retracts pending free evidence"
+        );
+        // The retraction holds for both strategy shapes, because `730` never implies a
+        // free evidence path in either.
+        assert_eq!(reclaim_evidence("730", true, false), ReclaimEvidence::Taken);
+    }
+
+    #[test]
+    fn a_monitor_offline_event_is_free_evidence_only_when_it_names_the_nick() {
+        assert_eq!(reclaim_evidence("731", true, true), ReclaimEvidence::Free);
+        assert_eq!(reclaim_evidence("731", true, false), ReclaimEvidence::Free);
+        assert_eq!(
+            reclaim_evidence("731", false, true),
+            ReclaimEvidence::Unrelated,
+            "a 731 about other nicks says nothing about the preferred one"
+        );
+    }
+
+    #[test]
+    fn an_ison_snapshot_is_evidence_only_as_an_answer_to_an_own_probe() {
+        assert_eq!(
+            reclaim_evidence("303", false, true),
+            ReclaimEvidence::Free,
+            "absence from the online set this generation asked for is the evidence"
+        );
+        assert_eq!(
+            reclaim_evidence("303", true, true),
+            ReclaimEvidence::Taken,
+            "presence in the returned set means the nick is taken"
+        );
+        assert_eq!(
+            reclaim_evidence("303", false, false),
+            ReclaimEvidence::Unrelated,
+            "an unsolicited 303 answers a question this generation never asked, so its \\
+             absence proves nothing"
+        );
+        assert_eq!(reclaim_evidence("303", true, false), ReclaimEvidence::Taken);
+    }
+
+    #[test]
+    fn every_other_upstream_command_is_not_reclaim_evidence() {
+        for command in [
+            "001", "331", "353", "366", "433", "PING", "7301", "1731", "",
+        ] {
+            assert_eq!(
+                reclaim_evidence(command, false, true),
+                ReclaimEvidence::Unrelated,
+                "{command} is not reclaim evidence in either direction"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_generation_that_sent_an_ison_can_read_a_303_as_its_answer() {
+        let monitoring = ReclaimAttempt::new("bot", "bot_1", ReclaimStrategy::Monitor);
+        assert!(
+            !monitoring.probe_outstanding(),
+            "a generation that asked through MONITOR has no ISON for a 303 to answer"
+        );
+        let probing = ReclaimAttempt::new("bot", "bot_1", ReclaimStrategy::Probe);
+        assert!(probing.probe_outstanding());
+        assert_eq!(
+            reclaim_evidence("303", false, probing.probe_outstanding()),
+            ReclaimEvidence::Free
+        );
+        assert_eq!(
+            reclaim_evidence("303", false, monitoring.probe_outstanding()),
+            ReclaimEvidence::Unrelated
         );
     }
 
     #[test]
     fn reclaim_writes_only_on_evidence_or_the_bounded_schedule() {
-        let mut attempt = ReclaimAttempt::new("bot", "bot_1");
+        let mut attempt = ReclaimAttempt::new("bot", "bot_1", ReclaimStrategy::Monitor);
         assert!(
             !attempt.should_write(Duration::from_secs(1), RECLAIM_INTERVAL),
             "a client attaching must not make a write due"
@@ -759,7 +1049,7 @@ mod tests {
 
     #[test]
     fn reclaim_refusal_clears_evidence_and_applies_testable_cooldown() {
-        let mut attempt = ReclaimAttempt::new("bot", "bot_1");
+        let mut attempt = ReclaimAttempt::new("bot", "bot_1", ReclaimStrategy::Monitor);
         attempt.evidence = true;
         note_reclaim_refusal(&mut attempt, Duration::from_secs(7));
         assert_eq!(attempt.refusals, 1);
