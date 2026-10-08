@@ -34,7 +34,7 @@ Canonical direction:
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
 | Bouncer Core Corrective 035 — MONITOR Numeric Conformance | closed | protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
-| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | ready | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
+| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | active | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
 
 ## Recently closed implementation plans
 

@@ -1,6 +1,6 @@
 # Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline
 
-Status: blocked
+Status: active
 
 Hard dependency:
 

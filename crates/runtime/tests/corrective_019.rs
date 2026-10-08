@@ -209,6 +209,11 @@ impl Harness {
             .write_all(b":srv 903 bot :SASL success\r\n:srv 001 bot :welcome\r\n")
             .await
             .unwrap();
+        sent.extend(read_until(upstream, b"CAP REQ :message-tags\r\n").await);
+        upstream
+            .write_all(b":srv CAP * ACK :message-tags\r\n")
+            .await
+            .unwrap();
         sent.extend(read_until(upstream, b"CAP END\r\n").await);
         self.wait_phase(Phase::Online).await;
         sent
@@ -319,7 +324,7 @@ async fn the_production_path_completes_a_sasl_plain_handshake() {
 
     let sent = String::from_utf8_lossy(&sent);
     assert!(
-        sent.contains("CAP REQ :sasl message-tags"),
+        sent.contains("CAP REQ :sasl\r\n") && sent.contains("CAP REQ :message-tags\r\n"),
         "a configured Network must request SASL upstream: {sent}"
     );
     assert!(
@@ -434,6 +439,209 @@ async fn sasl_configured_but_not_offered_is_a_terminal_registration_error() {
         "registering without the configured authentication is a registration failure, saw \
          {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn a_classic_server_welcomes_without_cap_end() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, None).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    let initial = read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv 001 bot :welcome\r\n")
+        .await
+        .unwrap();
+    harness.wait_phase(Phase::Online).await;
+    let (outcome, written) = harness.stop_explicitly().await;
+    assert!(
+        outcome.is_ok(),
+        "no-CAP registration is supported: {outcome:?}"
+    );
+    let written = String::from_utf8_lossy(&written);
+    assert!(String::from_utf8_lossy(&initial).contains("CAP LS 302\r\n"));
+    assert!(
+        !written.contains("CAP END"),
+        "CAP END is not sent to a classic server: {written}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_cap_command_then_welcome_is_a_supported_downgrade() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, None).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv 421 bot CAP :Unknown command\r\n:srv 001 bot :welcome\r\n")
+        .await
+        .unwrap();
+    harness.wait_phase(Phase::Online).await;
+    let (outcome, written) = harness.stop_explicitly().await;
+    assert!(
+        outcome.is_ok(),
+        "421 CAP is an optional compatibility downgrade: {outcome:?}"
+    );
+    assert!(!String::from_utf8_lossy(&written).contains("CAP END"));
+}
+
+#[tokio::test]
+async fn optional_capability_nak_does_not_abort_registration() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, None).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :message-tags\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP REQ :message-tags\r\n").await;
+    upstream
+        .write_all(b":srv CAP * NAK :message-tags\r\n:srv 001 bot :welcome\r\n")
+        .await
+        .unwrap();
+    harness.wait_phase(Phase::Online).await;
+    let (outcome, written) = harness.stop_explicitly().await;
+    assert!(
+        outcome.is_ok(),
+        "optional capability rejection is non-fatal: {outcome:?}"
+    );
+    assert!(String::from_utf8_lossy(&written).contains("CAP END\r\n"));
+}
+
+#[tokio::test]
+async fn cap_without_sasl_completes_without_authentication_when_none_is_configured() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, None).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :message-tags\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP REQ :message-tags\r\n").await;
+    upstream
+        .write_all(b":srv CAP * ACK :message-tags\r\n:srv 001 bot :welcome\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP END\r\n").await;
+    harness.wait_phase(Phase::Online).await;
+    let (outcome, written) = harness.stop_explicitly().await;
+    assert!(outcome.is_ok());
+    assert!(!String::from_utf8_lossy(&written).contains("AUTHENTICATE"));
+}
+
+#[tokio::test]
+async fn bare_sasl_capability_attempts_configured_plain_authentication() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :sasl\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP REQ :sasl\r\n").await;
+    upstream
+        .write_all(b":srv CAP * ACK :sasl\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"AUTHENTICATE PLAIN\r\n").await;
+    upstream.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+    let payload = format!("AUTHENTICATE {}\r\n", sasl_payload());
+    read_until(upstream, payload.as_bytes()).await;
+    upstream
+        .write_all(b":srv 903 bot :SASL success\r\n:srv 001 bot :welcome\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP END\r\n").await;
+    harness.wait_phase(Phase::Online).await;
+    let (outcome, _) = harness.stop_explicitly().await;
+    assert!(
+        outcome.is_ok(),
+        "bare sasl permits the configured PLAIN attempt: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn configured_sasl_rejects_an_explicit_non_plain_offer() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :sasl=EXTERNAL\r\n")
+        .await
+        .unwrap();
+    let outcome = harness.await_ending().await;
+    assert!(matches!(outcome, Err(RuntimeError::Registration)));
+}
+
+#[tokio::test]
+async fn configured_sasl_nak_is_a_terminal_registration_error() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :sasl\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP REQ :sasl\r\n").await;
+    upstream
+        .write_all(b":srv CAP * NAK :sasl\r\n")
+        .await
+        .unwrap();
+    let outcome = harness.await_ending().await;
+    assert!(matches!(outcome, Err(RuntimeError::Registration)));
+}
+
+#[tokio::test]
+async fn configured_sasl_fails_when_cap_is_unsupported() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
+    harness.take_generation().await;
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv 421 bot CAP :Unknown command\r\n")
+        .await
+        .unwrap();
+    let outcome = harness.await_ending().await;
+    assert!(matches!(outcome, Err(RuntimeError::Registration)));
+}
+
+#[tokio::test]
+async fn welcome_before_sasl_success_does_not_complete_registration() {
+    let (_store, handle) = store();
+    let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
+    harness.take_generation().await;
+    let snapshot = harness.snapshot.clone();
+    let upstream = harness.upstream();
+    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :sasl\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"CAP REQ :sasl\r\n").await;
+    upstream
+        .write_all(b":srv CAP * ACK :sasl\r\n")
+        .await
+        .unwrap();
+    read_until(upstream, b"AUTHENTICATE PLAIN\r\n").await;
+    upstream
+        .write_all(b":srv 001 bot :welcome without SASL\r\n")
+        .await
+        .unwrap();
+    let outcome = harness.await_ending().await;
+    assert!(matches!(outcome, Err(RuntimeError::Registration)));
+    assert_ne!(snapshot.borrow().phase, Some(Phase::Online));
 }
 
 // --------------------------------------------------------- upstream QUIT fence

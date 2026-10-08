@@ -810,6 +810,14 @@ pub enum Phase {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationCapState {
+    Unknown,
+    Negotiating,
+    Supported,
+    Unsupported,
+}
+
 impl Phase {
     /// A fixed, non-secret name for diagnostics.
     ///
@@ -1308,13 +1316,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let mut ubuf = [0u8; 2048];
         let mut welcomed = false;
         let mut cap_finished = false;
+        let mut cap_state = RegistrationCapState::Unknown;
         // Upstream capability negotiation is generation-owned and downstream-client
         // independent: it is a pure function of what the server offered.
         let mut upstream_caps = UpstreamCapabilities::default();
         let mut sasl_plain_offered = false;
         let mut requested = false;
         let mut sasl_active = false;
+        let mut sasl_authenticated = self.context.record.sasl.is_none();
+        let mut optional_decided = false;
         let registration = async {
+            cap_state = RegistrationCapState::Negotiating;
             send(&mut uw, "CAP LS 302\r\n").await?;
             send(
                 &mut uw,
@@ -1353,17 +1365,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         .map(|p| String::from_utf8_lossy(p).into_owned())
                         .collect();
                     match command.as_str() {
-                        "CAP" if params.iter().any(|p| p == "LS") => {
+                        "CAP" if params.iter().any(|p| p.eq_ignore_ascii_case("LS")) => {
+                            cap_state = RegistrationCapState::Supported;
                             let capabilities = params.last().map(String::as_str).unwrap_or("");
                             for token in capabilities.split_whitespace() {
                                 upstream_caps.note_offer(token.trim_start_matches(':'));
                             }
                             sasl_plain_offered |= capabilities.split_whitespace().any(|item| {
-                                item.strip_prefix("sasl=").is_some_and(|mechanisms| {
-                                    mechanisms
+                                let Some((name, mechanisms)) = item.split_once('=') else {
+                                    return item.eq_ignore_ascii_case("sasl");
+                                };
+                                name.eq_ignore_ascii_case("sasl")
+                                    && mechanisms
                                         .split(',')
                                         .any(|mechanism| mechanism.eq_ignore_ascii_case("PLAIN"))
-                                })
                             });
                             let continuation = params.get(2).is_some_and(|p| p == "*");
                             if !requested && !continuation {
@@ -1372,27 +1387,27 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 {
                                     return Err(RuntimeError::Registration);
                                 }
-                                // The requested set is the reviewed foundational set
-                                // plus SASL when configured. It never depends on an
-                                // attached client, because upstream negotiation happens
-                                // once per generation while clients attach freely.
-                                let mut wanted = upstream_caps.request_set();
-                                if self.context.record.sasl.is_some()
-                                    && upstream_caps.was_offered("sasl")
-                                {
-                                    wanted.insert(0, "sasl".to_owned());
+                                let optional = upstream_caps.request_set();
+                                optional_decided =
+                                    self.context.record.sasl.is_none() && optional.is_empty();
+                                if self.context.record.sasl.is_some() {
+                                    // SASL is required policy. Keep its ACK/NAK independent
+                                    // from the opportunistic capability set so an optional
+                                    // refusal cannot silently downgrade authentication.
+                                    send(&mut uw, "CAP REQ :sasl\r\n").await?;
+                                } else if !optional.is_empty() {
+                                    send(&mut uw, &format!("CAP REQ :{}\r\n", optional.join(" ")))
+                                        .await?;
                                 }
-                                if wanted.is_empty() {
+                                if self.context.record.sasl.is_none() && optional_decided {
                                     send(&mut uw, "CAP END\r\n").await?;
                                     cap_finished = true;
-                                } else {
-                                    send(&mut uw, &format!("CAP REQ :{}\r\n", wanted.join(" ")))
-                                        .await?;
                                 }
                                 requested = true;
                             }
                         }
-                        "CAP" if params.iter().any(|p| p == "ACK") => {
+                        "CAP" if params.iter().any(|p| p.eq_ignore_ascii_case("ACK")) => {
+                            cap_state = RegistrationCapState::Supported;
                             for token in params.iter().flat_map(|p| p.split_whitespace()) {
                                 upstream_caps.note_enabled(token);
                             }
@@ -1403,30 +1418,43 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             state.set_upstream_multi_prefix(
                                 upstream_caps.is_enabled(crate::capability::MEMBER_MULTI_PREFIX),
                             );
-                            let sasl_accepted = upstream_caps.is_enabled("sasl");
-                            if self.context.record.sasl.is_some() && !sasl_accepted {
-                                return Err(RuntimeError::Registration);
-                            }
-                            if self.context.record.sasl.is_some() {
+                            let acked_sasl =
+                                params
+                                    .iter()
+                                    .flat_map(|p| p.split_whitespace())
+                                    .any(|token| {
+                                        token
+                                            .split('=')
+                                            .next()
+                                            .is_some_and(|n| n.eq_ignore_ascii_case("sasl"))
+                                    });
+                            if self.context.record.sasl.is_some() && !sasl_active {
+                                if !acked_sasl {
+                                    return Err(RuntimeError::Registration);
+                                }
                                 send(&mut uw, "AUTHENTICATE PLAIN\r\n").await?;
                                 sasl_active = true;
                             } else {
+                                optional_decided = true;
+                            }
+                            if optional_decided && sasl_authenticated {
                                 send(&mut uw, "CAP END\r\n").await?;
                                 cap_finished = true;
                             }
                         }
-                        "CAP"
-                            if params.iter().any(|p| p == "NAK")
-                                && self.context.record.sasl.is_some() =>
-                        {
-                            return Err(RuntimeError::Registration);
-                        }
-                        "CAP" if params.iter().any(|p| p == "NAK") => {
-                            // A NAK means the server refused something we asked for. The
-                            // non-SASL capabilities are optional, so negotiation simply
-                            // proceeds with whatever was granted.
-                            send(&mut uw, "CAP END\r\n").await?;
-                            cap_finished = true;
+                        "CAP" if params.iter().any(|p| p.eq_ignore_ascii_case("NAK")) => {
+                            cap_state = RegistrationCapState::Supported;
+                            // Optional requests are sent only after the required SASL
+                            // request is acknowledged, so a NAK before that ACK is a
+                            // refusal of required authentication.
+                            if self.context.record.sasl.is_some() && !sasl_active {
+                                return Err(RuntimeError::Registration);
+                            }
+                            optional_decided = true;
+                            if optional_decided && sasl_authenticated {
+                                send(&mut uw, "CAP END\r\n").await?;
+                                cap_finished = true;
+                            }
                         }
                         "AUTHENTICATE"
                             if sasl_active && params.first().is_some_and(|p| p == "+") =>
@@ -1454,8 +1482,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             }
                         }
                         "903" if sasl_active => {
-                            send(&mut uw, "CAP END\r\n").await?;
-                            cap_finished = true;
+                            sasl_authenticated = true;
+                            let optional = upstream_caps
+                                .request_set()
+                                .into_iter()
+                                .filter(|name| name != "sasl")
+                                .collect::<Vec<_>>();
+                            optional_decided = optional.is_empty();
+                            if optional_decided {
+                                send(&mut uw, "CAP END\r\n").await?;
+                                cap_finished = true;
+                            } else {
+                                send(&mut uw, &format!("CAP REQ :{}\r\n", optional.join(" ")))
+                                    .await?;
+                            }
                         }
                         "904" | "905" | "906" | "907" if sasl_active => {
                             return Err(RuntimeError::Registration);
@@ -1474,7 +1514,32 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             state.nick = next.clone();
                             send(&mut uw, &format!("NICK {next}\r\n")).await?;
                         }
-                        "001" => welcomed = true,
+                        "001" => {
+                            if self.context.record.sasl.is_some() && !sasl_authenticated {
+                                return Err(RuntimeError::Registration);
+                            }
+                            welcomed = true;
+                            if cap_state != RegistrationCapState::Supported {
+                                cap_state = RegistrationCapState::Unsupported;
+                                if self.context.record.sasl.is_some() {
+                                    return Err(RuntimeError::Registration);
+                                }
+                                // A classic server has completed registration without
+                                // demonstrating CAP support. Never send CAP END to it.
+                                cap_finished = true;
+                            }
+                        }
+                        "421"
+                            if params
+                                .get(1)
+                                .is_some_and(|parameter| parameter.eq_ignore_ascii_case("CAP")) =>
+                        {
+                            if self.context.record.sasl.is_some() {
+                                return Err(RuntimeError::Registration);
+                            }
+                            cap_state = RegistrationCapState::Unsupported;
+                            cap_finished = true;
+                        }
                         "ERROR" | "464" | "465" | "451" => return Err(RuntimeError::Registration),
                         _ => match state.apply_line(&message) {
                             LineOutcome::Quiet => {}
