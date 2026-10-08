@@ -1,6 +1,6 @@
 # Bouncer Core M007-C / Plan 041 — Eggchaos Multi-Client Adverse Qualification and M007 Closure
 
-Status: blocked
+Status: active
 
 Hard dependency:
 
