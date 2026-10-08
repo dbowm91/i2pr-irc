@@ -23,7 +23,9 @@ use std::time::Duration;
 use i2pr_irc_core::{ByteStream, ClientId, I2pEndpoint, NetworkId, SessionId};
 use i2pr_irc_runtime::admission::{AdmissionOutcome, DownstreamAdmission, NetworkSelection};
 use i2pr_irc_runtime::controller::{ControlSnapshot, RuntimeControlHandle, RuntimeController};
-use i2pr_irc_store::{NetworkRecord, Store, StorePath};
+use i2pr_irc_store::{
+    BufferKind, HistoryQuery, HistoryQueryBound, NetworkRecord, Store, StorePath,
+};
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -137,8 +139,10 @@ impl Runtime {
         // test honest about which capabilities were actually granted, since an ACK that
         // names a capability the bouncer never requested would be answered by a
         // different branch of registration than the real one.
+        let mut output = String::new();
         loop {
             let line = read_line(&mut upstream).await;
+            output.push_str(&line);
             if line.contains("CAP END") {
                 break;
             }
@@ -166,6 +170,55 @@ impl Runtime {
         })
         .await;
         peer
+    }
+
+    async fn reconnect_peer(&mut self, network: u64, channels: &[&str], cap_ls: &str) -> String {
+        let mut upstream = self.provider.plain_peer().await;
+        read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(format!(":srv CAP * LS :{cap_ls}\r\n").as_bytes())
+            .await
+            .expect("replacement upstream offers capabilities");
+        let mut output = String::new();
+        loop {
+            let line = read_line(&mut upstream).await;
+            output.push_str(&line);
+            if line.contains("CAP END") {
+                break;
+            }
+            if let Some(request) = line.strip_prefix("CAP REQ :") {
+                let requested = request.trim_end_matches("\r\n");
+                upstream
+                    .write_all(format!(":srv CAP * ACK :{requested}\r\n").as_bytes())
+                    .await
+                    .expect("replacement upstream acks");
+            }
+        }
+        upstream
+            .write_all(b":srv 001 bot :welcome\r\n")
+            .await
+            .expect("replacement upstream welcomes");
+        for channel in channels {
+            output.push_str(&read_until(&mut upstream, format!("JOIN {channel}").as_bytes()).await);
+        }
+        wait_for(&self.control, |snapshot| {
+            snapshot
+                .networks
+                .iter()
+                .any(|entry| entry.network == NetworkId(network) && entry.live)
+        })
+        .await;
+        let mut bytes = [0u8; 1024];
+        while let Ok(Ok(count)) =
+            tokio::time::timeout(Duration::from_millis(20), upstream.read(&mut bytes)).await
+        {
+            if count == 0 {
+                break;
+            }
+            output.push_str(&String::from_utf8_lossy(&bytes[..count]));
+        }
+        self.upstreams.push(upstream);
+        output
     }
 
     async fn stop(self) {
@@ -263,7 +316,7 @@ impl Client {
     }
 }
 
-fn admit(runtime: &Runtime, network: NetworkId, session: SessionId) -> Client {
+fn admit_as(runtime: &Runtime, network: NetworkId, session: SessionId, client: ClientId) -> Client {
     let (end, runtime_end, script) = ScriptedStream::pair(FaultScript::default());
     let control = runtime.control.clone();
     let outcome = tokio::spawn(async move {
@@ -275,7 +328,7 @@ fn admit(runtime: &Runtime, network: NetworkId, session: SessionId) -> Client {
             }),
             control,
             session,
-            ClientId(7),
+            client,
         )
         .run(stream)
         .await
@@ -294,7 +347,17 @@ async fn register(
     session: SessionId,
     capabilities: &str,
 ) -> Client {
-    let mut client = admit(runtime, network, session);
+    register_as(runtime, network, session, capabilities, ClientId(7)).await
+}
+
+async fn register_as(
+    runtime: &Runtime,
+    network: NetworkId,
+    session: SessionId,
+    capabilities: &str,
+    client_id: ClientId,
+) -> Client {
+    let mut client = admit_as(runtime, network, session, client_id);
     let request = if capabilities.is_empty() {
         "NICK bot\r\nUSER user 0 * :client\r\nCAP END\r\n".to_owned()
     } else {
@@ -345,6 +408,28 @@ async fn read_until(stream: &mut ScriptedStream, needle: &[u8]) -> String {
     String::from_utf8_lossy(&all).into_owned()
 }
 
+async fn upstream_barrier(runtime: &mut Runtime, peer: usize, token: &str) {
+    runtime.upstreams[peer]
+        .write_all(format!(":srv PING :{token}\r\n").as_bytes())
+        .await
+        .expect("upstream writes ordering barrier");
+    let response = read_until(
+        &mut runtime.upstreams[peer],
+        format!("PONG :{token}").as_bytes(),
+    )
+    .await;
+    assert!(response.contains(&format!("PONG :{token}")), "{response:?}");
+}
+
+fn parsed_line_with(text: &str, marker: &str) -> i2pr_irc_wire::Message {
+    let line = text
+        .lines()
+        .find(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("no frame containing {marker:?}: {text:?}"));
+    i2pr_irc_wire::Message::parse(format!("{line}\r\n").as_bytes())
+        .expect("rendered IRC frame parses")
+}
+
 // ----------------------------------------------------------------- tests
 
 #[tokio::test]
@@ -381,6 +466,209 @@ async fn the_advertised_set_names_exactly_what_this_build_serves() {
     assert!(
         !listing.contains("echo-message"),
         "upstream did not negotiate echo-message, so the bouncer must not offer it: {listing:?}"
+    );
+    assert!(
+        !listing.to_ascii_lowercase().contains("otr"),
+        "OTR is opaque payload carried by endpoints, not a bouncer IRC capability: {listing:?}"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn otr_queries_fragments_and_whitespace_remain_opaque_across_tags_fanout_and_history() {
+    let mut runtime = Runtime::start().await;
+    let peer = runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time account-tag batch labeled-response",
+        )
+        .await;
+    upstream_barrier(&mut runtime, peer, "m009a-otr-ready").await;
+
+    let mut modern = register_as(
+        &runtime,
+        NetworkId(1),
+        SessionId(11),
+        "message-tags server-time account-tag",
+        ClientId(101),
+    )
+    .await;
+    let mut passive = register_as(
+        &runtime,
+        NetworkId(1),
+        SessionId(12),
+        "message-tags",
+        ClientId(102),
+    )
+    .await;
+    let mut legacy = register_as(&runtime, NetworkId(1), SessionId(13), "", ClientId(103)).await;
+    for client in [&mut modern, &mut passive, &mut legacy] {
+        client.settle().await;
+    }
+    let marks = [modern.mark(), passive.mark(), legacy.mark()];
+
+    // Synthetic query/start form with exact trailing TAB/SPACE bytes. The extra
+    // opaque tag and the body are deliberately unrelated; neither is interpreted.
+    let body = b"?OTRv3?\t \x20 ";
+    let mut incoming =
+        b"@account=alice;time=2026-01-01T00:00:00.000Z;+custom=kept :alice!u@h PRIVMSG #room :"
+            .to_vec();
+    incoming.extend_from_slice(body);
+    incoming.extend_from_slice(b"\r\n");
+    runtime.upstreams[peer]
+        .write_all(&incoming)
+        .await
+        .expect("upstream writes opaque query");
+    for (client, mark) in [
+        (&mut modern, marks[0]),
+        (&mut passive, marks[1]),
+        (&mut legacy, marks[2]),
+    ] {
+        client.await_new(mark, "?OTRv3?").await;
+    }
+    for (client, mark) in [
+        (&mut modern, marks[0]),
+        (&mut passive, marks[1]),
+        (&mut legacy, marks[2]),
+    ] {
+        client.settle().await;
+        let rendered = client.since(mark);
+        let message = parsed_line_with(&rendered, "?OTRv3?");
+        assert_eq!(
+            message.params.last().map(Vec::as_slice),
+            Some(body.as_slice())
+        );
+    }
+    let modern_line = modern.since(marks[0]);
+    let passive_line = passive.since(marks[1]);
+    let legacy_line = legacy.since(marks[2]);
+    assert!(modern_line.contains("account=alice"), "{modern_line:?}");
+    assert!(modern_line.contains("time=2026-01-01T00:00:00.000Z"));
+    assert!(modern_line.contains("+custom=kept"));
+    assert!(!passive_line.contains("account=alice"));
+    assert!(!passive_line.contains("time="));
+    assert!(passive_line.contains("+custom=kept"));
+    assert!(!legacy_line.starts_with('@'));
+
+    // Two OTR fragments remain two distinct ordered IRC events.
+    let mark = modern.mark();
+    runtime.upstreams[peer]
+        .write_all(
+            b":alice!u@h PRIVMSG #room :?OTR,1,2,fragmentA+/==\r\n:alice!u@h PRIVMSG #room :?OTR,2,2,fragmentB+/==\r\n",
+        )
+        .await
+        .expect("upstream writes distinct fragments");
+    modern.await_new(mark, "fragmentB+/==").await;
+    modern.settle().await;
+    let fragment_window = modern.since(mark);
+    let first_pos = fragment_window.find("fragmentA+/==").expect("fragment one");
+    let second_pos = fragment_window.find("fragmentB+/==").expect("fragment two");
+    assert!(
+        first_pos < second_pos,
+        "fragment order changed: {fragment_window:?}"
+    );
+    assert_eq!(fragment_window.matches("?OTR,").count(), 2);
+
+    // The exact observed messages, including trailing whitespace, are durable.
+    let handle = runtime._store.handle_clone();
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("history buffer resolves")
+        .buffer;
+    handle.flush().await.expect("history writes flush");
+    let events = handle
+        .query_history(&HistoryQuery {
+            buffer,
+            bound: HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("opaque history reads");
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        i2pr_irc_wire::Message::parse(&[events[0].payload.as_slice(), b"\r\n"].concat())
+            .expect("history event parses")
+            .params
+            .last()
+            .map(Vec::as_slice),
+        Some(body.as_slice()),
+        "history preserves ciphertext-bearing payload bytes"
+    );
+    assert!(events[1].payload.ends_with(b"?OTR,1,2,fragmentA+/=="));
+    assert!(events[2].payload.ends_with(b"?OTR,2,2,fragmentB+/=="));
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn outbound_otr_body_is_forwarded_byte_exactly_and_near_line_limit() {
+    let mut runtime = Runtime::start().await;
+    let peer = runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch labeled-response",
+        )
+        .await;
+    upstream_barrier(&mut runtime, peer, "m009a-otr-outbound-ready").await;
+    let mut client = register_as(&runtime, NetworkId(1), SessionId(21), "", ClientId(201)).await;
+    client.settle().await;
+
+    let ordinary = "PRIVMSG #room :?OTR:AKE+/== punctuation?!\t  \r\n";
+    client.send(ordinary).await;
+    let forwarded = read_until(&mut runtime.upstreams[peer], b"?OTR:AKE+/==").await;
+    assert!(
+        forwarded
+            .as_bytes()
+            .windows(ordinary.len())
+            .any(|w| w == ordinary.as_bytes())
+    );
+
+    let notice = "NOTICE #room :?OTR:NOTICE-opaque+/==  \t\r\n";
+    client.send(notice).await;
+    let forwarded = read_until(&mut runtime.upstreams[peer], b"?OTR:NOTICE-opaque").await;
+    assert!(
+        forwarded
+            .as_bytes()
+            .windows(notice.len())
+            .any(|window| window == notice.as_bytes())
+    );
+
+    let large_body = format!("?OTR:{}", "A".repeat(490));
+    let near_limit = format!("PRIVMSG #room :{large_body}\r\n");
+    assert_eq!(near_limit.len(), i2pr_irc_wire::MAX_LINE_BYTES);
+    client.send(&near_limit).await;
+    let forwarded = read_until(&mut runtime.upstreams[peer], b"?OTR:AAAA").await;
+    assert!(
+        forwarded
+            .as_bytes()
+            .windows(near_limit.len())
+            .any(|window| window == near_limit.as_bytes()),
+        "maximum-size fragment was changed: {} bytes",
+        forwarded.len()
+    );
+
+    // The server may have received the complete opaque chat even though the
+    // connection dies before any confirmation. The replacement connection must
+    // identify and rejoin, but must not replay this non-idempotent user frame.
+    runtime.upstreams[peer]
+        .shutdown()
+        .await
+        .expect("old upstream disconnects");
+    let replacement = runtime
+        .reconnect_peer(
+            1,
+            &["#room"],
+            "message-tags server-time batch labeled-response",
+        )
+        .await;
+    assert!(
+        !replacement.contains("?OTR"),
+        "ambiguous OTR chat replayed: {replacement:?}"
     );
     runtime.stop().await;
 }

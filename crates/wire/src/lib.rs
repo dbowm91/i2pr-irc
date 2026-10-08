@@ -509,6 +509,42 @@ impl LineDecoder {
 mod tests {
     use super::*;
     #[test]
+    fn opaque_otr_shapes_preserve_trailing_bytes_and_frame_boundaries() {
+        let bodies: [&[u8]; 5] = [
+            b"?OTRv3?",
+            b"?OTR:AAICAAAAAAABAAAAAABase64-like+/==.",
+            b"?OTR,1,2,fragment-one+/==",
+            b"?OTR,2,2,fragment-two+/==",
+            b"plaintext with whitespace tag \x20\x20\t ",
+        ];
+        for body in bodies {
+            let mut frame = b":alice!u@h PRIVMSG #room :".to_vec();
+            frame.extend_from_slice(body);
+            frame.extend_from_slice(b"\r\n");
+            let parsed = Message::parse(&frame).expect("synthetic opaque OTR frame parses");
+            assert_eq!(parsed.params.last().map(Vec::as_slice), Some(body));
+            assert_eq!(parsed.encode().expect("frame re-encodes"), frame);
+        }
+
+        let first = Message::parse(b":alice PRIVMSG #room :?OTR,1,2,first\r\n")
+            .expect("first fragment parses");
+        let second = Message::parse(b":alice PRIVMSG #room :?OTR,2,2,second\r\n")
+            .expect("second fragment parses");
+        assert_eq!(first.params.last().unwrap(), b"?OTR,1,2,first");
+        assert_eq!(second.params.last().unwrap(), b"?OTR,2,2,second");
+        assert_ne!(first, second, "fragments remain separate IRC messages");
+    }
+
+    #[test]
+    fn near_limit_otr_payload_is_not_trimmed_or_reformatted() {
+        let body = format!("?OTR:{}", "A".repeat(479));
+        let frame = format!(":alice!u@h PRIVMSG #room :{body}\r\n");
+        assert_eq!(frame.len(), MAX_LINE_BYTES);
+        let parsed = Message::parse(frame.as_bytes()).expect("maximum-size IRC line parses");
+        assert_eq!(parsed.encode().expect("line re-encodes"), frame.as_bytes());
+    }
+
+    #[test]
     fn tags_unknown_command_and_colon_roundtrip() {
         let m = Message::parse(b"@x=one\\stwo;x=final :nick FUTURE #c ::leading\r\n").unwrap();
         assert_eq!(m.tags.get(b"x" as &[u8]), Some(&Some(b"final".to_vec())));

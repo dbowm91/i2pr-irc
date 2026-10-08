@@ -878,6 +878,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn otr_bearing_chat_remains_an_ambiguous_nonreplayable_user_intent() {
+        let mut harness = Harness::new(NetworkState::new("bot", &[]));
+        harness.register();
+        let wire = b"PRIVMSG #room :?OTR:AAICAAAAAAABAAAAAA+/==\r\n";
+        harness
+            .send(wire)
+            .expect("opaque OTR chat is ordinary IRC chat");
+        let intent = harness.upstream_normal_rx.try_recv().expect("queued");
+        assert_eq!(intent.class, IntentClass::NonReplayable);
+        assert!(!intent.survives_disconnect());
+        assert_eq!(intent.wire, wire);
+    }
+
+    #[tokio::test]
     async fn client_prefix_and_local_quit_are_explicit_dispositions() {
         let mut harness = Harness::new(NetworkState::new("bot", &[]));
         assert!(matches!(
