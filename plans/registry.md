@@ -26,16 +26,14 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | M009 closed | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | Plans 043-048 are closed. External real-client OTR interoperability awaits a future standalone-listener product path; Router R002 remains independently blocked upstream. |
-| I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
+| Bouncer core | post-M009 corrective active | plans/subsystems/bouncer-core-roadmap.md | Corrective 049 ready | M001-M009 remain historical product closures. Corrective 049 owns only the transient SAM conformance timeout investigation and stale registry/README/roadmap reconciliation. |
+| I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization | closed | verification/test-harness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/043-status.md |
-| Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation | closed | security infrastructure + persistence | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/044-status.md |
-| Bouncer Core M008-B / Plan 045 — Encrypted Store Migration and Key Rotation | closed | security migration + durability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/045-status.md |
+| Bouncer Core Corrective 049 — Post-M009 Verification and Documentation Reconciliation | ready | verification reliability + planning/documentation reconciliation | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/049-status.md |
 
 ## Recently closed implementation plans
 
@@ -96,14 +94,15 @@ Canonical direction:
 
 ## Unplanned later milestones
 
-M008 and M009 are now fully researched and registered behind Corrective 043.
+M008 and M009 are closed. Corrective 049 is the only active Bouncer Core handoff.
 
 Later product lines intentionally remain unplanned:
 
-- executable-specific store-key provisioning (environment/file/keyring/HSM) as part of standalone/bootstrap work;
+- standalone daemon/local listener/bootstrap and packaging;
+- executable-specific store-key provisioning (environment/file/keyring/HSM);
+- external real-client OTR interoperability through the future production listener;
 - per-buffer no-history/privacy-retention policy;
 - built-in IRC client cryptographic endpoint support, including any OTRv4 evaluation;
-- standalone daemon/listener/packaging work;
 - Router R002 — i2pr managed-app adapter, blocked on stable public app stream/listener/lifecycle contracts;
 - Router R003 — optional scoped Proposal 170/control integration, research-blocked until a concrete product need exists.
 
@@ -153,8 +152,12 @@ Important retained conclusions:
 
 ## Latest closure and handoff
 
-Corrective 043 and M008/M009 Plans 044-048 are closed; see their closure records under `plans/closure/bouncer-core/`.
+Implement only:
 
-No Bouncer Core implementation plan is currently registered as dependency-ready. External real-client OTR interoperability awaits a future standalone-listener product path, which is not currently planned. Router R002 remains independently blocked on stable public i2pr managed-app contracts.
+- plans/implementation/bouncer-core/049-post-m009-verification-and-docs-corrective.md
 
-M006, M007, Corrective 042, and R001 remain product closures. R002 remains independently blocked on upstream i2pr managed-app contracts.
+Corrective 049 is the sole dependency-ready handoff.
+
+It must first investigate the transient Rust 1.88 SAM fragmented-reply/SessionCreate timeout recorded by Plan 048 without weakening production timeouts or hiding the failure behind retries. It also reconciles the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
+
+No successor feature milestone is registered yet. Standalone daemon/listener/bootstrap work remains the likely next productization line, but it requires its own research/planning gate. R002 remains independently blocked on upstream i2pr managed-app contracts.
