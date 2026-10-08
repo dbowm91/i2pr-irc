@@ -1,6 +1,6 @@
 # Standalone Daemon and Local Access Roadmap
 
-Status: M010 in progress; M010-A/Plan 050 closed; M010-B/Plan 051 active; Plans 052-054 dependency-gated
+Status: M010 in progress; M010-A/Plan 050 through M010-C/Plan 052 closed; M010-D/Plan 053 active; Plan 054 dependency-gated
 Canonical direction: plans/000-long-term-specification.md; plans/002-long-term-roadmap.md; plans/003-planning-process.md
 Research: plans/research/010-m010-standalone-daemon-local-access-and-bootstrap.md
 Decision authority: plans/adrs/ADR-0007-local-authentication-and-standalone-process-boundary.md, ADR-0001, ADR-0003, ADR-0006
@@ -45,10 +45,10 @@ M009/C049 and R001 [closed]
 Plan 050 / M010-A [closed] daemon scaffold, configuration, process lease/lifecycle
              |
              v
-Plan 051 / M010-B [active] auth-aware local acceptance + guard
+Plan 051 / M010-B [closed] auth-aware local acceptance + guard
              |
              v
-Plan 052 / M010-C [proposed; waits on 051] IRC registration checkpoint + stable profiles
+Plan 052 / M010-C [closed] IRC registration checkpoint + stable profiles
              |
              v
 Plan 053 / M010-D [proposed; waits on 052] secure initialization, key/credential UX
@@ -87,9 +87,9 @@ If tests show incorrect auth state transfer or permission ambiguity, do not mark
 | Milestone | Status | Plan | Closure expected |
 |---|---|---|---|
 | M010-A | closed | plans/implementation/standalone/050-m010a-daemon-runtime-bootstrap.md | plans/closure/standalone/050-status.md |
-| M010-B | active | plans/implementation/standalone/051-m010b-local-listener-and-authentication.md | plans/closure/standalone/051-status.md |
-| M010-C | proposed; depends on 051 closure | plans/implementation/standalone/052-m010c-registration-handoff-client-profiles.md | plans/closure/standalone/052-status.md |
-| M010-D | proposed; depends on 052 closure | plans/implementation/standalone/053-m010d-secure-init-and-key-provisioning.md | plans/closure/standalone/053-status.md |
+| M010-B | closed | plans/implementation/standalone/051-m010b-local-listener-and-authentication.md | plans/closure/standalone/051-status.md |
+| M010-C | closed | plans/implementation/standalone/052-m010c-registration-handoff-client-profiles.md | plans/closure/standalone/052-status.md |
+| M010-D | active | plans/implementation/standalone/053-m010d-secure-init-and-key-provisioning.md | plans/closure/standalone/053-status.md |
 | M010-E | proposed; depends on 053 closure | plans/implementation/standalone/054-m010e-product-integration-and-closure.md | plans/closure/standalone/054-status.md |
 
 ## 10. Completion definition

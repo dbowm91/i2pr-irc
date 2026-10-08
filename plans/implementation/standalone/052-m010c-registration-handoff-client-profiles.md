@@ -1,6 +1,6 @@
 # Standalone M010-C / Plan 052 — Authenticated Registration Handoff and Client Profiles
 
-Status: proposed — dependency-gated on Plan 051 closure
+Status: closed — see `plans/closure/standalone/052-status.md`
 Repository baseline for planning: f325e7d5e495e36b1fc7b168c30e4b725756d22c
 Primary class: capability + trust-transition invariant
 Authority: plans/subsystems/standalone-daemon-roadmap.md; ADR-0003; ADR-0007; Research 010

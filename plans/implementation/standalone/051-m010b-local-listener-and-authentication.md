@@ -1,6 +1,6 @@
 # Standalone M010-B / Plan 051 — Local Listener and Bounded Authentication
 
-Status: active — Plan 050 closed; Plan 052 remains gated on this plan's closure
+Status: closed — see plans/closure/standalone/051-status.md
 Repository baseline for planning: f325e7d5e495e36b1fc7b168c30e4b725756d22c
 Primary class: security invariant + infrastructure
 Authority: plans/subsystems/standalone-daemon-roadmap.md; ADR-0007; Research 010

@@ -32,13 +32,13 @@ Research lives under plans/research/. Subsystem roadmaps live under plans/subsys
 ### Standalone daemon bootstrap status
 
 - `cargo run -p i2pr-irc-daemon -- --help` exposes the bootstrap CLI. Plan 050 adds an executable that takes an exclusive state lease, opens an explicitly configured existing plaintext store, restores RuntimeController ownership and stops on SIGINT/SIGTERM.
-- The daemon does not activate a listener; configured listener values are rejected with an explicit message. Operator authentication and client access arrive in Plans 051-052.
+- The listener/authentication and canonical registration handoff are implemented, including stable per-profile ClientIds and unbound control sessions. The CLI does not activate them until Plan 053 provisions private credentials and the encrypted store key.
 - This bootstrap is for a deliberately pre-provisioned plaintext test store only. Secure encrypted initialization and key provisioning are not available until Plan 053. It is not yet a usable standalone IRC bouncer.
 - No production store-key provisioning UX (environment/file/keyring/HSM).
 - No packaging, service, or install layer.
 - No real-client OTR interoperability qualification through a product listener; that waits on the future production listener.
 
-The standalone M010 productization milestone is in progress (Research 010, ADR-0007, Plans 050-054). Track each sequential handoff in `plans/registry.md`; completing Plan 050 does not make a usable standalone bouncer.
+The standalone M010 productization milestone is in progress (Research 010, ADR-0007, Plans 050-054). Plans 050-052 establish the process, authentication and runtime handoff. The executable remains non-listening until secure credential and store-key provisioning is complete. Track sequential handoffs in `plans/registry.md`.
 
 Router R002 (i2pr managed-app adapter) remains blocked on stable public i2pr managed-app stream/listener/lifecycle contracts.
 
