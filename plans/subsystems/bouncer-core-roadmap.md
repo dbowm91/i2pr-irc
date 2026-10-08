@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: M008 active — Corrective 043 and Plan 044 closed; Plan 045 ready
+Status: M008 active — Corrective 043 and Plans 044-045 closed; Plan 046 ready
 
 Long-term references:
 
@@ -943,9 +943,10 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M007-C / Plan 041 | closed | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | plans/closure/bouncer-core/041-status.md | Plan 040 closure |
 | C042 / Corrective 042 | closed | plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md | plans/closure/bouncer-core/042-status.md | none |
 | C043 / Corrective 043 | closed | plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md | plans/closure/bouncer-core/043-status.md | none; test-harness synchronization only |
-| M008 | active | Plans 044-046 | future plans/closure/bouncer-core/046-status.md | Plan 045 active handoff |
+| M008 | active | Plans 044-046 | future plans/closure/bouncer-core/046-status.md | Plan 046 active handoff |
 | M008-A / Plan 044 | closed | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md | plans/closure/bouncer-core/044-status.md | Corrective 043 closure |
-| M008-B / Plan 045 | ready | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md | future plans/closure/bouncer-core/045-status.md | Plan 044 closure |
+| M008-B / Plan 045 | closed | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md | plans/closure/bouncer-core/045-status.md | Plan 044 closure |
+| M008-C / Plan 046 | ready | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md | future plans/closure/bouncer-core/046-status.md | Plan 045 closure |
 | M008-C / Plan 046 | blocked | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md | future plans/closure/bouncer-core/046-status.md | Plan 045 closure |
 | M009 | planned / gated | Plans 047-048 | future plans/closure/bouncer-core/048-status.md | M008 closure |
 | M009-A / Plan 047 | blocked | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md | future plans/closure/bouncer-core/047-status.md | Plan 046 / M008 closure |
