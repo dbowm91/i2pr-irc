@@ -26,7 +26,7 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | no active plan | plans/subsystems/bouncer-core-roadmap.md | Corrective 042 closed | M006, M007, and Corrective 042 are all closed. 042 fixed the `730` event/snapshot distinction, accepted standards-compliant bare and positive-limit `MONITOR`, and replaced the generic echo-peer destructive evidence with product-path Eggchaos scenarios. No plan is open; a successor must be raised explicitly. |
+| Bouncer core | verification corrective active; privacy line planned | plans/subsystems/bouncer-core-roadmap.md | Corrective 043 ready; M008/M009 gated | Product behavior remains closed through Corrective 042. Corrective 043 removes the known m005g test synchronization race. After it closes, Plans 044-046 implement/qualify encrypted durable state, followed by Plans 047-048 for OTRv3 transparent carriage. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -87,14 +87,22 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
+| Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation | blocked | Corrective 043 closure | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md |
+| Bouncer Core M008-B / Plan 045 — Encrypted Store Migration and Key Rotation | blocked | Plan 044 closure | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md |
+| Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure | blocked | Plan 045 closure | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md |
+| Bouncer Core M009-A / Plan 047 — OTRv3 Opaque-Carriage and Multi-Client Invariants | blocked | Plan 046 / M008 closure | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md |
+| Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure | blocked | Plan 047 closure | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md |
 | Router R002 — i2pr Managed-App Adapter | blocked | stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts + its own managed-app prerequisites | no implementation handoff yet |
 
 ## Unplanned later milestones
 
-M006 and M007 are fully planned and registered. Later product lines remain intentionally unplanned:
+M008 and M009 are now fully researched and registered behind Corrective 043.
 
-- privacy/encryption at rest: credential-vault and encrypted SQLite/history design;
-- encrypted conversation research: OTR/E2EE endpoint placement, multi-client semantics, and history behavior;
+Later product lines intentionally remain unplanned:
+
+- executable-specific store-key provisioning (environment/file/keyring/HSM) as part of standalone/bootstrap work;
+- per-buffer no-history/privacy-retention policy;
+- built-in IRC client cryptographic endpoint support, including any OTRv4 evaluation;
 - standalone daemon/listener/packaging work;
 - Router R002 — i2pr managed-app adapter, blocked on stable public app stream/listener/lifecycle contracts;
 - Router R003 — optional scoped Proposal 170/control integration, research-blocked until a concrete product need exists.
@@ -110,6 +118,7 @@ Broad SAM portability matrices are not an open milestone in this repository; the
 | plans/adrs/ADR-0003-process-runtime-control-and-pre-bind-downstream-admission.md | accepted | M005 adds a bounded process RuntimeController and pre-bind DownstreamAdmission; a selected session transfers exactly once into the existing NetworkOwner, which remains the bound data-path owner. |
 | plans/adrs/ADR-0004-network-scoped-provider-and-owned-sam31-client.md | accepted | R001 uses NetworkId-scoped provider semantics and one long-lived transient owned SAM 3.1 STREAM session per active Network; unrelated Networks do not share one I2P Destination by default. |
 | plans/adrs/ADR-0005-explicit-i2p-provider-scope-release.md | accepted | I2pStreamProvider gains explicit idempotent NetworkId scope release so long-lived router sessions survive IRC reconnects but are torn down on durable Network deletion/process shutdown. |
+| plans/adrs/ADR-0006-encryption-layering-store-key-and-otr-endpoint.md | accepted | Durable privacy uses optional whole-database SQLCipher with an injected process-level key; OTR remains endpoint-to-endpoint client crypto and the bouncer carries ciphertext opaquely without keys/session state. |
 
 ## Research authority
 
@@ -121,6 +130,7 @@ Current foundation research:
 - plans/research/006-m005-mature-bouncer-and-control-session-research.md
 - plans/research/007-r001-owned-sam31-client-and-provider-scope.md
 - plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
+- plans/research/009-m008-m009-privacy-encryption-and-otr.md
 
 Important retained conclusions:
 
@@ -134,6 +144,9 @@ Important retained conclusions:
 - M006 treats no-CAP/no-SASL/plain IRC-over-I2P as first-class compatibility modes while keeping configured SASL fail-closed.
 - M006 promotes account-tag and invite-notify without fabricating live state; chghost and extended-monitor remain explicitly deferred.
 - M007 builds service authentication/recovery from constrained phased actions rather than NickServ prose parsing, and uses Eggchaos only as an external qualification substrate.
+- M008 selects optional whole-database SQLCipher so credentials, history and FTS terms are protected together; the Store consumes an injected key and does not own key-source policy.
+- M009 keeps OTR truly endpoint-to-endpoint: i2pr-irc never holds OTR private keys/fingerprints/session state or plaintext, and only qualifies transparent OTRv3 carriage/non-replay/history behavior.
+- OTRv4 is deferred to a future client/endpoint line; no native OTR library/unsafe FFI enters the bouncer.
 - Provider scope is per durable Network by default so unrelated IRC Networks do not silently share one I2P Destination; transient SAM identity survives IRC reconnects but not provider/router-session recreation or process restart.
 - Proposal 170 is not required for the IRC data path.
 - i2pr managed-app integration waits for public app-scoped I2P stream and local accepted-stream/listener capabilities; it must not import private router internals.
@@ -144,8 +157,16 @@ Implement only:
 
 - plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md
 
-Corrective 043 is the sole dependency-ready handoff. It replaces the scheduler-dependent post-attachment barrier in the known flaky m005g member-state test with a deterministic pre-attachment upstream ordering barrier.
+Corrective 043 remains the sole dependency-ready handoff. It replaces the scheduler-dependent post-attachment barrier in the known flaky m005g member-state test with a deterministic pre-attachment upstream ordering barrier.
 
-This is a verification-only corrective; M006, M007, Corrective 042, and R001 remain product closures. R002 remains independently blocked on upstream i2pr managed-app contracts.
+The privacy/encryption line is fully researched and registered but remains blocked in sequence:
 
-The privacy/encryption line is under active research and may register blocked successor plans, but none may become implementation-ready ahead of Corrective 043 closure.
+1. Plan 044 — SQLCipher/keyed-store foundation.
+2. Plan 045 — source-preserving encrypted migration/key rotation.
+3. Plan 046 — encrypted durable-state qualification and M008 closure.
+4. Plan 047 — OTRv3 opaque-carriage/multi-client invariants.
+5. Plan 048 — integrated OTR privacy qualification and M009 closure.
+
+Do not start Plan 044 before Corrective 043 closes.
+
+M006, M007, Corrective 042, and R001 remain product closures. R002 remains independently blocked on upstream i2pr managed-app contracts.
