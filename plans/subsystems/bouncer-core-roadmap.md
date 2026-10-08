@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: no active plan — M006, M007, and Corrective 042 are all closed
+Status: verification corrective active — Corrective 043 ready; product behavior remains closed through Corrective 042
 
 Long-term references:
 
@@ -25,6 +25,7 @@ Post-closure corrective authority:
 - plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md
 - plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md
 - plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md
+- plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md
 
 Pre-M003 gates:
 
@@ -847,3 +848,4 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M007-B / Plan 040 | closed | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md | plans/closure/bouncer-core/040-status.md | Plan 039 closed |
 | M007-C / Plan 041 | closed | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | plans/closure/bouncer-core/041-status.md | Plan 040 closure |
 | C042 / Corrective 042 | closed | plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md | plans/closure/bouncer-core/042-status.md | none |
+| C043 / Corrective 043 | ready | plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md | future plans/closure/bouncer-core/043-status.md | none; test-harness synchronization only |
