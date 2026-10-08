@@ -1,6 +1,6 @@
 # Bouncer Core M009-A / Plan 047 — OTRv3 Opaque-Carriage and Multi-Client Invariants
 
-Status: blocked
+Status: ready
 
 Hard dependency:
 

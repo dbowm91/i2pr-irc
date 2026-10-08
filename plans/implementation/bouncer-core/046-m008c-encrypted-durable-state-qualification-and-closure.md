@@ -1,6 +1,6 @@
 # Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure
 
-Status: active
+Status: closed
 
 Hard dependency:
 
