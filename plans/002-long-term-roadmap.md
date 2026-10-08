@@ -80,6 +80,8 @@ M009 — OTRv3 transparent-carriage compatibility:
 
 ADR-0006 is the encryption-layering authority. Database encryption is not described as E2EE, and OTR is not terminated in the bouncer.
 
+M008 and M009 are closed (Plans 044-048, plus post-M009 Corrective 049).
+
 ## Phase 6 — Portable SAM integration
 
 Production SAM 3.1-compatible stream provider, long-lived session ownership, I2P naming, router restart behavior, and one real mature-router application-byte qualification. The temporary in-repo SAM client is not required to repeat Java/i2pd/i2pr or mixed-router conformance; broad SAM portability belongs to the dedicated SAM library project. Proposal 170 is not required.

@@ -26,19 +26,18 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | post-M009 corrective active | plans/subsystems/bouncer-core-roadmap.md | Corrective 049 ready | M001-M009 remain historical product closures. Corrective 049 owns only the transient SAM conformance timeout investigation and stale registry/README/roadmap reconciliation. |
+| Bouncer core | post-M009 complete, no active plan | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | M001-M009 remain historical product closures; Corrective 049 closed the post-M009 SAM framing defect and the registry/README/roadmap reconciliation. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
-| Plan | Status | Class | Source | Closure/result |
-|---|---|---|---|---|
-| Bouncer Core Corrective 049 — Post-M009 Verification and Documentation Reconciliation | ready | verification reliability + planning/documentation reconciliation | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/049-status.md |
+No implementation plan is currently active or dependency-ready.
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core Corrective 049 — Post-M009 Verification and Documentation Reconciliation | closed | verification reliability + planning/documentation reconciliation | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/049-status.md |
 | Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure | closed | privacy qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/048-status.md |
 | Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | closed | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/042-status.md |
 | Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure | closed | security qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/046-status.md |
@@ -94,7 +93,7 @@ Canonical direction:
 
 ## Unplanned later milestones
 
-M008 and M009 are closed. Corrective 049 is the only active Bouncer Core handoff.
+M008 and M009 are closed. No Bouncer Core implementation plan is currently active or dependency-ready.
 
 Later product lines intentionally remain unplanned:
 
@@ -152,12 +151,6 @@ Important retained conclusions:
 
 ## Latest closure and handoff
 
-Implement only:
-
-- plans/implementation/bouncer-core/049-post-m009-verification-and-docs-corrective.md
-
-Corrective 049 is the sole dependency-ready handoff.
-
-It must first investigate the transient Rust 1.88 SAM fragmented-reply/SessionCreate timeout recorded by Plan 048 without weakening production timeouts or hiding the failure behind retries. It also reconciles the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
+Corrective 049 is closed; see `plans/closure/bouncer-core/049-status.md`. It fixed a real SAM client framing defect (a reply terminator split across TCP reads was dropped, stalling the phase to its deadline) and reconciled the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
 
 No successor feature milestone is registered yet. Standalone daemon/listener/bootstrap work remains the likely next productization line, but it requires its own research/planning gate. R002 remains independently blocked on upstream i2pr managed-app contracts.

@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: post-M009 corrective active — Corrective 049 ready
+Status: post-M009 complete — Corrective 049 closed; no registered successor plan
 
 Long-term references:
 
@@ -893,7 +893,7 @@ Architecture decisions requiring an ADR if encountered:
 
 ## 11. Completion definition
 
-This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed, and Corrective 042 closed the last open correctness and qualification gaps against them, so the post-M005 product-completeness track is fully evidence-closed. M008-M009 are now evidence-closed through Plans 044-048. Corrective 049 is the current post-M009 readiness authority for the transient SAM verification finding and planning/README reconciliation.
+This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed, and Corrective 042 closed the last open correctness and qualification gaps against them, so the post-M005 product-completeness track is fully evidence-closed. M008-M009 are now evidence-closed through Plans 044-048. Corrective 049 has closed the post-M009 SAM framing defect and the planning/README reconciliation, so no Bouncer Core plan is currently open; a successor must be registered explicitly before implementation begins. The obvious future productization line is standalone daemon/listener/bootstrap work, which remains unregistered until researched/planned. External real-client OTR qualification waits on that production listener. R002 remains separately blocked.
 
 ## 12. Milestone status
 
@@ -949,4 +949,4 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M009 | closed | Plans 047-048 | plans/closure/bouncer-core/048-status.md | Plans 047-048 closed |
 | M009-A / Plan 047 | closed | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md | plans/closure/bouncer-core/047-status.md | M008 closure |
 | M009-B / Plan 048 | closed | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md | plans/closure/bouncer-core/048-status.md | Plan 047 closure |
-| C049 / Corrective 049 | ready | plans/implementation/bouncer-core/049-post-m009-verification-and-docs-corrective.md | future plans/closure/bouncer-core/049-status.md | none; post-M009 verification/documentation corrective |
+| C049 / Corrective 049 | closed | plans/implementation/bouncer-core/049-post-m009-verification-and-docs-corrective.md | plans/closure/bouncer-core/049-status.md | none; post-M009 verification/documentation corrective |
