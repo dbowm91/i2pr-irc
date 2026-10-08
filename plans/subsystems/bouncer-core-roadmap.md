@@ -10,6 +10,7 @@ Long-term references:
 - plans/research/001-bouncer-and-i2p-foundation.md
 - plans/research/005-m004-anonymity-and-adverse-network-research.md
 - plans/research/006-m005-mature-bouncer-and-control-session-research.md
+- plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
 
 Related ADRs:
 
@@ -22,6 +23,7 @@ Post-closure corrective authority:
 - plans/subsystems/bouncer-core-m002-lifecycle-corrective-addendum.md
 - plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md
 - plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md
+- plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md
 
 Pre-M003 gates:
 
@@ -134,7 +136,9 @@ Canonical product/security direction remains unchanged: I2P-only upstream author
 
 Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. All nine are closed and M005 remains complete.
 
-Corrective 034 was a post-M005 maintenance corrective raised by Corrective 033's closure evidence, and is now closed; see `plans/closure/bouncer-core/034-status.md`. The repository declares Rust 1.88 as its MSRV, but the full Rust 1.88 verification had failed in pre-existing test-formatting code while current-toolchain verification and the SAM crate's Rust 1.88 checks passed. The cause was a lint-group change rather than a defect in the repository's intent: `clippy::uninlined_format_args` is a `style` lint (warn by default, so fatal under `-D warnings`) on 1.88.0 and a `pedantic` lint (allow by default) on 1.89 and later, and the workspace sets `clippy::all = "warn"`. The **MSRV toolchain was the strict one**, so the red floor was invisible to the toolchain this repository verifies with most often. Corrective 034 closed the finding with two behavior-neutral interpolated-format-argument rewrites, both in test code, with no lint suppression, no dependency change, no script change, and no production behavior change. The declared Rust 1.88 floor and current stable now both pass `scripts/verify.sh full` green from one tree.
+Corrective 034 was a post-M005 maintenance corrective raised by Corrective 033's closure evidence, and is now closed; see `plans/closure/bouncer-core/034-status.md`.
+
+Research 008 now opens the post-M005 product-completeness line. It couples M006 registration/capability downgrade with M007 identity/connectivity resilience because both operate in the same upstream generation state machine. The research also found a pre-existing MONITOR conformance defect in M005-C: the live reclaim path interprets 730/731 backwards relative to IRCv3. Corrective 035 is therefore the strict first gate before any M006/M007 implementation. The repository declares Rust 1.88 as its MSRV, but the full Rust 1.88 verification had failed in pre-existing test-formatting code while current-toolchain verification and the SAM crate's Rust 1.88 checks passed. The cause was a lint-group change rather than a defect in the repository's intent: `clippy::uninlined_format_args` is a `style` lint (warn by default, so fatal under `-D warnings`) on 1.88.0 and a `pedantic` lint (allow by default) on 1.89 and later, and the workspace sets `clippy::all = "warn"`. The **MSRV toolchain was the strict one**, so the red floor was invisible to the toolchain this repository verifies with most often. Corrective 034 closed the finding with two behavior-neutral interpolated-format-argument rewrites, both in test code, with no lint suppression, no dependency change, no script change, and no production behavior change. The declared Rust 1.88 floor and current stable now both pass `scripts/verify.sh full` green from one tree.
 
 ## 5. Target architecture
 
@@ -584,6 +588,103 @@ Deferred:
 - generic port/TLS/clearnet semantics in bouncer-network attributes;
 - router-specific code.
 
+### M006 — IRC interoperability and capability downgrade
+
+Class: protocol compatibility + capability
+
+Objective:
+
+Make the bouncer robust against the actual range of IRC servers found inside I2P: modern IRCv3, partial IRCv3, and older servers with no CAP, no SASL, and no TLS assumption.
+
+Dependencies:
+
+- M005 closed;
+- Corrective 035 closed.
+
+Research authority:
+
+- plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
+
+Accepted deliverables:
+
+- explicit no-CAP registration completion rather than timing out after a valid 001;
+- configured-SASL remains fail-closed, while no-SASL configuration remains a first-class supported mode;
+- bare sasl capability values are handled according to IRCv3 SASL 3.2;
+- optional capability rejection cannot accidentally turn into authentication failure;
+- plain IRC directly over the I2P byte stream remains canonical and requires no TLS layer;
+- account-tag is mediated from observed upstream tags without synthesis;
+- invite-notify is mediated per downstream session;
+- chghost and extended-monitor remain explicitly deferred until their legacy/multi-client projection and privacy semantics are designed;
+- simultaneous legacy and modern downstream clients remain truthful under one fixed upstream capability policy.
+
+Implementation decomposition:
+
+1. Corrective 035 — MONITOR numeric conformance. **Ready**.
+2. M006-A / Plan 036 — registration downgrade and legacy-server baseline. **Blocked on 035**.
+3. M006-B / Plan 037 — account-tag and invite-notify mediation. **Blocked on 036**.
+4. M006-C / Plan 038 — integrated IRC interoperability qualification and M006 closure. **Blocked on 037**.
+
+Exit:
+
+Legacy/no-CAP/no-SASL and modern IRCv3 server profiles are all usable under deterministic qualification, configured SASL never silently downgrades, and no unsupported capability is advertised.
+
+Deferred beyond M006:
+
+- chghost compatibility synthesis;
+- downstream extended-monitor broker;
+- TLS-over-I2P;
+- additional SASL mechanisms.
+
+### M007 — Identity and connectivity resilience
+
+Class: capability + resilience qualification
+
+Objective:
+
+Make long-running bouncer identity stable under collisions, split-like disconnect/reconnect churn, non-SASL services authentication, and simultaneous local clients.
+
+Dependencies:
+
+- M006 closed.
+
+Research authority:
+
+- plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
+
+Accepted deliverables:
+
+- phased constrained service actions for pre-join authentication and fallback-nick recovery without parsing NickServ prose;
+- existing registration actions migrate to their historical post-join semantics;
+- transient nickname collisions no longer permanently terminal the Network after the bounded fallback sequence is exhausted;
+- online reclaim refusals back off without tearing down a healthy generation;
+- explicit local NICK does not fight the keep-nick policy during the same generation;
+- a local client configured with the preferred nick can attach truthfully while the upstream Network temporarily holds a generated fallback nick;
+- all healthy simultaneous clients converge on the one observed upstream nick;
+- no human-readable netsplit parsing;
+- deterministic in-process fault tests plus external Eggchaos socket/process qualification;
+- no ambiguous user traffic replay under long stalls, blackholes, disconnects, or reconnect storms.
+
+Implementation decomposition:
+
+1. M007-A / Plan 039 — phased service actions for non-SASL authentication and recovery. **Blocked on M006 closure**.
+2. M007-B / Plan 040 — preferred-nick, reconnect, and multi-client identity resilience. **Blocked on 039**.
+3. M007-C / Plan 041 — Eggchaos multi-client adverse qualification and M007 closure. **Blocked on 040**.
+
+Eggchaos is an external qualification tool only. It is not a production/Cargo dependency and its Rust 1.89+ toolchain requirement does not change this repository's Rust 1.88 floor.
+
+Exit:
+
+A Network survives realistic degraded connectivity and nickname/service churn without identity lies, tight reclaim loops, permanent transient-collision failure, cross-session disagreement, or replay of ambiguous user messages.
+
+Deferred beyond M007:
+
+- OTR/end-to-end encrypted conversation semantics;
+- encrypted database/history;
+- credential-vault redesign;
+- generic ZNC/plugin ABI;
+- service-text heuristics;
+- multi-user hosting.
+
 ## 8. Cross-cutting requirements
 
 ### Storage and migration
@@ -687,7 +788,7 @@ Architecture decisions requiring an ADR if encountered:
 
 ## 11. Completion definition
 
-This roadmap is complete when M001-M005 are evidence-closed and the core is a durable, multi-network, multi-client, modern IRC/IRCv3 bouncer qualified under deterministic adverse-network/anonymity tests without any router-specific dependency or generic upstream clearnet path.
+This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path.
 
 ## 12. Milestone status
 
@@ -725,3 +826,12 @@ This roadmap is complete when M001-M005 are evidence-closed and the core is a du
 | M005-H / Plan 027 | closed | plans/implementation/bouncer-core/027-m005h-operator-diagnostics-config-and-registration-actions.md | plans/closure/bouncer-core/027-status.md | Plan 026 closure |
 | M005-I / Plan 028 | closed | plans/implementation/bouncer-core/028-m005i-integrated-mature-bouncer-qualification-and-closure.md | plans/closure/bouncer-core/028-status.md | Plan 027 closure |
 | C034 / Corrective 034 | closed | plans/implementation/bouncer-core/034-rust-1-88-verification-corrective.md | plans/closure/bouncer-core/034-status.md | none; maintenance-only MSRV verification repair |
+| C035 / Corrective 035 | ready | plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md | future plans/closure/bouncer-core/035-status.md | none |
+| M006 | planned / gated | Plans 036-038 | future plans/closure/bouncer-core/038-status.md | Corrective 035 closure |
+| M006-A / Plan 036 | blocked | plans/implementation/bouncer-core/036-m006a-registration-downgrade-and-legacy-server-baseline.md | future plans/closure/bouncer-core/036-status.md | Corrective 035 closure |
+| M006-B / Plan 037 | blocked | plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md | future plans/closure/bouncer-core/037-status.md | Plan 036 closure |
+| M006-C / Plan 038 | blocked | plans/implementation/bouncer-core/038-m006c-integrated-irc-interoperability-qualification-and-closure.md | future plans/closure/bouncer-core/038-status.md | Plan 037 closure |
+| M007 | planned / gated | Plans 039-041 | future plans/closure/bouncer-core/041-status.md | M006 closure |
+| M007-A / Plan 039 | blocked | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md | future plans/closure/bouncer-core/039-status.md | Plan 038 closure |
+| M007-B / Plan 040 | blocked | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md | future plans/closure/bouncer-core/040-status.md | Plan 039 closure |
+| M007-C / Plan 041 | blocked | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | future plans/closure/bouncer-core/041-status.md | Plan 040 closure |
