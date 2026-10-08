@@ -54,7 +54,31 @@ M007 — identity and connectivity resilience:
 - simultaneous-client nick consistency;
 - deterministic adverse-network qualification, including external Eggchaos process/socket campaigns.
 
-OTR/E2EE, encrypted local storage, and broader privacy-at-rest work are intentionally separate later milestones.
+M006 and M007 are now historically closed.
+
+## Post-M007 privacy track — M008/M009
+
+This track is independent of the blocked i2pr managed-app work.
+
+M008 — encrypted durable state:
+
+- SQLCipher whole-database encryption as an explicit option;
+- injected process-level store key rather than a key derived from downstream login;
+- encrypted credentials, service-action payloads, history and FTS index together;
+- source-preserving plaintext-to-encrypted migration;
+- source-preserving key rotation;
+- wrong-key fail-closed behavior and platform/MSRV qualification.
+
+M009 — OTRv3 transparent-carriage compatibility:
+
+- OTR remains endpoint-to-endpoint between IRC clients;
+- the bouncer carries opaque OTR query/AKE/data/fragment payloads without decrypting or owning crypto state;
+- simultaneous bouncer clients do not share bouncer-side OTR state;
+- OTR-bearing chat remains non-replayable across ambiguous disconnects;
+- retained history contains ciphertext only;
+- OTRv4 and built-in-client crypto remain later endpoint work.
+
+ADR-0006 is the encryption-layering authority. Database encryption is not described as E2EE, and OTR is not terminated in the bouncer.
 
 ## Phase 6 — Portable SAM integration
 
