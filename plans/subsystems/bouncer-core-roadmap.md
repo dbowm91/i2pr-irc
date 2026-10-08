@@ -11,12 +11,14 @@ Long-term references:
 - plans/research/005-m004-anonymity-and-adverse-network-research.md
 - plans/research/006-m005-mature-bouncer-and-control-session-research.md
 - plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
+- plans/research/009-m008-m009-privacy-encryption-and-otr.md
 
 Related ADRs:
 
 - plans/adrs/ADR-0001-i2p-only-upstream-and-router-adapter-boundary.md
 - plans/adrs/ADR-0002-bounded-sqlite-persistence-history-order-and-session-identity.md
 - plans/adrs/ADR-0003-process-runtime-control-and-pre-bind-downstream-admission.md
+- plans/adrs/ADR-0006-encryption-layering-store-key-and-otr-endpoint.md
 
 Post-closure corrective authority:
 
@@ -697,6 +699,98 @@ Deferred beyond M007:
 - service-text heuristics;
 - multi-user hosting.
 
+### M008 — Encrypted durable state
+
+Class: security infrastructure + persistence qualification
+
+Objective:
+
+Offer whole-database encryption at rest without breaking the existing single-worker SQLite/FTS model or tying bouncer availability to an attached downstream client.
+
+Research/architecture authority:
+
+- plans/research/009-m008-m009-privacy-encryption-and-otr.md
+- plans/adrs/ADR-0006-encryption-layering-store-key-and-otr-endpoint.md
+
+Dependencies:
+
+- Corrective 043 closed.
+
+Accepted direction:
+
+- SQLCipher whole-database encryption rather than field-level history/credential encryption;
+- explicit plaintext versus encrypted Store-open policy;
+- injected high-entropy StoreKey; crates/store does not discover keys;
+- keyed validation before any schema read/migration;
+- existing FTS5/search semantics after unlock;
+- source-preserving plaintext-to-encrypted migration and key rotation;
+- no claim against a compromised live process;
+- no key source tied to downstream IRC login.
+
+Implementation decomposition:
+
+1. M008-A / Plan 044 — SQLCipher and keyed-store foundation. **Blocked on Corrective 043**.
+2. M008-B / Plan 045 — encrypted store migration and key rotation. **Blocked on Plan 044**.
+3. M008-C / Plan 046 — encrypted durable-state qualification and M008 closure. **Blocked on Plan 045**.
+
+Exit:
+
+Encrypted mode protects credentials, registration actions, history and FTS terms in closed durable files under one injected store key; wrong-key open fails closed; migration/rekey is recoverable; plaintext mode remains explicit; current and Rust 1.88/platform verification is green.
+
+Deferred beyond M008:
+
+- executable-specific environment/file/keyring/HSM key provisioning;
+- per-network/per-user databases;
+- searchable field encryption;
+- secure physical-erasure claims.
+
+### M009 — OTRv3 transparent-carriage compatibility
+
+Class: privacy invariant + protocol qualification
+
+Objective:
+
+Ensure client-to-client OTRv3 remains genuinely end-to-end across the bouncer by keeping OTR cryptography at IRC endpoints and making i2pr-irc a byte-faithful opaque transport/history layer.
+
+Research/architecture authority:
+
+- plans/research/009-m008-m009-privacy-encryption-and-otr.md
+- plans/adrs/ADR-0006-encryption-layering-store-key-and-otr-endpoint.md
+
+Dependencies:
+
+- M008 closed.
+
+Accepted direction:
+
+- no bouncer-held OTR keys, fingerprints, SMP/session state or plaintext;
+- no libotr/libotr-ng production dependency or unsafe FFI;
+- OTR query/AKE/data/fragment/whitespace transport remains opaque;
+- generic IRC parser/mediation preserves meaningful trailing-body bytes;
+- simultaneous clients receive ordinary IRC fanout; the bouncer does not route by OTR instance tag;
+- OTR-bearing user chat remains NonReplayable across ambiguous disconnects;
+- retained history contains ciphertext only;
+- OTRv4 remains deferred as a client/endpoint concern.
+
+Implementation decomposition:
+
+1. M009-A / Plan 047 — OTRv3 opaque-carriage and multi-client invariants. **Blocked on M008 closure**.
+2. M009-B / Plan 048 — integrated OTR privacy qualification and M009 closure. **Blocked on Plan 047**.
+
+Exit:
+
+Representative OTRv3 transport survives parse/mediation/history paths byte-exactly, no cryptographic state enters the bouncer, disconnect semantics remain non-replayable, and documentation accurately claims transparent compatibility rather than bouncer-side encryption.
+
+External real-client/libotr interoperability remains a later standalone-listener qualification because no production downstream socket listener exists yet.
+
+Deferred beyond M009:
+
+- OTRv4;
+- group-chat E2EE;
+- Signal/OMEMO;
+- per-buffer no-history retention policy;
+- built-in client cryptographic endpoint implementation.
+
 ## 8. Cross-cutting requirements
 
 ### Storage and migration
@@ -800,7 +894,7 @@ Architecture decisions requiring an ADR if encountered:
 
 ## 11. Completion definition
 
-This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed, and Corrective 042 closed the last open correctness and qualification gaps against them, so the post-M005 product-completeness track is fully evidence-closed.
+This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed, and Corrective 042 closed the last open correctness and qualification gaps against them, so the post-M005 product-completeness track is fully evidence-closed. The next independent privacy track is M008-M009, gated first by verification-only Corrective 043 and then sequenced through Plans 044-048.
 
 ## 12. Milestone status
 
@@ -849,3 +943,10 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M007-C / Plan 041 | closed | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | plans/closure/bouncer-core/041-status.md | Plan 040 closure |
 | C042 / Corrective 042 | closed | plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md | plans/closure/bouncer-core/042-status.md | none |
 | C043 / Corrective 043 | ready | plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md | future plans/closure/bouncer-core/043-status.md | none; test-harness synchronization only |
+| M008 | planned / gated | Plans 044-046 | future plans/closure/bouncer-core/046-status.md | Corrective 043 closure |
+| M008-A / Plan 044 | blocked | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md | future plans/closure/bouncer-core/044-status.md | Corrective 043 closure |
+| M008-B / Plan 045 | blocked | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md | future plans/closure/bouncer-core/045-status.md | Plan 044 closure |
+| M008-C / Plan 046 | blocked | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md | future plans/closure/bouncer-core/046-status.md | Plan 045 closure |
+| M009 | planned / gated | Plans 047-048 | future plans/closure/bouncer-core/048-status.md | M008 closure |
+| M009-A / Plan 047 | blocked | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md | future plans/closure/bouncer-core/047-status.md | Plan 046 / M008 closure |
+| M009-B / Plan 048 | blocked | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md | future plans/closure/bouncer-core/048-status.md | Plan 047 closure |
