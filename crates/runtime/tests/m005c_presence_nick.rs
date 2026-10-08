@@ -1088,7 +1088,7 @@ async fn monitor_evidence_reclaims_the_preferred_nick() {
     // is due immediately rather than at the end of the schedule.
     harness
         .upstream(0)
-        .write_all(b":srv 730 bot :bot\r\n")
+        .write_all(b":srv 731 bot :bot\r\n")
         .await
         .expect("server reports the nick free");
     let seen = read_until(harness.upstream(0), b"NICK bot\r\n").await;
@@ -1108,6 +1108,36 @@ async fn monitor_evidence_reclaims_the_preferred_nick() {
     assert!(
         !after.contains("NICK bot"),
         "having reclaimed it, the bouncer stops asking: {after}"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn monitor_online_is_not_free_evidence_and_offline_lists_match_by_nick() {
+    let (mut harness, _) = Harness::build(&[], Policy::KEEP_NICK, "MONITOR=4").await;
+    register_under_collision(&mut harness).await;
+    read_until(harness.upstream(0), b"MONITOR + bot\r\n").await;
+
+    harness
+        .upstream(0)
+        .write_all(b":srv 730 bot :bot!user@host\r\n")
+        .await
+        .expect("server reports preferred nick online");
+    let online = drain(harness.upstream(0), Duration::from_millis(300)).await;
+    assert!(
+        !online.contains("NICK bot"),
+        "730 online evidence must not trigger a reclaim: {online}"
+    );
+
+    harness
+        .upstream(0)
+        .write_all(b":srv 731 bot :other,bot\r\n")
+        .await
+        .expect("server reports a comma-separated offline list");
+    let offline = read_until(harness.upstream(0), b"NICK bot\r\n").await;
+    assert!(
+        offline.contains("NICK bot"),
+        "731 offline lists containing the preferred nick trigger reclaim: {offline}"
     );
     harness.shutdown().await;
 }
@@ -1154,7 +1184,7 @@ async fn a_replaced_generations_reclaim_state_cannot_act_on_its_replacement() {
     // and the loser would be whichever connection the server answered first.
     harness
         .upstream(0)
-        .write_all(b":srv 730 bot :bot\r\n")
+        .write_all(b":srv 731 bot :bot\r\n")
         .await
         .expect("server reports the nick free");
     let seen = drain(harness.upstream(0), Duration::from_millis(500)).await;

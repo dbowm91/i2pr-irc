@@ -3147,11 +3147,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     ///
     /// * `303` (RPL_ISON) lists the nicks that are **online**, so the preferred one being
     ///   *absent* from the answer is the evidence that it is free.
-    /// * `730` (RPL_MONITOROFFLINE) names the nick that just went **offline**, so the
+    /// * `731` (RPL_MONOFFLINE) names the nick that just went **offline**, so the
     ///   preferred one being *named* is the evidence that it is free.
     ///
     /// Only those two commands are evidence at all. Every other line -- including a
-    /// `731` reporting the preferred nick on-line -- is recorded as nothing rather than
+    /// `730` reporting the preferred nick on-line -- is recorded as nothing rather than
     /// as negative evidence that would suppress a future write.
     ///
     /// Accepted evidence wakes the reclaim clock rather than waiting out the interval. A
@@ -3170,9 +3170,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         };
         // Both replies are addressed to the bouncer, so the nick list starts after the
         // recipient parameter.
-        let offline = if message.command.eq_ignore_ascii_case(b"730") {
+        let offline = if message.command.eq_ignore_ascii_case(b"731") {
             Some(true)
-        } else if message.command.eq_ignore_ascii_case(b"303") {
+        } else if message.command.eq_ignore_ascii_case(b"730")
+            || message.command.eq_ignore_ascii_case(b"303")
+        {
             Some(false)
         } else {
             None
@@ -3180,18 +3182,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let Some(offline) = offline else {
             return;
         };
-        let listed: Vec<String> = message
-            .params
-            .iter()
-            .skip(1)
-            .map(|param| String::from_utf8_lossy(param).into_owned())
-            .collect();
-        if listed.is_empty() {
-            return;
-        }
-        let preferred_listed = listed
-            .iter()
-            .any(|nick| state.same_nick(nick, &attempt.preferred));
+        let preferred_listed = message.params.iter().skip(1).any(|param| {
+            String::from_utf8_lossy(param).split(',').any(|target| {
+                let nick = if message.command.eq_ignore_ascii_case(b"730") {
+                    target.split_once('!').map_or(target, |(nick, _)| nick)
+                } else {
+                    target
+                };
+                state.same_nick(nick, &attempt.preferred)
+            })
+        });
         let free = if offline {
             preferred_listed
         } else {

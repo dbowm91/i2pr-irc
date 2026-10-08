@@ -77,10 +77,11 @@ The clock is a generation-owned `tokio::time::interval` and nothing else moves i
 
 Evidence moves the *timing* of a write, never its permission. Accepted evidence wakes the reclaim select arm through a generation-local `Notify`, so a server that has just told the bouncer the preferred nick came free is not made to wait out the interval:
 
-- `730` (RPL_MONITOROFFLINE) names the nick that went **offline**, so the preferred one being *named* is the evidence;
+- `731` (RPL_MONOFFLINE) names the nick that went **offline**, so the preferred one being *named* is the evidence;
+- `730` (RPL_MONONLINE) reports nicks that are **online**, so it is never free evidence;
 - `303` (RPL_ISON) lists nicks that are **online**, so the preferred one being *absent* is the evidence.
 
-Reading both as an online list would make a nick coming free look like a reason to keep waiting for it. Every other line — including a `731` reporting the preferred nick on-line — is recorded as nothing rather than as negative evidence that would suppress a future write.
+MONITOR target lists are comma-separated; the parser compares nicknames using the current casemapping and ignores the optional `!user@host` suffix on 730 targets. Every other line is recorded as nothing rather than as negative evidence that would suppress a future write.
 
 A `NICK <preferred>` is a request. Only the server's own frame confirms it, so the bouncer never treats its own write as success.
 
