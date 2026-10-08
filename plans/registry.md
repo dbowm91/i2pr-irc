@@ -26,24 +26,25 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | closed through M007 | plans/subsystems/bouncer-core-roadmap.md | M007 complete | Corrective 035 and Plans 036-041 closed; M006 and M007 complete. M005 and Corrective 034 remain closed. |
-| I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Research 008 delegates broad Java/i2pd/i2pr and mixed-router SAM conformance to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
+| Bouncer core | corrective active | plans/subsystems/bouncer-core-roadmap.md | Corrective 042 ready | M006 and M007 remain historically closed. Corrective 042 is the strict current readiness authority for remaining MONITOR event semantics, MONITOR ISUPPORT interpretation, destructive Eggchaos product-path evidence, and planning reconciliation. |
+| I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core Corrective 035 — MONITOR Numeric Conformance | closed | protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
-| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | closed | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/036-status.md |
-| Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | closed | IRCv3 capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/037-status.md |
-| Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | closed | qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/038-status.md |
-| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | closed | identity state machine + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/040-status.md |
-| Bouncer Core M007-C / Plan 041 — Eggchaos Multi-Client Adverse Qualification and M007 Closure | closed | external qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/041-status.md |
+| Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | ready | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/042-status.md |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M007-C / Plan 041 — Eggchaos Multi-Client Adverse Qualification and M007 Closure | closed | external qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/041-status.md |
+| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | closed | identity state machine + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/040-status.md |
+| Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | closed | IRCv3 capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/037-status.md |
+| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | closed | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/036-status.md |
+| Bouncer Core Corrective 035 — MONITOR Numeric Conformance | historical closure | protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
+
 | Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery | closed | durable policy + security | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/039-status.md |
 | Bouncer Core Corrective 034 — Restore Rust 1.88 Repository Verification | closed | verification + maintenance corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/034-status.md |
 | Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | closed | qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/038-status.md |
@@ -140,14 +141,8 @@ Important retained conclusions:
 
 Implement only:
 
-- plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md
+- plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md
 
-Plans 035-041 are closed in the registered sequence. Corrective 035 establishes that 730 is
-online, 731 is offline/free, and 303 ISON remains the fallback probe. M006 and M007 are now
-complete; see their plan closure records and the bouncer-core roadmap.
+Corrective 042 is the sole dependency-ready handoff. It fixes the remaining MONITOR event/snapshot distinction, accepts standards-compliant bare and positive-limit MONITOR support for the one-target keep-nick watch, strengthens disruptive Eggchaos qualification through the real SamProvider path, and reconciles stale planning metadata.
 
-R001 is closed for this repository on the existing real i2pd product-path evidence. R002
-remains independently blocked on upstream i2pr managed-app contracts. No later bouncer-core
-plan is dependency-ready: privacy/encryption, standalone listener, and related work remain
-intentionally unplanned pending their own research/product gates. Privacy/encryption work is
-intentionally a later separate line.
+M006 and M007 remain historical closures; Corrective 042 supersedes only the affected readiness claims. R001 remains closed for this repository. R002 remains independently blocked on upstream i2pr managed-app contracts. Privacy/encryption and standalone-daemon work remain intentionally unplanned pending their own research gates.
