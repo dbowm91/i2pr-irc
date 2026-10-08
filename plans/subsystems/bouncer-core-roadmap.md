@@ -668,7 +668,7 @@ Implementation decomposition:
 
 1. M007-A / Plan 039 — phased service actions for non-SASL authentication and recovery. **Closed**.
 2. M007-B / Plan 040 — preferred-nick, reconnect, and multi-client identity resilience. **Closed**.
-3. M007-C / Plan 041 — Eggchaos multi-client adverse qualification and M007 closure. **Active**.
+3. M007-C / Plan 041 — Eggchaos multi-client adverse qualification and M007 closure. **Closed**.
 
 Eggchaos is an external qualification tool only. It is not a production/Cargo dependency and its Rust 1.89+ toolchain requirement does not change this repository's Rust 1.88 floor.
 
@@ -831,7 +831,7 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M006-A / Plan 036 | closed | plans/implementation/bouncer-core/036-m006a-registration-downgrade-and-legacy-server-baseline.md | plans/closure/bouncer-core/036-status.md | Corrective 035 closure |
 | M006-B / Plan 037 | closed | plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md | plans/closure/bouncer-core/037-status.md | Plan 036 closure |
 | M006-C / Plan 038 | closed | plans/implementation/bouncer-core/038-m006c-integrated-irc-interoperability-qualification-and-closure.md | plans/closure/bouncer-core/038-status.md | Plan 037 closure |
-| M007 | active | Plans 039-041 | future plans/closure/bouncer-core/041-status.md | Plans 039-040 closed; Plan 041 active |
+| M007 | closed | Plans 039-041 | plans/closure/bouncer-core/041-status.md | Plans 039-041 closed; M007 complete |
 | M007-A / Plan 039 | closed | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md | plans/closure/bouncer-core/039-status.md | M006 closed by Plan 038 |
 | M007-B / Plan 040 | closed | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md | plans/closure/bouncer-core/040-status.md | Plan 039 closed |
-| M007-C / Plan 041 | active | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | future plans/closure/bouncer-core/041-status.md | Plan 040 closure |
+| M007-C / Plan 041 | closed | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | plans/closure/bouncer-core/041-status.md | Plan 040 closure |
