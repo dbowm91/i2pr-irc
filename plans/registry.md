@@ -31,8 +31,9 @@ Canonical direction:
 
 ## Active and dependency-ready implementation plans
 
-None. No plan is open on this control surface; a successor must be registered here
-before implementation begins.
+| Plan | Status | Class | Source | Closure/result |
+|---|---|---|---|---|
+| Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization | ready | verification/test-harness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/043-status.md |
 
 ## Recently closed implementation plans
 
@@ -139,10 +140,12 @@ Important retained conclusions:
 
 ## Latest closure and handoff
 
-There is no active handoff. The most recent closure is:
+Implement only:
 
-- plans/closure/bouncer-core/042-status.md — Corrective 042
+- plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md
 
-Corrective 042 fixed the MONITOR event/snapshot distinction (a `730` RPL_MONONLINE event no longer implies anything about a nick it did not name), accepted standards-compliant bare and positive-limit `MONITOR` for the one-target keep-nick watch, and replaced the generic echo-peer destructive evidence with product-path Eggchaos scenarios running the real `SamProvider`.
+Corrective 043 is the sole dependency-ready handoff. It replaces the scheduler-dependent post-attachment barrier in the known flaky m005g member-state test with a deterministic pre-attachment upstream ordering barrier.
 
-M006 and M007 remain historical closures; Corrective 042 supersedes only the affected readiness claims. R001 remains closed for this repository. R002 remains independently blocked on upstream i2pr managed-app contracts. Privacy/encryption and standalone-daemon work remain intentionally unplanned pending their own research gates.
+This is a verification-only corrective; M006, M007, Corrective 042, and R001 remain product closures. R002 remains independently blocked on upstream i2pr managed-app contracts.
+
+The privacy/encryption line is under active research and may register blocked successor plans, but none may become implementation-ready ahead of Corrective 043 closure.
