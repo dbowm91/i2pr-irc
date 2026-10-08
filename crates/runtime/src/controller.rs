@@ -994,7 +994,7 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                             .keys()
                             .filter_map(|network| self.project_one(*network, &inputs))
                             .collect();
-                        projected.sort_by(|left, right| left.network.cmp(&right.network));
+                        projected.sort_by_key(|left| left.network);
                         process.networks = projected;
                         Ok(process)
                     }

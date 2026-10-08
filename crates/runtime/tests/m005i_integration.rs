@@ -216,7 +216,7 @@ impl Runtime {
                     .expect("upstream acks");
             }
         }
-        let mut frames = vec![format!(":srv 005 bot CHANTYPES=# NETWORK=i2p")];
+        let mut frames = vec![":srv 005 bot CHANTYPES=# NETWORK=i2p".to_owned()];
         for channel in channels {
             frames.push(format!(":bot!u@h JOIN {channel}"));
             frames.push(format!(":srv 353 bot = {channel} :bot"));
@@ -318,14 +318,12 @@ impl Client {
             let mut chunk = [0u8; 1024];
             let count = tokio::time::timeout_at(deadline, self.end.read(&mut chunk))
                 .await
-                .unwrap_or_else(|_| {
-                    panic!("timed out waiting for {needle:?}; saw {:?}", &self.seen)
-                })
+                .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}; saw {:?}", self.seen))
                 .expect("the client stream does not fail");
             assert!(
                 count > 0,
                 "client closed waiting for {needle:?}; saw {:?}",
-                &self.seen
+                self.seen
             );
             self.seen
                 .push_str(&String::from_utf8_lossy(&chunk[..count]));

@@ -63,7 +63,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err("a hex payload must have an even length".to_string());
     }
     (0..text.len())

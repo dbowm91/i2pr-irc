@@ -199,7 +199,7 @@ fn valid_destination(value: &str) -> bool {
     // actually block-aligned. An unpadded token is also legal, which is why alignment
     // is only demanded when padding is present.
     padding <= 2
-        && (padding == 0 || value.len() % 4 == 0)
+        && (padding == 0 || value.len().is_multiple_of(4))
         && body
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'~' | b'+' | b'/'))
