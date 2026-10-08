@@ -110,6 +110,14 @@ pub struct Script {
     /// Forces the client's partial-read path to reassemble, which a loopback socket that
     /// delivers whole writes would otherwise never exercise.
     pub fragment: bool,
+    /// Write each reply in two writes split between its trailing CR and LF, pausing
+    /// briefly between them.
+    ///
+    /// A deterministic read-boundary regression for Corrective 049: unlike `fragment`,
+    /// which splits everywhere probabilistically, this pins the one boundary that
+    /// once dropped the whole reply — a terminator straddling two TCP segments.
+    /// Mutually exclusive with `fragment`; `fragment` wins when both are set.
+    pub split_crlf: bool,
 }
 
 impl Script {
@@ -260,6 +268,7 @@ async fn serve(
     refused: Arc<AtomicUsize>,
 ) {
     let fragment = script.fragment;
+    let split_crlf = script.split_crlf && !script.fragment;
     let close_after = script.close_after;
     let close_after_session = script.close_after_session;
     let trailing = script.trailing;
@@ -319,6 +328,21 @@ async fn serve(
                         if socket.write_all(&[byte]).await.is_err() {
                             return;
                         }
+                    }
+                } else if split_crlf && reply.len() >= 2 && reply.ends_with(b"\r\n") {
+                    // A deterministic read-boundary split: the first write ends after
+                    // the CR and a short pause makes it unlikely the two writes
+                    // coalesce into one segment before the client reads. The
+                    // regression this pins is a reply whose terminator straddles the
+                    // boundary (Corrective 049).
+                    let head = reply.len() - 1;
+                    if socket.write_all(&reply[..head]).await.is_err() {
+                        return;
+                    }
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(SPLIT_PAUSE).await;
+                    if socket.write_all(&reply[head..]).await.is_err() {
+                        return;
                     }
                 } else if socket.write_all(&reply).await.is_err() {
                     return;
@@ -634,6 +658,13 @@ impl FakeIrcPeer {
 
 /// How long one pass of [`FakeIrcPeer::recv`] waits on a single stream before moving on.
 const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Pause between the two writes of a [`Script::split_crlf`] reply.
+///
+/// Long enough that the client's first read returns the head before the tail is sent,
+/// so the CR/LF boundary is genuinely split across reads; short enough to keep the
+/// suite fast. Test-only.
+const SPLIT_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 // ------------------------------------------------- the inbound (ACCEPT) side
 

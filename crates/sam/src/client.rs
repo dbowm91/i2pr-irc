@@ -224,11 +224,12 @@ pub struct SamClient {
     state: SamState,
     reader: LineReader,
     stream: TcpStream,
-    /// Bytes read from the socket that the reader has not yet turned into a line.
+    /// Bytes read from the socket but not yet fed to the reader.
     ///
-    /// Held here rather than inside the reader because the reader cannot know when a
-    /// complete line ends in the middle of a chunk: two replies in one TCP segment is
-    /// normal, and the second one must survive to the next read.
+    /// Only ever holds bytes the reader has not seen: the reader itself retains a
+    /// partial line across feeds, so nothing here is a copy of reader state. Two
+    /// replies in one TCP segment are handled because the reader yields every line
+    /// a chunk completes and the surplus lines wait in `ready`.
     pending: Vec<u8>,
     /// Complete lines already read but not yet consumed, each with the byte offset at
     /// which it ended.
@@ -441,6 +442,11 @@ impl SamClient {
     ///
     /// The reader owns the partial-line buffer, so a `STREAM STATUS` split across two
     /// TCP segments is reassembled here rather than being lost at a read boundary.
+    /// Each socket byte is fed to the reader exactly once: the reader retains its
+    /// partial line — including a trailing carriage return held back pending the
+    /// line feed — across calls, and taking it back out for re-feeding would both
+    /// double-count framing offsets and turn a `CRLF` split across two reads into a
+    /// refused line (Corrective 049).
     async fn next_line(&mut self, phase: SamPhase) -> Result<Option<String>, SamError> {
         loop {
             // Anything the previous chunk already completed is served first, before
@@ -452,9 +458,11 @@ impl SamClient {
             let chunk = std::mem::take(&mut self.pending);
             // Recorded before parsing, so the offset a completed line reports lines up
             // with what was fed. `drain_to` then removes exactly the consumed prefix.
+            // This is the only feed point: `chunk` holds bytes read from the socket
+            // since the last feed, and the reader keeps whatever partial line they
+            // extend to. Nothing is taken back out of the reader.
             self.inflight.extend(chunk.iter().copied());
             let produced = self.reader.push(&chunk);
-            self.pending = self.reader.take_partial();
             for line in produced {
                 if let SamLine::Complete { text, end } = line {
                     self.ready.push_back((text.to_string(), end));

@@ -163,6 +163,32 @@ async fn a_fragmented_reply_produces_the_same_result() {
     wait_for_requests(&bridge, 3).await;
 }
 
+/// A terminator split across two reads must still reassemble to the same result.
+///
+/// Deterministic regression for Corrective 049: the bridge answers every reply in
+/// two writes split between the trailing CR and LF, so the client's line reader
+/// always observes the boundary the byte-at-a-time case only hits probabilistically.
+/// A prior framing defect took the reader's partial line back out for re-feeding on
+/// every loop; the re-fed bytes arrived while the held-back CR was still pending,
+/// so the CR was baked into the line as content, the line was refused as embedded
+/// control, and the phase stalled out to its full deadline.
+#[tokio::test]
+async fn a_crlf_split_across_reads_produces_the_same_result() {
+    let bridge = FakeBridge::start(Script {
+        // One connection: `SamClient` speaks hello, session, and stream on the same socket.
+        hello: vec![hello_ok()],
+        session: vec![session_ok_with_destination()],
+        stream: vec![stream_ok()],
+        split_crlf: true,
+        ..Script::default()
+    })
+    .await;
+    open_stream(&bridge, SamTimeouts::default())
+        .await
+        .expect("a CR/LF-split exchange reassembles to the same result");
+    wait_for_requests(&bridge, 3).await;
+}
+
 /// Two replies in one segment must both be seen.
 #[tokio::test]
 async fn two_replies_in_one_segment_are_both_read() {
