@@ -10,6 +10,7 @@
 //! fresh supervisors and reconciles stored intent.
 mod encryption;
 pub mod error;
+mod migration;
 pub mod model;
 mod ops;
 mod schema;
@@ -49,5 +50,6 @@ pub use model::{
 pub use i2pr_irc_core::{BufferId, ClientId, HistoryEventId, NetworkId};
 // The single definition of "when in history this event sits". Re-exported because the
 // runtime renders a `time=` tag from the same rule and must not carry its own copy.
+pub use migration::export_encrypted_copy;
 pub use search::effective_time;
 pub use worker::{STORE_BUSY_TIMEOUT_MS, STORE_QUEUE_CAPACITY, Store, StoreHandle};

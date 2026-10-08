@@ -14,6 +14,24 @@ impl StoreKey {
     pub(crate) fn into_bytes(self) -> Zeroizing<[u8; 32]> {
         self.0
     }
+
+    pub(crate) fn duplicate_for_verification(&self) -> Self {
+        Self::from_bytes(*self.0)
+    }
+}
+
+pub(crate) fn key_hex_literal(key: StoreKey) -> Zeroizing<String> {
+    let bytes = key.into_bytes();
+    let mut encoded = Zeroizing::new(String::with_capacity(67));
+    encoded.push_str("x'");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes.iter() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded.push('\'');
+    drop(bytes);
+    encoded
 }
 
 impl std::fmt::Debug for StoreKey {

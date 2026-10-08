@@ -252,3 +252,23 @@ Storage is **not** authority for `ConnectionGeneration`, registration phase, joi
 `Store::open` remains the explicit plaintext compatibility path. `Store::open_with_options` accepts either `StoreOpenOptions::plaintext()` or an encrypted option carrying a consumed `StoreKey` of exactly 32 caller-supplied random bytes. The store does not generate, derive, load, log, serialize, or retain the key in its schema. Its `Debug` output is redacted and the application-owned bytes and temporary hexadecimal encoding are zeroized after SQLCipher accepts the key. The SQLCipher connection retains the active cipher context only while the owned Store worker is alive.
 
 Encrypted open applies the key before schema access, checks the non-secret `cipher_version` pragma, and reads `sqlite_master` to force decryption/authentication before schema validation or migration. A rejected key fails closed with a redacted `KeyRejected` classification. An encrypted database opened through the plaintext path fails as a startup error; encryption mode is never guessed, and no schema is created over unreadable bytes. Encryption-at-rest protects a closed database only while the key is kept separately from it; it does not protect a compromised live process or hide IRC metadata from the bouncer.
+
+## Offline encrypted copy and key rotation
+
+`export_encrypted_copy` is an offline operation: the caller must stop and join the
+Store worker before calling it. It accepts the source's declared policy and a new
+destination key, opens/migrates the source using the normal schema path, and uses
+SQLCipher's `sqlcipher_export` to copy the complete database without materializing
+history in application memory. The destination must be a distinct new sibling file;
+it is created exclusively with mode `0600` on Unix. The exporter sets and checks the
+application ID and schema version, syncs the destination and parent directory where
+available, then reopens it through the ordinary keyed Store API so schema, indexes,
+and FTS consistency are checked before success.
+
+The source is never deleted or replaced. The same copy-and-verify path supports
+plaintext-to-encrypted migration and old-key-to-new-key rotation. A wrong source key is
+rejected before destination creation; failures after reservation remove the incomplete
+destination and sidecars best-effort, while the source remains available under its
+original policy. Schema migration of an older source occurs through ordinary startup
+before export, so the source may be upgraded transactionally even when a later copy
+fails. This API does not claim secure deletion or perform installation swaps.

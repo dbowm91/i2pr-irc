@@ -25,19 +25,11 @@ use tokio::sync::{mpsc, oneshot};
 /// Applies a raw 256-bit SQLCipher key before any application schema access. rusqlite's
 /// safe PRAGMA surface builds a short SQL string internally; our only temporary copy is
 /// itself zeroizing, and neither SQL text nor SQLite errors are exposed publicly.
-fn apply_encryption_key(connection: &Connection, key: crate::StoreKey) -> Result<(), StoreError> {
-    use zeroize::Zeroizing;
-
-    let bytes = key.into_bytes();
-    let mut encoded = Zeroizing::new(String::with_capacity(67));
-    encoded.push_str("x'");
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes.iter() {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded.push('\'');
-    drop(bytes);
+pub(crate) fn apply_encryption_key(
+    connection: &Connection,
+    key: crate::StoreKey,
+) -> Result<(), StoreError> {
+    let encoded = crate::encryption::key_hex_literal(key);
 
     connection
         .pragma_update(None, "key", encoded.as_str())
