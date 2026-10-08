@@ -34,9 +34,31 @@ Persistent/detached channels, auto-away, keep-nick/reclaim, constrained perform 
 
 Arbitrary ZNC-style native/interpreted modules remain out of scope.
 
+## Post-M005 core enhancement track — M006/M007
+
+This track is independent of the blocked i2pr managed-app work and may proceed while router-app contracts stabilize.
+
+M006 — IRC interoperability and capability downgrade:
+
+- no-CAP/no-SASL server support;
+- strict required-SASL semantics when configured;
+- plain IRC directly over I2P without a TLS requirement;
+- truthful promotion of selected IRCv3 capabilities;
+- simultaneous legacy/modern downstream qualification.
+
+M007 — identity and connectivity resilience:
+
+- bounded service-auth/recovery phases for non-SASL networks;
+- transient nick-collision retry rather than permanent failure;
+- robust preferred-nick reclaim;
+- simultaneous-client nick consistency;
+- deterministic adverse-network qualification, including external Eggchaos process/socket campaigns.
+
+OTR/E2EE, encrypted local storage, and broader privacy-at-rest work are intentionally separate later milestones.
+
 ## Phase 6 — Portable SAM integration
 
-Production SAM 3.1-compatible stream provider, long-lived session ownership, I2P naming, router restart behavior, and cross-router interoperability evidence. Proposal 170 is not required.
+Production SAM 3.1-compatible stream provider, long-lived session ownership, I2P naming, router restart behavior, and one real mature-router application-byte qualification. The temporary in-repo SAM client is not required to repeat Java/i2pd/i2pr or mixed-router conformance; broad SAM portability belongs to the dedicated SAM library project. Proposal 170 is not required.
 
 ## Phase 7 — i2pr managed-app integration
 
