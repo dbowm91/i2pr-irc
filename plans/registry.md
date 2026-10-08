@@ -26,14 +26,15 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | verification corrective active; privacy line planned | plans/subsystems/bouncer-core-roadmap.md | Corrective 043 ready; M008/M009 gated | Product behavior remains closed through Corrective 042. Corrective 043 removes the known m005g test synchronization race. After it closes, Plans 044-046 implement/qualify encrypted durable state, followed by Plans 047-048 for OTRv3 transparent carriage. |
+| Bouncer core | M008 active | plans/subsystems/bouncer-core-roadmap.md | Plan 044 ready | Corrective 043 closed with an upstream ordering barrier. Plans 044-046 implement/qualify encrypted durable state, followed by Plans 047-048 for OTRv3 transparent carriage. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
-| Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization | ready | verification/test-harness corrective | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/043-status.md |
+| Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization | closed | verification/test-harness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/043-status.md |
+| Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation | ready | security infrastructure + persistence | plans/subsystems/bouncer-core-roadmap.md | future plans/closure/bouncer-core/044-status.md |
 
 ## Recently closed implementation plans
 
@@ -87,7 +88,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation | blocked | Corrective 043 closure | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md |
 | Bouncer Core M008-B / Plan 045 — Encrypted Store Migration and Key Rotation | blocked | Plan 044 closure | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md |
 | Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure | blocked | Plan 045 closure | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md |
 | Bouncer Core M009-A / Plan 047 — OTRv3 Opaque-Carriage and Multi-Client Invariants | blocked | Plan 046 / M008 closure | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md |
@@ -153,13 +153,13 @@ Important retained conclusions:
 
 ## Latest closure and handoff
 
-Implement only:
+Corrective 043 is closed. Its new upstream ordering barrier proves JOIN and MODE processing before client attachment; see `plans/closure/bouncer-core/043-status.md`.
 
-- plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md
+Implement only the current dependency-ready handoff:
 
-Corrective 043 remains the sole dependency-ready handoff. It replaces the scheduler-dependent post-attachment barrier in the known flaky m005g member-state test with a deterministic pre-attachment upstream ordering barrier.
+- plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md
 
-The privacy/encryption line is fully researched and registered but remains blocked in sequence:
+The remaining privacy/encryption plans stay blocked in sequence:
 
 1. Plan 044 — SQLCipher/keyed-store foundation.
 2. Plan 045 — source-preserving encrypted migration/key rotation.
@@ -167,6 +167,6 @@ The privacy/encryption line is fully researched and registered but remains block
 4. Plan 047 — OTRv3 opaque-carriage/multi-client invariants.
 5. Plan 048 — integrated OTR privacy qualification and M009 closure.
 
-Do not start Plan 044 before Corrective 043 closes.
+Do not start Plan 045 before Plan 044 closes; likewise preserve the listed sequence through Plan 048.
 
 M006, M007, Corrective 042, and R001 remain product closures. R002 remains independently blocked on upstream i2pr managed-app contracts.

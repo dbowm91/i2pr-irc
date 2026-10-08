@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: verification corrective active — Corrective 043 ready; product behavior remains closed through Corrective 042
+Status: M008 active — Corrective 043 closed; Plan 044 ready
 
 Long-term references:
 
@@ -729,7 +729,7 @@ Accepted direction:
 
 Implementation decomposition:
 
-1. M008-A / Plan 044 — SQLCipher and keyed-store foundation. **Blocked on Corrective 043**.
+1. M008-A / Plan 044 — SQLCipher and keyed-store foundation. **Ready; Corrective 043 closed**.
 2. M008-B / Plan 045 — encrypted store migration and key rotation. **Blocked on Plan 044**.
 3. M008-C / Plan 046 — encrypted durable-state qualification and M008 closure. **Blocked on Plan 045**.
 
@@ -942,9 +942,9 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M007-B / Plan 040 | closed | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md | plans/closure/bouncer-core/040-status.md | Plan 039 closed |
 | M007-C / Plan 041 | closed | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | plans/closure/bouncer-core/041-status.md | Plan 040 closure |
 | C042 / Corrective 042 | closed | plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md | plans/closure/bouncer-core/042-status.md | none |
-| C043 / Corrective 043 | ready | plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md | future plans/closure/bouncer-core/043-status.md | none; test-harness synchronization only |
-| M008 | planned / gated | Plans 044-046 | future plans/closure/bouncer-core/046-status.md | Corrective 043 closure |
-| M008-A / Plan 044 | blocked | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md | future plans/closure/bouncer-core/044-status.md | Corrective 043 closure |
+| C043 / Corrective 043 | closed | plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md | plans/closure/bouncer-core/043-status.md | none; test-harness synchronization only |
+| M008 | active | Plans 044-046 | future plans/closure/bouncer-core/046-status.md | Plan 044 active handoff |
+| M008-A / Plan 044 | ready | plans/implementation/bouncer-core/044-m008a-sqlcipher-and-keyed-store-foundation.md | future plans/closure/bouncer-core/044-status.md | Corrective 043 closure |
 | M008-B / Plan 045 | blocked | plans/implementation/bouncer-core/045-m008b-encrypted-store-migration-and-key-rotation.md | future plans/closure/bouncer-core/045-status.md | Plan 044 closure |
 | M008-C / Plan 046 | blocked | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md | future plans/closure/bouncer-core/046-status.md | Plan 045 closure |
 | M009 | planned / gated | Plans 047-048 | future plans/closure/bouncer-core/048-status.md | M008 closure |

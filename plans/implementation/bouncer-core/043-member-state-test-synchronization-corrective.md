@@ -1,6 +1,10 @@
 # Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization
 
-Status: ready for handoff
+Status: closed
+
+Closure:
+
+- plans/closure/bouncer-core/043-status.md
 
 Repository baseline:
 

@@ -1,8 +1,8 @@
 # Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation
 
-Status: blocked
+Status: ready for handoff
 
-Hard dependency:
+Satisfied prerequisite:
 
 - plans/closure/bouncer-core/043-status.md
 
