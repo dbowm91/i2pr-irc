@@ -1,6 +1,6 @@
 # Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation
 
-Status: ready for handoff
+Status: closed
 
 Satisfied prerequisite:
 

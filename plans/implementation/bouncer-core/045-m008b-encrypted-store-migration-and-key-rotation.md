@@ -1,6 +1,6 @@
 # Bouncer Core M008-B / Plan 045 — Encrypted Store Migration and Key Rotation
 
-Status: blocked
+Status: ready
 
 Hard dependency:
 
