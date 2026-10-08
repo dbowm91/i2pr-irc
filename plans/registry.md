@@ -26,7 +26,7 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active M006-A | plans/subsystems/bouncer-core-roadmap.md | Plan 036 ready | Corrective 035 closed the reversed IRCv3 MONITOR 730/731 semantics. Plans 036-038 close M006, followed by Plans 039-041 for M007. M005 and Corrective 034 remain closed. |
+| Bouncer core | active M006-B | plans/subsystems/bouncer-core-roadmap.md | Plan 037 ready | Corrective 035 and Plan 036 closed. Plans 037-038 close M006, followed by Plans 039-041 for M007. M005 and Corrective 034 remain closed. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Research 008 delegates broad Java/i2pd/i2pr and mixed-router SAM conformance to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -34,7 +34,8 @@ Canonical direction:
 | Plan | Status | Class | Source | Closure/result |
 |---|---|---|---|---|
 | Bouncer Core Corrective 035 — MONITOR Numeric Conformance | closed | protocol correctness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
-| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | active | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/035-status.md |
+| Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | closed | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/036-status.md |
+| Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | ready | IRCv3 capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/036-status.md |
 
 ## Recently closed implementation plans
 
@@ -79,7 +80,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | blocked | Plan 036 closure | plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md |
 | Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | blocked | Plan 037 closure | plans/implementation/bouncer-core/038-m006c-integrated-irc-interoperability-qualification-and-closure.md |
 | Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery | blocked | Plan 038 / M006 closure | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md |
 | Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | blocked | Plan 039 closure | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md |
@@ -139,7 +139,7 @@ Important retained conclusions:
 
 Implement only:
 
-- plans/implementation/bouncer-core/036-m006a-registration-downgrade-and-legacy-server-baseline.md
+- plans/implementation/bouncer-core/037-m006b-account-tag-and-invite-notify-mediation.md
 
 Corrective 035 is closed: 730 is online, 731 is offline/free, and 303 ISON remains the fallback probe. See `plans/closure/bouncer-core/035-status.md`.
 
