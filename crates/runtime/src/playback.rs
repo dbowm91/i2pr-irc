@@ -253,6 +253,8 @@ mod tests {
             away_notify: false,
             multi_prefix: false,
             setname: false,
+            account_tag: false,
+            invite_notify: false,
         };
         assert!(
             !wants_backlog(explicit),
@@ -280,6 +282,8 @@ mod tests {
             away_notify: false,
             multi_prefix: false,
             setname: false,
+            account_tag: false,
+            invite_notify: false,
         };
         assert!(
             wants_backlog(markers_only),

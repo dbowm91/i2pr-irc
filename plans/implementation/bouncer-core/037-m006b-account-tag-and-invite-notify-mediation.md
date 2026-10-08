@@ -1,6 +1,6 @@
 # Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation
 
-Status: blocked
+Status: closed
 
 Hard dependency:
 

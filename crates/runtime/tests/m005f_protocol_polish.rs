@@ -765,19 +765,55 @@ async fn an_upstream_announcement_about_something_unserved_is_not_reported() {
     listening.until("001 bot").await;
 
     runtime.upstreams[peer]
-        .write_all(b":srv CAP * NEW :away-notify account-notify\r\n")
+        .write_all(b":srv CAP * NEW :chghost extended-monitor\r\n")
         .await
         .expect("upstream announces capabilities this build does not serve");
     // Give the notification a bounded window to arrive, so a line that *would* have been
     // sent is observed as arriving rather than merely not-yet-arriving.
     listening.settle().await;
     assert!(
-        !listening.since(0).contains("away-notify")
-            && !listening.since(0).contains("account-notify"),
+        !listening.since(0).contains("chghost") && !listening.since(0).contains("extended-monitor"),
         "a capability the bouncer does not serve changes nothing a client can act on, so it \
          is not reported: {:?}",
         listening.since(0)
     );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn account_and_invite_capability_changes_follow_upstream_ack_and_del() {
+    let mut runtime = Runtime::start().await;
+    let peer = runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch labeled-response",
+        )
+        .await;
+    let mut listening = register(&runtime, NetworkId(1), SessionId(1), "cap-notify").await;
+    listening.until("001 bot").await;
+    runtime.upstreams[peer]
+        .write_all(b":srv CAP * NEW :account-tag invite-notify\r\n")
+        .await
+        .expect("upstream adds mediated capabilities");
+    read_until(
+        &mut runtime.upstreams[peer],
+        b"CAP REQ :account-tag invite-notify",
+    )
+    .await;
+    runtime.upstreams[peer]
+        .write_all(b":srv CAP * ACK :account-tag invite-notify\r\n")
+        .await
+        .expect("upstream enables both capabilities");
+    listening.await_new(0, "CAP * NEW").await;
+    assert!(listening.since(0).contains("account-tag invite-notify"));
+    let mark = listening.mark();
+    runtime.upstreams[peer]
+        .write_all(b":srv CAP * DEL :account-tag invite-notify\r\n")
+        .await
+        .expect("upstream withdraws both capabilities");
+    listening.await_new(mark, "CAP * DEL").await;
+    assert!(listening.since(mark).contains("account-tag invite-notify"));
     runtime.stop().await;
 }
 

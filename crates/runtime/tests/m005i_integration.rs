@@ -40,7 +40,7 @@ fn b32() -> String {
 /// `sasl=PLAIN` is present because a Network holding a credential needs a *named*
 /// mechanism to authenticate against; a server offering bare `sasl` cannot be authenticated
 /// and the owner refuses registration rather than connecting unauthenticated.
-const CAPS: &str = "message-tags server-time batch sasl=PLAIN extended-join account-notify away-notify multi-prefix setname cap-notify standard-replies echo-message draft/no-implicit-names";
+const CAPS: &str = "message-tags server-time batch sasl=PLAIN extended-join account-notify away-notify multi-prefix setname cap-notify standard-replies echo-message draft/no-implicit-names account-tag invite-notify";
 
 fn record(network: u64, channels: &[&str]) -> NetworkRecord {
     NetworkRecord {
@@ -302,6 +302,166 @@ where
             .await
             .expect("the controller publishes a snapshot");
     }
+}
+
+#[tokio::test]
+async fn account_tag_is_forwarded_per_client_without_synthesizing_state() {
+    let mut runtime = Runtime::start().await;
+    let peer = runtime.bring_online(1, &["#room"]).await;
+    let mut tagged = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(1),
+        "message-tags account-tag",
+    )
+    .await;
+    let mut generic = register(&runtime, NetworkId(1), SessionId(2), "message-tags").await;
+    let mut account_only = register(&runtime, NetworkId(1), SessionId(3), "account-tag").await;
+    let mut legacy = register(&runtime, NetworkId(1), SessionId(4), "").await;
+    let mut timed = register(
+        &runtime,
+        NetworkId(1),
+        SessionId(5),
+        "message-tags server-time",
+    )
+    .await;
+    for client in [&tagged, &generic, &account_only, &legacy, &timed] {
+        assert!(client.seen.contains("001 bot"));
+    }
+    assert!(tagged.seen.contains("ACK :message-tags account-tag"));
+    assert!(account_only.seen.contains("ACK :account-tag"));
+    assert!(
+        timed.seen.contains("ACK :message-tags server-time"),
+        "{}",
+        timed.seen
+    );
+
+    let marks = [
+        tagged.mark(),
+        generic.mark(),
+        account_only.mark(),
+        legacy.mark(),
+        timed.mark(),
+    ];
+    runtime.upstreams[peer]
+        .write_all(
+            b"@account=alice;msgid=m1;time=2025-01-02T03:04:05.000Z :alice!u@h PRIVMSG #room :tagged\r\n",
+        )
+        .await
+        .expect("upstream sends authenticated account metadata");
+    tagged.until("tagged").await;
+    generic.until("tagged").await;
+    account_only.until("tagged").await;
+    legacy.until("tagged").await;
+    timed.until("tagged").await;
+    for client in [
+        &mut tagged,
+        &mut generic,
+        &mut account_only,
+        &mut legacy,
+        &mut timed,
+    ] {
+        client.settle().await;
+    }
+    let views = [
+        tagged.since(marks[0]),
+        generic.since(marks[1]),
+        account_only.since(marks[2]),
+        legacy.since(marks[3]),
+        timed.since(marks[4]),
+    ];
+    assert!(
+        views[0].contains("@account=alice;msgid=m1 :alice!u@h PRIVMSG"),
+        "{}",
+        views[0]
+    );
+    assert!(!views[0].contains("time="), "{}", views[0]);
+    assert!(
+        views[1].contains("@msgid=m1 :alice!u@h PRIVMSG"),
+        "{}",
+        views[1]
+    );
+    assert!(
+        !views[1].contains("account=") && !views[1].contains("time="),
+        "{}",
+        views[1]
+    );
+    assert!(
+        views[2].contains("@account=alice :alice!u@h PRIVMSG"),
+        "{}",
+        views[2]
+    );
+    assert!(
+        !views[2].contains("msgid=") && !views[2].contains("time="),
+        "{}",
+        views[2]
+    );
+    assert!(
+        !views[3].contains("@account=")
+            && !views[3].contains("@msgid=")
+            && !views[3].contains("@time="),
+        "{}",
+        views[3]
+    );
+    assert!(
+        views[4].contains("@msgid=m1;time=2025-01-02T03:04:05.000Z :alice!u@h PRIVMSG"),
+        "{}",
+        views[4]
+    );
+    assert!(!views[4].contains("account="), "{}", views[4]);
+
+    // The server has supplied an account-notify observation, but that cached state does
+    // not authorize the bouncer to invent an `account` tag on a later unstamped message.
+    let unstamped_mark = tagged.mark();
+    runtime.upstreams[peer]
+        .write_all(
+            b":alice!u@h JOIN #room\r\n:alice ACCOUNT alice\r\n:alice!u@h PRIVMSG #room :unstamped\r\n",
+        )
+        .await
+        .expect("upstream sends account state and an unstamped message");
+    tagged.until("unstamped").await;
+    tagged.settle().await;
+    assert!(
+        !tagged.since(unstamped_mark).contains("@account="),
+        "cached account state is never projected as a fabricated tag: {}",
+        tagged.since(unstamped_mark)
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn invite_notify_filters_third_party_invites_but_preserves_self_invites() {
+    let mut runtime = Runtime::start().await;
+    let peer = runtime.bring_online(1, &["#room"]).await;
+    let mut listening = register(&runtime, NetworkId(1), SessionId(1), "invite-notify").await;
+    let mut ordinary = register(&runtime, NetworkId(1), SessionId(2), "").await;
+
+    runtime.upstreams[peer]
+        .write_all(b":alice!u@h INVITE bot #room\r\n")
+        .await
+        .expect("upstream invites this Network's nick");
+    listening.until("INVITE bot #room").await;
+    ordinary.until("INVITE bot #room").await;
+
+    let listening_mark = listening.mark();
+    let ordinary_mark = ordinary.mark();
+    runtime.upstreams[peer]
+        .write_all(b":alice!u@h INVITE other #room\r\n")
+        .await
+        .expect("upstream reports a third-party invitation");
+    listening.until("INVITE other #room").await;
+    listening.settle().await;
+    ordinary.settle().await;
+    assert!(
+        listening
+            .since(listening_mark)
+            .contains("INVITE other #room")
+    );
+    assert!(
+        !ordinary.since(ordinary_mark).contains("INVITE other #room"),
+        "a session without invite-notify never receives third-party invite events"
+    );
+    runtime.stop().await;
 }
 
 struct Client {

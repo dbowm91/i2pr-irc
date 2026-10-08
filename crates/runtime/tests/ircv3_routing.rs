@@ -112,6 +112,8 @@ fn the_upstream_request_set_is_the_reviewed_constant_only() {
             "away-notify".to_owned(),
             "multi-prefix".to_owned(),
             "setname".to_owned(),
+            "account-tag".to_owned(),
+            "invite-notify".to_owned(),
         ],
         "SASL is requested by the authentication path, and nothing else is mirrored"
     );

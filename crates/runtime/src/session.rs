@@ -219,6 +219,11 @@ pub struct SessionCapabilities {
     /// read. This is tracked per session because the fanout path delivers one upstream
     /// line to many sessions with different surfaces.
     pub message_tags: bool,
+    /// The client negotiated `account-tag`, so it may receive only server-supplied
+    /// `account` tags when it did not also ask for generic message tags.
+    pub account_tag: bool,
+    /// The client negotiated `invite-notify`, so it may receive third-party INVITEs.
+    pub invite_notify: bool,
     /// The client negotiated `draft/pre-away`, so `PASSIVE` and `ACTIVE` are part of the
     /// contract it expects the bouncer to honour.
     ///
@@ -293,6 +298,8 @@ impl Default for SessionCapabilities {
             explicit_history: false,
             read_markers: false,
             message_tags: false,
+            account_tag: false,
+            invite_notify: false,
             pre_away: false,
             search: false,
             bouncer_networks: false,
@@ -363,6 +370,16 @@ impl SessionCapabilities {
         self.server_time
     }
 
+    /// True when this session may receive server-supplied `account` message tags.
+    pub fn negotiated_account_tag(&self) -> bool {
+        self.account_tag
+    }
+
+    /// True when this session may receive third-party invite notifications.
+    pub fn negotiated_invite_notify(&self) -> bool {
+        self.invite_notify
+    }
+
     /// True when this session asked for `standard-replies`.
     pub fn negotiated_standard_replies(&self) -> bool {
         self.standard_replies
@@ -415,10 +432,10 @@ impl SessionCapabilities {
     /// those are the tags it asked for. Collapsing the two states would either strip
     /// tags the client requested or deliver one it did not.
     pub fn tag_surface(&self) -> TagSurface {
-        match (self.message_tags, self.server_time) {
-            (false, _) => TagSurface::None,
-            (true, true) => TagSurface::All,
-            (true, false) => TagSurface::WithoutTime,
+        TagSurface {
+            message_tags: self.message_tags,
+            server_time: self.server_time,
+            account_tag: self.account_tag,
         }
     }
 
@@ -433,6 +450,14 @@ impl SessionCapabilities {
                 || enabled
                     .iter()
                     .any(|name| name == crate::capability::MESSAGE_TAGS),
+            account_tag: self.account_tag
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::ACCOUNT_TAG),
+            invite_notify: self.invite_notify
+                || enabled
+                    .iter()
+                    .any(|name| name == crate::capability::INVITE_NOTIFY),
             pre_away: self.pre_away
                 || enabled
                     .iter()
@@ -493,18 +518,16 @@ impl SessionCapabilities {
     }
 }
 
-/// How much of a message's tag surface one session may receive.
+/// Which classes of upstream message tags one session may receive.
 ///
-/// Three states rather than a boolean, because `message-tags` and `server-time` are
-/// separate permissions and the difference between them is one tag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TagSurface {
-    /// No tags at all: the client cannot parse a frame that begins with a tag prefix.
-    None,
-    /// Every tag, including `time`.
-    All,
-    /// Every tag except `time`, which this session never negotiated.
-    WithoutTime,
+/// `account-tag` and `server-time` each implicitly support the tag wire format for their
+/// own tag, while `message-tags` permits generic tags. Keeping these permissions separate
+/// prevents a client that requested only account metadata from receiving unrelated tags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TagSurface {
+    pub message_tags: bool,
+    pub server_time: bool,
+    pub account_tag: bool,
 }
 
 /// Handle the owner uses to reach one session.

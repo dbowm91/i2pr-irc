@@ -11,7 +11,7 @@ answer into N client answers that are each correct.
 
 ## The accepted set, and what is deliberately not
 
-Five capabilities were accepted. Four were examined and **deferred with a stated reason**,
+Five capabilities were accepted in M005-G. Plan 037 adds two mediated capabilities. Two were examined and **deferred with a stated reason**,
 because a capability this build does not fully mediate must not be requested upstream and
 must not be advertised downstream.
 
@@ -23,21 +23,26 @@ must not be advertised downstream.
 | `multi-prefix` | yes | upstream negotiated it | membership is widened only for a session that negotiated it, and only when the run was observed whole |
 | `setname` | yes | upstream negotiated it | a `SETNAME` change reaches only sessions that asked, and the command travels only from sessions that asked |
 
-`DOWNSTREAM_DEFERRED_MEMBER` records the four that were examined and withheld:
+`DOWNSTREAM_DEFERRED_MEMBER` records the two that remain withheld:
 
 | Deferred | Why |
 |---|---|
-| `account-tag` | requires stamping a server tag onto messages the upstream did not stamp. Plan 025 established that no live frame is ever fabricated — `server-time` synthesis is confined to history replay — and a second synthesis surface contradicts that rule rather than extending it. |
 | `chghost` | its specification falls back to a synthetic `QUIT`/`JOIN`/`MODE` sequence for clients that did not negotiate it. A bouncer whose whole projection discipline is that it never claims a membership a client did not see established must not synthesise membership events. Withholding it also makes a continuously attached legacy client's user/host stale while a freshly projected one is current — a real divergence, which is the honest reason to defer rather than half-solve. |
-| `invite-notify` | `INVITE` already reaches sessions through ordinary fanout. The capability only carries meaning if invites are withheld per session, and M005 establishes no such requirement. Advertising it would promise routing behaviour that does not exist. |
 | `extended-monitor` | changes the *format* of MONITOR replies, not which monitors work. M005-C reads `MONITOR` from ISUPPORT and its reclaim behaviour is satisfied by standard MONITOR. |
 
-Every accepted capability is in `UPSTREAM_FOUNDATIONAL`, which is now ten names. A server
+`account-tag` is negotiated upstream when offered and downstream only after upstream ACK.
+Its `account` tag is forwarded only when present on that live frame and only to sessions
+that negotiated account-tag; cached ACCOUNT state never creates a tag. `invite-notify`
+uses the same conditional negotiation. Self-targeted invites remain ordinary baseline
+INVITE delivery to every session; third-party invite notifications go only to sessions
+that negotiated invite-notify.
+
+Every accepted capability is in `UPSTREAM_FOUNDATIONAL`, which is now twelve names. A server
 offering a deferred name gets no request for it: the runtime has no handling for the
 message forms that name would enable, and requesting it would make the server send frames
 the bouncer cannot interpret.
 
-## The advertisement is conditional on upstream, for all five
+## The advertisement is conditional on upstream
 
 `DownstreamCapabilities::advertise` adds each member capability only when upstream
 *acknowledged* it. This is the same rule `echo-message` already used, and it has the same
@@ -260,7 +265,7 @@ being able to ask for one.
 |---|---|
 | `crates/runtime/src/member.rs` | the mediation module. Pure functions over `(state, message, capabilities)`. No authority. |
 | `crates/runtime/src/state.rs` | `MemberEntry`, `AccountState`, `AwayState`, `MemberObservation`, `PrefixMap::split_prefix_run` / `merge_symbols` / `highest`, and the `AWAY` / `ACCOUNT` / `SETNAME` arms |
-| `crates/runtime/src/capability.rs` | `MEMBER_CAPABILITIES`, `DOWNSTREAM_DEFERRED_MEMBER`, the ten-name upstream request set, the conditional advertisement |
+| `crates/runtime/src/capability.rs` | accepted and deferred capability sets, the twelve-name upstream request set, the conditional advertisement |
 | `crates/runtime/src/session.rs` | per-session negotiation flags, the `SETNAME` command gate, the advertisement passed into registration |
 | `crates/runtime/src/owner.rs` | `TagForms`, the per-session mediate-then-tag loop, the routed-reply reduction |
 | `crates/runtime/src/admission.rs` | reads the Network's live advertisement before registration begins |

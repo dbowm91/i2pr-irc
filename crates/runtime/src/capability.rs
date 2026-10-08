@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 /// runtime handles every message form it enables, and each name is still filtered
 /// through what the server actually offered, so the request set remains a pure function
 /// of the server's answer.
-pub const UPSTREAM_FOUNDATIONAL: [&str; 10] = [
+pub const UPSTREAM_FOUNDATIONAL: [&str; 12] = [
     "message-tags",
     "server-time",
     "batch",
@@ -37,7 +37,14 @@ pub const UPSTREAM_FOUNDATIONAL: [&str; 10] = [
     MEMBER_AWAY_NOTIFY,
     MEMBER_MULTI_PREFIX,
     MEMBER_SETNAME,
+    ACCOUNT_TAG,
+    INVITE_NOTIFY,
 ];
+
+/// `account-tag`: forward server-authenticated account metadata carried on live messages.
+pub const ACCOUNT_TAG: &str = "account-tag";
+/// `invite-notify`: forward third-party invite notifications only to sessions that asked.
+pub const INVITE_NOTIFY: &str = "invite-notify";
 
 /// `extended-join`: a JOIN carries the joining member's account and realname, so an
 /// attaching client can be shown them without a WHO.
@@ -75,12 +82,7 @@ pub const MEMBER_CAPABILITIES: [&str; 5] = [
 /// it, and a bouncer whose whole projection discipline is that it never claims a
 /// membership a client did not see established must not synthesise membership events.
 /// The other three are additive metadata this build does not yet derive or route.
-pub const DOWNSTREAM_DEFERRED_MEMBER: [&str; 4] = [
-    "account-tag",
-    "chghost",
-    "invite-notify",
-    "extended-monitor",
-];
+pub const DOWNSTREAM_DEFERRED_MEMBER: [&str; 2] = ["chghost", "extended-monitor"];
 
 /// Downstream capabilities this build can truthfully advertise.
 ///
@@ -399,6 +401,12 @@ impl DownstreamCapabilities {
         if upstream.echo_available() {
             advertised.push(ECHO_MESSAGE.to_owned());
         }
+        if upstream.is_enabled(ACCOUNT_TAG) {
+            advertised.push(ACCOUNT_TAG.to_owned());
+        }
+        if upstream.is_enabled(INVITE_NOTIFY) {
+            advertised.push(INVITE_NOTIFY.to_owned());
+        }
         // Member-state capabilities are conditional on upstream for the same reason
         // `echo-message` is: the bouncer mediates what the server supplied, so a server
         // that never offered `extended-join` leaves nothing to mediate and advertising it
@@ -610,6 +618,28 @@ mod tests {
                 .contains(&"echo-message".to_owned()),
             "with an upstream echo the bouncer can confirm a message truthfully"
         );
+    }
+
+    #[test]
+    fn account_tag_and_invite_notify_are_advertised_only_after_upstream_ack() {
+        let mut upstream = UpstreamCapabilities::default();
+        upstream.note_offer(ACCOUNT_TAG);
+        upstream.note_offer(INVITE_NOTIFY);
+        assert!(
+            !DownstreamCapabilities::default()
+                .advertise(&upstream)
+                .contains(&ACCOUNT_TAG.to_owned())
+        );
+        assert!(
+            !DownstreamCapabilities::default()
+                .advertise(&upstream)
+                .contains(&INVITE_NOTIFY.to_owned())
+        );
+        upstream.note_enabled(ACCOUNT_TAG);
+        upstream.note_enabled(INVITE_NOTIFY);
+        let advertised = DownstreamCapabilities::default().advertise(&upstream);
+        assert!(advertised.contains(&ACCOUNT_TAG.to_owned()));
+        assert!(advertised.contains(&INVITE_NOTIFY.to_owned()));
     }
 
     #[test]

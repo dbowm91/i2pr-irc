@@ -2554,7 +2554,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // session that negotiated the tag prefix but not that particular tag gets
             // every other tag and loses only `time`, because the others are exactly what
             // it asked for.
-            let tag_forms = TagForms::build(message, raw);
+            let tag_surfaces = sessions
+                .values()
+                .map(|task| task.handle().capabilities().tag_surface())
+                .collect::<BTreeSet<_>>();
+            let tag_forms = TagForms::build(message, raw, &tag_surfaces);
             // A rewritten frame already has every detached channel removed from it, so it
             // replaces all three forms. Dropping its tags is sound: a tag is optional in
             // every direction, and the alternative would reintroduce a detached channel
@@ -2565,6 +2569,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             };
             for (id, task) in sessions {
                 let capabilities = task.handle().capabilities();
+                if message.command.eq_ignore_ascii_case(b"INVITE") {
+                    let target = message
+                        .params
+                        .first()
+                        .and_then(|target| std::str::from_utf8(target).ok());
+                    if target.is_some_and(|target| {
+                        !state.same_nick(target, &state.nick) && !capabilities.invite_notify
+                    }) {
+                        continue;
+                    }
+                }
                 // Member-state mediation runs per session and before the tag surface is
                 // chosen, because it can withhold the frame or hand back a *different*
                 // frame. Choosing the surface first would let a session be handed reduced
@@ -2579,15 +2594,20 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     Some(line) => line.clone(),
                     // The unreduced frame already has all three forms built.
                     None if reduced.is_none() => match &tag_forms {
-                        Some(forms) => forms.render(surface),
+                        Some(forms) => forms
+                            .render(surface)
+                            .map_or_else(|| raw.to_vec(), <[u8]>::to_vec),
                         None => raw.to_vec(),
                     },
                     // A reduced frame carries its own tags, so its forms are built from it.
                     None => match TagForms::build(
                         reduced.as_ref().expect("reduced is Some in this arm"),
                         raw,
+                        &BTreeSet::from([surface]),
                     ) {
-                        Some(forms) => forms.render(surface),
+                        Some(forms) => forms
+                            .render(surface)
+                            .map_or_else(|| raw.to_vec(), <[u8]>::to_vec),
                         None => raw.to_vec(),
                     },
                 };
@@ -3839,11 +3859,7 @@ fn incoming_for(message: &Message) -> Incoming<'_> {
 /// expensive part and the forms depend only on the frame's tags.
 #[derive(Clone, Debug)]
 struct TagForms {
-    tagged: Vec<u8>,
-    untagged: Vec<u8>,
-    /// `None` when the frame carried no `time` tag to withhold, which is the same
-    /// situation as the `untagged` form.
-    timed: Option<Vec<u8>>,
+    forms: BTreeMap<TagSurface, Vec<u8>>,
 }
 impl TagForms {
     /// Builds every form for one frame.
@@ -3852,45 +3868,26 @@ impl TagForms {
     /// bytes it already has. Encoding is total rather than panicking: a frame that will
     /// not encode is a real condition, and taking the generation down over it would
     /// disconnect an Operator for something the bouncer can simply relay as received.
-    fn build(message: &Message, raw: &[u8]) -> Option<Self> {
-        if message.tags.is_empty() {
-            // The untagged form of an untagged message *is* that message, re-encoded.
-            // `raw` would be wrong here: a mediated frame carries different bytes from
-            // the line it replaced, and handing the original back would undo the
-            // mediation exactly when the mediation happened on a frame with no tags.
-            let encoded = message.encode().ok().unwrap_or_else(|| raw.to_vec());
-            return Some(Self {
-                tagged: encoded.clone(),
-                untagged: encoded,
-                timed: None,
+    fn build(message: &Message, _raw: &[u8], surfaces: &BTreeSet<TagSurface>) -> Option<Self> {
+        let mut forms = BTreeMap::new();
+        for surface in surfaces {
+            let mut projected = message.clone();
+            projected.tags.retain(|key, _| {
+                if key.as_slice() == i2pr_irc_wire::TIME_TAG {
+                    surface.server_time
+                } else if key.as_slice() == b"account" {
+                    surface.account_tag
+                } else {
+                    surface.message_tags
+                }
             });
+            forms.insert(*surface, projected.encode().ok()?);
         }
-        let mut bare = message.clone();
-        bare.tags.clear();
-        let untagged = bare.encode().ok()?;
-        let mut without_time = message.clone();
-        without_time.tags.remove(i2pr_irc_wire::TIME_TAG);
-        let timed = if message.tags.contains_key(i2pr_irc_wire::TIME_TAG)
-            && !without_time.tags.is_empty()
-        {
-            Some(without_time.encode().ok()?)
-        } else {
-            None
-        };
-        Some(Self {
-            tagged: message.encode().ok()?,
-            untagged,
-            timed,
-        })
+        Some(Self { forms })
     }
     /// The form this session's negotiated surface calls for.
-    fn render(&self, surface: TagSurface) -> Vec<u8> {
-        match surface {
-            TagSurface::All => self.tagged.clone(),
-            // Withholding `time` only matters when a `time` tag was present to withhold.
-            TagSurface::WithoutTime => self.timed.clone().unwrap_or_else(|| self.untagged.clone()),
-            TagSurface::None => self.untagged.clone(),
-        }
+    fn render(&self, surface: TagSurface) -> Option<&[u8]> {
+        self.forms.get(&surface).map(Vec::as_slice)
     }
 }
 

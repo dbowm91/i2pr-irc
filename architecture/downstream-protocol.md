@@ -33,13 +33,20 @@ This is the one that needed real machinery rather than an advertisement change.
 `server-time` says *and that prefix may carry this particular tag*. They are different
 permissions, and before this plan the fanout had exactly two states — all tags or none.
 
-`TagSurface` makes it three:
+`TagSurface` now independently tracks generic tags, server time, and account metadata:
 
 | | `message-tags` | `server-time` | receives |
 |---|---|---|---|
-| `None` | no | — | no tags |
-| `WithoutTime` | yes | no | every tag **except** `time` |
-| `All` | yes | yes | every tag |
+| `message-tags` | `server-time` | `account-tag` | receives |
+| no | no | no | no tags |
+| yes | no | no | all tags except `time` and `account` |
+| no | yes | no | only `time` |
+| no | no | yes | only `account` |
+| yes | yes | yes | all tags |
+
+The intermediate combinations preserve only the specific tag permissions negotiated.
+An `account` tag is forwarded only when the upstream placed it on that live frame;
+account state cached from `ACCOUNT` never creates a tag.
 
 The middle row is the point. Collapsing it into either neighbour is wrong in a way a
 client cannot detect: stripping all tags would remove tags it *did* ask for, and sending

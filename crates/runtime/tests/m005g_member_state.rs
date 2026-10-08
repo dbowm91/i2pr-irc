@@ -33,7 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CEILING: Duration = Duration::from_secs(10);
 
 /// Everything the reviewed upstream request set can ask for.
-const FULL: &str = "message-tags server-time batch labeled-response echo-message extended-join account-notify away-notify multi-prefix setname";
+const FULL: &str = "message-tags server-time batch labeled-response echo-message extended-join account-notify away-notify multi-prefix setname account-tag invite-notify";
 
 /// The same Network on a server that offers no member-state capability at all.
 const LEAN: &str = "message-tags server-time batch labeled-response";
@@ -591,12 +591,7 @@ async fn deferred_member_capabilities_are_never_advertised() {
         .await;
     let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
     let listing = isupport(&mut client).await;
-    for deferred in [
-        "account-tag",
-        "chghost",
-        "invite-notify",
-        "extended-monitor",
-    ] {
+    for deferred in ["chghost", "extended-monitor"] {
         assert!(
             !listing.contains(deferred),
             "{deferred} is deferred, so advertising it would be a promise this build keeps: {listing:?}"
