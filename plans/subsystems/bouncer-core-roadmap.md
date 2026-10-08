@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: M009 closed — Plans 047-048 closed; no registered successor plan
+Status: post-M009 corrective active — Corrective 049 ready
 
 Long-term references:
 
@@ -28,6 +28,7 @@ Post-closure corrective authority:
 - plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md
 - plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md
 - plans/implementation/bouncer-core/043-member-state-test-synchronization-corrective.md
+- plans/implementation/bouncer-core/049-post-m009-verification-and-docs-corrective.md
 
 Pre-M003 gates:
 
@@ -892,7 +893,7 @@ Architecture decisions requiring an ADR if encountered:
 
 ## 11. Completion definition
 
-This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed, and Corrective 042 closed the last open correctness and qualification gaps against them, so the post-M005 product-completeness track is fully evidence-closed. The next independent privacy track is M008-M009, gated first by verification-only Corrective 043 and then sequenced through Plans 044-048.
+This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed, and Corrective 042 closed the last open correctness and qualification gaps against them, so the post-M005 product-completeness track is fully evidence-closed. M008-M009 are now evidence-closed through Plans 044-048. Corrective 049 is the current post-M009 readiness authority for the transient SAM verification finding and planning/README reconciliation.
 
 ## 12. Milestone status
 
@@ -948,3 +949,4 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M009 | closed | Plans 047-048 | plans/closure/bouncer-core/048-status.md | Plans 047-048 closed |
 | M009-A / Plan 047 | closed | plans/implementation/bouncer-core/047-m009a-otrv3-opaque-carriage-and-multiclient-invariants.md | plans/closure/bouncer-core/047-status.md | M008 closure |
 | M009-B / Plan 048 | closed | plans/implementation/bouncer-core/048-m009b-integrated-otr-privacy-qualification-and-closure.md | plans/closure/bouncer-core/048-status.md | Plan 047 closure |
+| C049 / Corrective 049 | ready | plans/implementation/bouncer-core/049-post-m009-verification-and-docs-corrective.md | future plans/closure/bouncer-core/049-status.md | none; post-M009 verification/documentation corrective |
