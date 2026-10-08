@@ -24,7 +24,8 @@ use i2pr_irc_core::{ByteStream, ClientId, I2pEndpoint, NetworkId, SessionId};
 use i2pr_irc_runtime::admission::{AdmissionOutcome, DownstreamAdmission, NetworkSelection};
 use i2pr_irc_runtime::controller::{ControlSnapshot, RuntimeControlHandle, RuntimeController};
 use i2pr_irc_store::{
-    BufferKind, HistoryQuery, HistoryQueryBound, NetworkRecord, Store, StorePath,
+    BufferKind, HistoryQuery, HistoryQueryBound, NetworkRecord, SearchQuery, SearchTerm, Store,
+    StoreKey, StoreOpenOptions, StorePath, testing,
 };
 use i2pr_irc_testkit::{FakeI2pStreamProvider, FaultScript, ScriptedStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,6 +102,10 @@ struct Runtime {
 impl Runtime {
     async fn start() -> Self {
         let store = Store::open(&StorePath::Memory).expect("store opens");
+        Self::start_with_store(store).await
+    }
+
+    async fn start_with_store(store: Store) -> Self {
         let handle = store.handle_clone();
         let provider = Provider::new();
         let (mut controller, control) =
@@ -602,6 +607,235 @@ async fn otr_queries_fragments_and_whitespace_remain_opaque_across_tags_fanout_a
     assert!(events[1].payload.ends_with(b"?OTR,1,2,fragmentA+/=="));
     assert!(events[2].payload.ends_with(b"?OTR,2,2,fragmentB+/=="));
     runtime.stop().await;
+}
+
+#[tokio::test]
+async fn encrypted_store_otr_transcript_fanout_history_and_restart_stay_opaque() {
+    const KEY: u8 = 0x9d;
+    const ENDPOINT_PLAINTEXT: &str = "endpointonlyplaintext16e2";
+    let dir = testing::temp_dir("m009-integrated-encrypted-otr");
+    let path = dir.db("otr.sqlite3");
+    let store = Store::open_with_options(
+        &StorePath::File(path.clone()),
+        StoreOpenOptions::encrypted(StoreKey::from_bytes([KEY; 32])),
+    )
+    .expect("encrypted store opens");
+    let mut runtime = Runtime::start_with_store(store).await;
+    let peer = runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch labeled-response",
+        )
+        .await;
+    upstream_barrier(&mut runtime, peer, "m009-integrated-encrypted-otr-ready").await;
+
+    let mut aware_a = register_as(
+        &runtime,
+        NetworkId(1),
+        SessionId(71),
+        "message-tags server-time",
+        ClientId(701),
+    )
+    .await;
+    let mut aware_b = register_as(
+        &runtime,
+        NetworkId(1),
+        SessionId(72),
+        "message-tags",
+        ClientId(702),
+    )
+    .await;
+    let mut legacy = register_as(&runtime, NetworkId(1), SessionId(73), "", ClientId(703)).await;
+    for client in [&mut aware_a, &mut aware_b, &mut legacy] {
+        client.settle().await;
+    }
+
+    // The endpoint-only plaintext is deliberately not passed to any bouncer API or
+    // stream. Only the synthetic opaque OTR-like transcript crosses this boundary.
+    let _endpoint_only_plaintext_fixture = ENDPOINT_PLAINTEXT;
+    let outgoing = "PRIVMSG #room :?OTRv3? query-and-AKE-instance=endpoint-A+/==\r\n";
+    aware_a.send(outgoing).await;
+    let sent_upstream = read_until(
+        &mut runtime.upstreams[peer],
+        b"query-and-AKE-instance=endpoint-A",
+    )
+    .await;
+    assert!(
+        sent_upstream
+            .as_bytes()
+            .windows(outgoing.len())
+            .any(|w| w == outgoing.as_bytes())
+    );
+
+    let inbound = [
+        ":alice!u@h PRIVMSG #room :?OTRv3? data-instance=endpoint-B-ciphertext+/==\r\n",
+        ":alice!u@h PRIVMSG #room :?OTR,1,2,fragment-instance=endpoint-B-1+/==\r\n",
+        ":alice!u@h PRIVMSG #room :?OTR,2,2,fragment-instance=endpoint-B-2+/==\r\n",
+    ];
+    let marks = [aware_a.mark(), aware_b.mark(), legacy.mark()];
+    for frame in inbound {
+        runtime.upstreams[peer]
+            .write_all(frame.as_bytes())
+            .await
+            .expect("upstream writes opaque frame");
+    }
+    for (client, mark) in [
+        (&mut aware_a, marks[0]),
+        (&mut aware_b, marks[1]),
+        (&mut legacy, marks[2]),
+    ] {
+        client
+            .await_new(mark, "fragment-instance=endpoint-B-2")
+            .await;
+        client.settle().await;
+        let lines = client.since(mark);
+        for frame in inbound {
+            let body = frame.split_once(" :").expect("body separator").1.trim_end();
+            assert!(
+                lines.contains(body),
+                "opaque body changed for a fanout recipient: {lines:?}"
+            );
+        }
+        assert!(!lines.contains(ENDPOINT_PLAINTEXT));
+    }
+
+    // Detaching one ordinary session does not couple or alter the transcript seen by
+    // the healthy endpoints.
+    drop(legacy);
+    let after_detach =
+        ":alice!u@h PRIVMSG #room :?OTRv3? post-detach-instance=endpoint-B-ciphertext+/==\r\n";
+    let marks = [aware_a.mark(), aware_b.mark()];
+    runtime.upstreams[peer]
+        .write_all(after_detach.as_bytes())
+        .await
+        .expect("upstream writes after one client detaches");
+    for (client, mark) in [(&mut aware_a, marks[0]), (&mut aware_b, marks[1])] {
+        client
+            .await_new(mark, "post-detach-instance=endpoint-B-ciphertext")
+            .await;
+        assert!(
+            client
+                .since(mark)
+                .contains("post-detach-instance=endpoint-B-ciphertext+/==")
+        );
+    }
+
+    let handle = runtime._store.handle_clone();
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("history buffer resolves")
+        .buffer;
+    handle.flush().await.expect("history flushes");
+    let history = handle
+        .query_history(&HistoryQuery {
+            buffer,
+            bound: HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("opaque history reads");
+    assert_eq!(history.len(), inbound.len() + 1);
+    let opaque_search = handle
+        .search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: vec![buffer],
+            sender: None,
+            after: None,
+            before: None,
+            terms: vec![SearchTerm::parse("ciphertext").expect("opaque term parses")],
+            limit: 10,
+        })
+        .await
+        .expect("opaque transcript search completes");
+    assert!(!opaque_search.is_empty());
+    assert!(opaque_search.iter().all(|hit| {
+        !hit.sender.contains(ENDPOINT_PLAINTEXT)
+            && !hit.target.contains(ENDPOINT_PLAINTEXT)
+            && !hit.body.contains(ENDPOINT_PLAINTEXT)
+    }));
+    for (event, frame) in history
+        .iter()
+        .zip(inbound.into_iter().chain([after_detach]))
+    {
+        assert_eq!(event.payload, frame.trim_end().as_bytes());
+    }
+
+    // A newly attached session requests the retained transcript through the IRC
+    // history path, which must replay only the opaque frames supplied above.
+    let mut reattached = register_as(
+        &runtime,
+        NetworkId(1),
+        SessionId(74),
+        "message-tags server-time batch",
+        ClientId(704),
+    )
+    .await;
+    let replay_mark = reattached.mark();
+    reattached.send("CHATHISTORY LATEST #room * 10\r\n").await;
+    reattached
+        .await_new(replay_mark, "fragment-instance=endpoint-B-2")
+        .await;
+    reattached.settle().await;
+    let replay_wire = reattached.since(replay_mark);
+    assert!(replay_wire.contains("data-instance=endpoint-B-ciphertext+/=="));
+    assert!(replay_wire.contains("fragment-instance=endpoint-B-1+/=="));
+    assert!(replay_wire.contains("fragment-instance=endpoint-B-2+/=="));
+    assert!(replay_wire.contains("post-detach-instance=endpoint-B-ciphertext+/=="));
+    assert!(!replay_wire.contains(ENDPOINT_PLAINTEXT));
+    runtime.stop().await;
+
+    let mut files = vec![path.clone()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        files.push(std::path::PathBuf::from(sidecar));
+    }
+    for file in files {
+        if let Ok(bytes) = std::fs::read(file) {
+            assert!(
+                !bytes
+                    .windows(ENDPOINT_PLAINTEXT.len())
+                    .any(|w| w == ENDPOINT_PLAINTEXT.as_bytes())
+            );
+            assert!(!bytes.windows(16).any(|w| w == b"SQLite format 3\0"));
+        }
+    }
+
+    let reopened = Store::open_with_options(
+        &StorePath::File(path),
+        StoreOpenOptions::encrypted(StoreKey::from_bytes([KEY; 32])),
+    )
+    .expect("encrypted store restarts with its key");
+    let handle = reopened.handle_clone();
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("restarted history buffer resolves")
+        .buffer;
+    let replay = handle
+        .query_history(&HistoryQuery {
+            buffer,
+            bound: HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("restarted opaque history reads");
+    assert_eq!(replay.len(), inbound.len() + 1);
+    assert!(replay.iter().all(|event| {
+        !event
+            .payload
+            .windows(ENDPOINT_PLAINTEXT.len())
+            .any(|w| w == ENDPOINT_PLAINTEXT.as_bytes())
+    }));
+    reopened.shutdown().expect("reopened store shuts down");
 }
 
 #[tokio::test]

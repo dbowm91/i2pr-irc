@@ -1,5 +1,15 @@
 # History search and indexed references
 
+## OTR and other endpoint-encrypted conversations
+
+When an IRC endpoint supplies an OTRv3-encrypted message body, retained history and
+CHATHISTORY replay preserve that opaque body. History may therefore replay old
+ciphertext that the receiving endpoint can no longer decrypt. FTS indexes only the
+bytes the bouncer receives; it cannot provide plaintext-content search for an
+end-to-end encrypted conversation whose plaintext never entered the bouncer.
+SQLCipher protects retained database pages at rest, but it does not turn ciphertext
+search into semantic search and its store key is independent of endpoint OTR keys.
+
 Plan 024 / M005-E. This document records the two things Plan 024 delivered: a bounded
 server-side search over retained history, and the indexed reference lookups CHATHISTORY
 needed but did not have.
