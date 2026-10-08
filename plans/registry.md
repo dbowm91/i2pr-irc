@@ -26,7 +26,7 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | M008 active | plans/subsystems/bouncer-core-roadmap.md | Plan 046 ready | Corrective 043 and Plans 044-045 are closed. Plan 046 qualifies encrypted durable state and closes M008 before Plans 047-048 qualify OTRv3 transparent carriage. |
+| Bouncer core | M008 active | plans/subsystems/bouncer-core-roadmap.md | Plan 046 active | Corrective 043 and Plans 044-045 are closed. Plan 046 qualifies encrypted durable state and closes M008 before Plans 047-048 qualify OTRv3 transparent carriage. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -36,7 +36,7 @@ Canonical direction:
 | Bouncer Core Corrective 043 — Deterministic Member-State Test Synchronization | closed | verification/test-harness corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/043-status.md |
 | Bouncer Core M008-A / Plan 044 — SQLCipher and Keyed-Store Foundation | closed | security infrastructure + persistence | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/044-status.md |
 | Bouncer Core M008-B / Plan 045 — Encrypted Store Migration and Key Rotation | closed | security migration + durability | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/045-status.md |
-| Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure | ready | security qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md |
+| Bouncer Core M008-C / Plan 046 — Encrypted Durable-State Qualification and M008 Closure | active | security qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/046-m008c-encrypted-durable-state-qualification-and-closure.md |
 
 ## Recently closed implementation plans
 
