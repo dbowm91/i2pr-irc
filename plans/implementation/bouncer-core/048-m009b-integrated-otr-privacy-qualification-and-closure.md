@@ -1,6 +1,6 @@
 # Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure
 
-Status: blocked
+Status: ready
 
 Hard dependency:
 
