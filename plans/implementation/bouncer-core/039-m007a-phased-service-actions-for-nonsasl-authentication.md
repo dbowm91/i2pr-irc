@@ -1,6 +1,6 @@
 # Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery
 
-Status: active
+Status: closed
 
 Hard dependency:
 
@@ -181,3 +181,5 @@ Create plans/closure/bouncer-core/039-status.md with:
 - redaction evidence;
 - reconnect replay matrix;
 - Plan 040 readiness.
+
+Closure record: `plans/closure/bouncer-core/039-status.md`.

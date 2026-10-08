@@ -1,6 +1,6 @@
 # Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience
 
-Status: blocked
+Status: active
 
 Hard dependency:
 

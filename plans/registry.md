@@ -26,7 +26,7 @@ Canonical direction:
 
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
-| Bouncer core | active M007-A | plans/subsystems/bouncer-core-roadmap.md | Plan 039 ready | Corrective 035 and Plans 036-038 closed; M006 closed. Plans 039-041 implement and qualify M007. M005 and Corrective 034 remain closed. |
+| Bouncer core | active M007-B | plans/subsystems/bouncer-core-roadmap.md | Plan 040 active | Corrective 035 and Plans 036-039 closed; M006 and M007-A closed. Plans 040-041 implement and qualify remaining M007 work. M005 and Corrective 034 remain closed. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Research 008 delegates broad Java/i2pd/i2pr and mixed-router SAM conformance to the dedicated SAM library project. R002 waits only on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own managed-app prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -37,12 +37,13 @@ Canonical direction:
 | Bouncer Core M006-A / Plan 036 — Registration Downgrade and Legacy-Server Baseline | closed | protocol compatibility + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/036-status.md |
 | Bouncer Core M006-B / Plan 037 — Account-Tag and Invite-Notify Mediation | closed | IRCv3 capability + invariant | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/037-status.md |
 | Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | closed | qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/038-status.md |
-| Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery | active | durable policy + security | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md |
+| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | active | identity state machine + resilience | plans/subsystems/bouncer-core-roadmap.md | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md |
 
 ## Recently closed implementation plans
 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
+| Bouncer Core M007-A / Plan 039 — Phased Service Actions for Non-SASL Authentication and Recovery | closed | durable policy + security | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/039-status.md |
 | Bouncer Core Corrective 034 — Restore Rust 1.88 Repository Verification | closed | verification + maintenance corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/034-status.md |
 | Bouncer Core M006-C / Plan 038 — Integrated IRC Interoperability Qualification and M006 Closure | closed | qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/038-status.md |
 | Router Corrective 033 — Repair Live SAM STREAM Qualification | closed | qualification corrective | plans/subsystems/i2p-router-integration-roadmap.md | plans/closure/router-integration/033-status.md |
@@ -83,7 +84,6 @@ Canonical direction:
 
 | Plan | Status | Blocker | Handoff |
 |---|---|---|---|
-| Bouncer Core M007-B / Plan 040 — Preferred-Nick, Reconnect, and Multi-Client Identity Resilience | blocked | Plan 039 closure | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md |
 | Bouncer Core M007-C / Plan 041 — Eggchaos Multi-Client Adverse Qualification and M007 Closure | blocked | Plan 040 closure | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md |
 | Router R002 — i2pr Managed-App Adapter | blocked | stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts + its own managed-app prerequisites | no implementation handoff yet |
 
