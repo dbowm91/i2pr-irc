@@ -1325,6 +1325,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let mut sasl_active = false;
         let mut sasl_authenticated = self.context.record.sasl.is_none();
         let mut optional_decided = false;
+        let mut used_fallback_nick = false;
         let registration = async {
             cap_state = RegistrationCapState::Negotiating;
             send(&mut uw, "CAP LS 302\r\n").await?;
@@ -1512,6 +1513,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 return Err(RuntimeError::NickExhausted);
                             }
                             state.nick = next.clone();
+                            used_fallback_nick = true;
                             send(&mut uw, &format!("NICK {next}\r\n")).await?;
                         }
                         "001" => {
@@ -1553,6 +1555,13 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                 }
             }
+            let actions = self.registration_actions().await;
+            for action in actions.actions_in_phase(crate::action::ActionPhase::PreJoin) {
+                if let Some(frame) = action.frame(&state.nick) {
+                    send(&mut uw, &frame).await?;
+                }
+            }
+
             // Desired state is re-sent only after a fresh registration, never carried
             // across a generation boundary. Writing a JOIN proves nothing about
             // membership: each attempt is recorded as outstanding and only an
@@ -1569,7 +1578,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 state.begin_desired_join(&channel);
                 send(&mut uw, &format!("JOIN {channel}\r\n")).await?;
             }
-            // Registration actions are replayed last, after the JOINs. The ordering is not
+            // PostJoin actions preserve the historical Plan 027 position after the JOINs.
+            // The ordering is not
             // cosmetic: an identify line addressed to a service that then receives our JOIN
             // burst is being read while a dozen unrelated frames arrive, whereas replaying
             // first means the service has the identification before the bouncer's own
@@ -1580,8 +1590,18 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // ambiguous: if a generation dies half way through, the next one starts the
             // sequence from the beginning, which is exactly what the plan requires and
             // exactly what replaying an ambiguous user message must never do.
-            for frame in self.registration_action_frames(&state.nick).await {
-                send(&mut uw, &frame).await?;
+            for action in actions.actions_in_phase(crate::action::ActionPhase::PostJoin) {
+                if let Some(frame) = action.frame(&state.nick) {
+                    send(&mut uw, &frame).await?;
+                }
+            }
+            if used_fallback_nick && self.context.record.keep_nick {
+                for action in actions.actions_in_phase(crate::action::ActionPhase::FallbackRecovery)
+                {
+                    if let Some(frame) = action.frame(&state.nick) {
+                        send(&mut uw, &frame).await?;
+                    }
+                }
             }
             Ok::<(), RuntimeError>(())
         };
@@ -3150,21 +3170,17 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
     /// `nick` is passed in rather than read from state so the frame is built against the
     /// nick *this* generation registered with. An action rendered against a nick from a
     /// previous generation would be configuring whichever identity happened to be current.
-    async fn registration_action_frames(&self, nick: &str) -> Vec<String> {
+    async fn registration_actions(&self) -> crate::action::ActionSet {
         // A bouncer with no control plane still registers and still joins; it simply has no
         // way to read what the Operator asked for. Pretending otherwise would be a lie the
         // Operator could only detect by noticing their identify line stopped.
         let Some(control) = self.control.as_ref() else {
-            return Vec::new();
+            return crate::action::ActionSet::default();
         };
         let Ok(actions) = control.action_list(self.context.network).await else {
-            return Vec::new();
+            return crate::action::ActionSet::default();
         };
         actions
-            .actions()
-            .iter()
-            .filter_map(|action| action.frame(nick))
-            .collect()
     }
 
     /// Evaluates presence and returns the upstream `AWAY` frame a transition requires.

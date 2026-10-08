@@ -246,6 +246,13 @@ pub enum ControlRequest {
         actions: ActionSet,
         reply: oneshot::Sender<Result<usize, RuntimeError>>,
     },
+    /// Replace one phase while preserving other phases as one serialized controller intent.
+    ActionSetPhase {
+        network: NetworkId,
+        phase: i2pr_irc_store::RegistrationActionPhase,
+        actions: ActionSet,
+        reply: oneshot::Sender<Result<usize, RuntimeError>>,
+    },
     /// Read one Network's stored registration actions.
     ///
     /// Returns the typed model rather than the durable rows, so a caller cannot bypass the
@@ -340,6 +347,23 @@ impl RuntimeControlHandle {
         let (reply, response) = oneshot::channel();
         self.send(ControlRequest::ActionSet {
             network,
+            actions,
+            reply,
+        })?;
+        response.await.map_err(|_| RuntimeError::Stopped)?
+    }
+
+    /// Replaces exactly one phase of a Network's registration-action list.
+    pub async fn set_action_phase(
+        &self,
+        network: NetworkId,
+        phase: i2pr_irc_store::RegistrationActionPhase,
+        actions: ActionSet,
+    ) -> Result<usize, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ActionSetPhase {
+            network,
+            phase,
             actions,
             reply,
         })?;
@@ -686,8 +710,13 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 }
             };
             actions.push(
-                crate::action::RegistrationAction::from_parts(kind, row.target, row.payload)
-                    .map_err(|_| RuntimeError::InvalidConfig)?,
+                crate::action::RegistrationAction::from_parts(
+                    kind,
+                    row.target,
+                    row.payload,
+                    row.phase,
+                )
+                .map_err(|_| RuntimeError::InvalidConfig)?,
             );
         }
         ActionSet::new(actions).map_err(|_| RuntimeError::InvalidConfig)
@@ -729,12 +758,22 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             // is wrong in the safe direction -- understated -- cannot mislead an Operator
             // into thinking an action is missing; one that is overstated would send them
             // looking for an action that is not there.
-            let action_count = self
+            let actions = self
                 .catalog
                 .store()
                 .load_registration_actions(record.network)
                 .await
-                .map_or(0, |rows| rows.len()) as u32;
+                .unwrap_or_default();
+            let action_count = actions.len() as u32;
+            let mut action_phase_counts = [0_u32; 3];
+            for action in &actions {
+                let index = match action.phase {
+                    i2pr_irc_store::RegistrationActionPhase::PreJoin => 0,
+                    i2pr_irc_store::RegistrationActionPhase::PostJoin => 1,
+                    i2pr_irc_store::RegistrationActionPhase::FallbackRecovery => 2,
+                };
+                action_phase_counts[index] = action_phase_counts[index].saturating_add(1);
+            }
             networks.push(SnapshotNetwork {
                 network: record.network,
                 display_name: record.display_name.clone(),
@@ -746,6 +785,7 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 keep_nick: record.keep_nick,
                 desired_channels: record.desired_channels.clone(),
                 action_count,
+                action_phase_counts,
             });
         }
         networks.sort_by_key(|entry| entry.network);
@@ -1076,6 +1116,29 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 let count = actions.len();
                 let stored = self.store_actions(network, &actions).await;
                 let _ = reply.send(stored.map(|()| count));
+            }
+            ControlRequest::ActionSetPhase {
+                network,
+                phase,
+                actions,
+                reply,
+            } => {
+                let result = async {
+                    let current = self.load_actions(network).await?;
+                    let merged = current
+                        .actions()
+                        .iter()
+                        .filter(|action| action.phase != phase)
+                        .cloned()
+                        .chain(actions.actions().iter().cloned())
+                        .collect();
+                    let merged = ActionSet::new(merged).map_err(|_| RuntimeError::InvalidConfig)?;
+                    let count = merged.len();
+                    self.store_actions(network, &merged).await?;
+                    Ok(count)
+                }
+                .await;
+                let _ = reply.send(result);
             }
             ControlRequest::ExportConfig { reply } => {
                 let _ = reply.send(Ok(self.export_snapshot().await));

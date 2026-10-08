@@ -71,8 +71,8 @@ bouncer can read back what it wrote.
 
 ```
 #i2pr-bouncer-config
-version 1
-network netid=1 name=lab host=…b32.i2p nick=bot username=user realname=bouncer auto_away=off keep_nick=off actions=1
+version 2
+network netid=1 name=lab host=…b32.i2p nick=bot username=user realname=bouncer auto_away=off keep_nick=off actions=1 action_phases=0,1,0
 channel target=#one position=0 detached=off
 ```
 
@@ -119,7 +119,16 @@ emit an action.
 
 ```
 BouncerServ :ACTION SET 1 mode=+B message=NickServ text=IDENTIFY hunter2
+BouncerServ :ACTION SET 1 phase=pre-join message=NickServ text=IDENTIFY hunter2
+BouncerServ :ACTION SET 1 phase=fallback-recovery message=NickServ text=RECOVER bot
 ```
+
+Actions have `pre-join`, `post-join`, or `fallback-recovery` phases. The legacy form
+replaces the full action list with post-join actions. Supplying `phase=` replaces only that
+phase; an empty phase-specific set clears that phase and preserves the others. Pre-join actions
+run before desired JOINs, post-join actions run after them, and fallback recovery runs only
+after registration under a generated fallback nick when `keep_nick` is enabled. Existing
+actions migrate to post-join.
 
 ### It is an allowlist of shapes, not a denylist of commands
 
@@ -138,12 +147,12 @@ alone would leave open:
 
 ### Replay semantics
 
-Actions are replayed after **every** successful registration generation, after the JOINs.
-That is the difference from retrying an ambiguous user message: nobody typed this at a moment
-whose delivery is in doubt, and an identify line sent twice on reconnect is the intended
-behaviour rather than a duplicate. Every action is idempotent by construction, which is what
-makes replaying it correct. A generation that dies part way through simply starts the
-sequence over on the next one — never resumed, never truncated to what it got through.
+Each successful registration generation runs the configured phases in order: pre-join
+actions, desired JOINs, post-join actions, then fallback-recovery actions only if registration
+used a generated fallback nick and `keep_nick` is enabled. A generation that dies part way
+through starts its applicable setup phases over on the next one. These are operator-configured
+setup actions, not queued user traffic; a reconnect never resumes at an ambiguous action
+index.
 
 ### Secrets
 
@@ -160,9 +169,8 @@ configuration.
 
 ## Storage
 
-Schema 7 adds `registration_actions`, purely additive: no existing table is read, written, or
-rebuilt, so an older binary pointed at a migrated database still sees exactly the
-configuration it had. `position` is part of the primary key because replay order is part of the
+Schema 7 adds `registration_actions`; schema 8 adds its constrained phase, defaulting existing
+rows to post-join. Both migrations preserve action order. `position` is part of the primary key because replay order is part of the
 meaning, and `kind` is `CHECK`-constrained to the two entries the allowlist defines, so a row
 written by a future build is refused by SQLite rather than read back as an unknown kind that
 something downstream would have to guess at.

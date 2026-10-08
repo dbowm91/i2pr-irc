@@ -1,4 +1,4 @@
-//! Schema versions 1 through 7 and their transactional migration harness.
+//! Schema versions 1 through 8 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -18,8 +18,9 @@ use rusqlite::Connection;
 /// [`migrate_4_to_5`]. Version 6 adds the search side index and the two relational
 /// indexes history reference lookup needs; see [`HISTORY_SEARCH_V6`],
 /// [`HISTORY_REFERENCE_INDEXES_V6`], and [`migrate_5_to_6`]. Version 7 adds the bounded
-/// registration-action table; see [`REGISTRATION_ACTIONS_V7`] and [`migrate_6_to_7`].
-pub const SCHEMA_VERSION: i64 = 7;
+/// registration-action table; version 8 adds action phases and migrates prior rows to
+/// `post-join`.
+pub const SCHEMA_VERSION: i64 = 8;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -404,6 +405,11 @@ pub(crate) fn schema_v7() -> String {
     format!("{}{}", schema_v6(), REGISTRATION_ACTIONS_V7)
 }
 
+/// The current schema, created directly when no database exists yet.
+pub(crate) fn schema_v8() -> String {
+    format!("{}{}", schema_v7(), REGISTRATION_ACTIONS_V8)
+}
+
 /// Fills in the derived state migration 6 added, for a schema 6 fixture.
 ///
 /// A genuine v6 database has its `effective_time` populated and its FTS side index built,
@@ -592,7 +598,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v7())
+                .execute_batch(&schema_v8())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -733,6 +739,7 @@ const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     // Without this column every timestamp reference against a buffer whose upstream
     // sends no `server-time` resolves against an empty index.
     ("history_events", "effective_time"),
+    ("registration_actions", "phase"),
 ];
 
 /// Confirms every promised column is present on its table.
@@ -771,6 +778,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             4 => migrate_4_to_5(transaction)?,
             5 => migrate_5_to_6(transaction)?,
             6 => migrate_6_to_7(transaction)?,
+            7 => migrate_7_to_8(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -1001,6 +1009,22 @@ CREATE TABLE registration_actions (
 /// configuration it had before, just without the new table's rows being replayed.
 fn migrate_6_to_7(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(REGISTRATION_ACTIONS_V7)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+/// Schema 8 adds an explicit execution phase. Existing durable actions were replayed after
+/// desired JOINs, so the default preserves their established behavior exactly.
+const REGISTRATION_ACTIONS_V8: &str = r#"
+ALTER TABLE registration_actions
+    ADD COLUMN phase TEXT NOT NULL DEFAULT 'post-join'
+    CHECK (phase IN ('pre-join', 'post-join', 'fallback-recovery'));
+"#;
+
+fn migrate_7_to_8(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(REGISTRATION_ACTIONS_V8)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;

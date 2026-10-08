@@ -1056,6 +1056,7 @@ async fn an_import_applies_a_snapshot_one_network_at_a_time_and_reports_progress
                 detached: false,
             }],
             action_count: 0,
+            action_phase_counts: [0, 0, 0],
         }],
     };
 
@@ -1101,6 +1102,7 @@ async fn an_import_that_names_a_different_network_under_one_identity_stops_witho
         keep_nick: false,
         desired_channels: Vec::new(),
         action_count: 0,
+        action_phase_counts: [0, 0, 0],
     };
     // Network 2 sorts after Network 1, so this would have been applied had Network 1 not
     // conflicted. That ordering is what makes "stopped" a meaningful claim.
@@ -1115,6 +1117,7 @@ async fn an_import_that_names_a_different_network_under_one_identity_stops_witho
         keep_nick: false,
         desired_channels: Vec::new(),
         action_count: 0,
+        action_phase_counts: [0, 0, 0],
     };
     entry.desired_channels = Vec::new();
 
@@ -1197,6 +1200,175 @@ async fn a_stored_action_is_replayed_after_a_successful_registration() {
 }
 
 #[tokio::test]
+async fn action_phases_bracket_join_and_recovery_follows_a_fallback_nick() {
+    use i2pr_irc_runtime::action::{ActionSet, RegistrationAction};
+    use i2pr_irc_store::RegistrationActionPhase as Phase;
+
+    let mut runtime = Runtime::start().await;
+    let mut configured = record(1, &["#room"]);
+    configured.keep_nick = true;
+    runtime
+        .control
+        .create(configured)
+        .await
+        .expect("network creates with keep-nick policy");
+    let actions = ActionSet::new(vec![
+        RegistrationAction::message_in_phase("NickServ", "IDENTIFY pre-secret", Phase::PreJoin)
+            .expect("pre-join service action"),
+        RegistrationAction::mode_in_phase("+B", Phase::PostJoin).expect("post-join mode"),
+        RegistrationAction::message_in_phase(
+            "NickServ",
+            "RECOVER bot recovery-secret",
+            Phase::FallbackRecovery,
+        )
+        .expect("fallback recovery action"),
+    ])
+    .expect("bounded phased actions");
+    runtime
+        .control
+        .set_actions(NetworkId(1), actions)
+        .await
+        .expect("actions persist");
+
+    let (mut upstream, controller) = runtime.provider.closable_peer().await;
+    read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+    upstream
+        .write_all(b":srv CAP * LS :\r\n")
+        .await
+        .expect("minimal server finishes CAP LS");
+    read_until(&mut upstream, b"CAP END\r\n").await;
+    upstream
+        .write_all(b":srv 433 bot bot :nickname in use\r\n")
+        .await
+        .expect("preferred nick collides");
+    let fallback = read_until(&mut upstream, b"NICK bot_").await;
+    assert!(fallback.contains("NICK bot_"));
+    let fallback_nick = fallback
+        .trim_end_matches("\r\n")
+        .split_once(' ')
+        .expect("fallback NICK has a parameter")
+        .1;
+    upstream
+        .write_all(b":srv 001 bot_ :welcome\r\n")
+        .await
+        .expect("fallback identity completes registration");
+    let transcript = read_until(
+        &mut upstream,
+        b"PRIVMSG NickServ :RECOVER bot recovery-secret\r\n",
+    )
+    .await;
+    let text = transcript;
+    assert!(text.contains("PRIVMSG NickServ :IDENTIFY pre-secret"));
+    assert!(text.contains("JOIN #room"));
+    let postjoin_mode = format!("MODE {fallback_nick} +B");
+    assert!(text.contains(&postjoin_mode), "{text}");
+    assert!(text.contains("PRIVMSG NickServ :RECOVER bot recovery-secret"));
+    assert!(
+        text.find("IDENTIFY pre-secret").unwrap() < text.find("JOIN #room").unwrap()
+            && text.find("JOIN #room").unwrap() < text.find(&postjoin_mode).unwrap()
+            && text.find(&postjoin_mode).unwrap()
+                < text.find("RECOVER bot recovery-secret").unwrap(),
+        "phase order is PreJoin, joins, PostJoin, FallbackRecovery: {text}"
+    );
+    runtime.upstreams.push(upstream);
+    runtime.upstreams_closable.push(Some(controller));
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn fallback_recovery_is_skipped_without_both_fallback_and_keep_nick() {
+    use i2pr_irc_runtime::action::{ActionSet, RegistrationAction};
+    use i2pr_irc_store::RegistrationActionPhase as Phase;
+
+    let mut runtime = Runtime::start().await;
+    for (network, keep_nick, collide) in [(1, true, false), (2, false, true)] {
+        let mut configured = record(network, &["#room"]);
+        configured.keep_nick = keep_nick;
+        runtime
+            .control
+            .create(configured)
+            .await
+            .expect("network creates");
+        let actions = ActionSet::new(vec![
+            RegistrationAction::message_in_phase(
+                "NickServ",
+                "RECOVER bot recovery-secret",
+                Phase::FallbackRecovery,
+            )
+            .expect("fallback recovery action"),
+        ])
+        .expect("bounded actions");
+        runtime
+            .control
+            .set_actions(NetworkId(network), actions)
+            .await
+            .expect("actions persist");
+
+        let (mut upstream, controller) = runtime.provider.closable_peer().await;
+        read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(b":srv CAP * LS :\r\n")
+            .await
+            .expect("CAP LS");
+        read_until(&mut upstream, b"CAP END\r\n").await;
+        if collide {
+            upstream
+                .write_all(b":srv 433 bot bot :nickname in use\r\n")
+                .await
+                .expect("preferred nick collides");
+            read_until(&mut upstream, b"NICK bot_").await;
+            upstream
+                .write_all(b":srv 001 bot_1 :welcome\r\n")
+                .await
+                .expect("fallback registration completes");
+        } else {
+            upstream
+                .write_all(b":srv 001 bot :welcome\r\n")
+                .await
+                .expect("preferred nick registration completes");
+        }
+        read_until(&mut upstream, b"JOIN #room\r\n").await;
+        let mut received = Vec::new();
+        let until = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        while tokio::time::Instant::now() < until {
+            let mut probe = [0_u8; 256];
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Ok(count)) = tokio::time::timeout(remaining, upstream.read(&mut probe)).await
+            else {
+                break;
+            };
+            received.extend_from_slice(&probe[..count]);
+            assert!(
+                !String::from_utf8_lossy(&probe[..count]).contains("RECOVER"),
+                "recovery must not run: {}",
+                String::from_utf8_lossy(&probe[..count])
+            );
+            if received
+                .windows(b"PING :bouncer-".len())
+                .any(|w| w == b"PING :bouncer-")
+            {
+                let ping = String::from_utf8_lossy(&received);
+                if let Some(token) = ping.lines().find_map(|line| line.strip_prefix("PING :")) {
+                    upstream
+                        .write_all(format!("PONG :{token}\r\n").as_bytes())
+                        .await
+                        .expect("answer the keepalive");
+                }
+                received.clear();
+            }
+        }
+        assert!(
+            !String::from_utf8_lossy(&received).contains("RECOVER"),
+            "recovery must not run: {}",
+            String::from_utf8_lossy(&received)
+        );
+        runtime.upstreams.push(upstream);
+        runtime.upstreams_closable.push(Some(controller));
+    }
+    runtime.stop().await;
+}
+
+#[tokio::test]
 async fn an_identify_line_with_a_space_replays_whole() {
     // `IDENTIFY hunter2` is one message containing a space. A parser that took a single
     // whitespace-separated word would store `IDENTIFY` and drop the password, which fails at
@@ -1226,6 +1398,109 @@ async fn an_identify_line_with_a_space_replays_whole() {
     assert_eq!(
         frame, "PRIVMSG NickServ :IDENTIFY hunter2\r\n",
         "the whole message survives, spaces included"
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn phase_scoped_action_set_replaces_only_that_phase() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut client = register(&runtime, NetworkId(1), SessionId(1), "").await;
+    client
+        .send("PRIVMSG BouncerServ :action set 1 phase=pre-join message=NickServ text=IDENTIFY first-secret\r\n")
+        .await;
+    client.until("Set 1 actions").await;
+    client
+        .send("PRIVMSG BouncerServ :action set 1 phase=fallback-recovery message=NickServ text=RECOVER bot second-secret\r\n")
+        .await;
+    client.until("Set 2 actions").await;
+
+    let actions = runtime
+        .control
+        .action_list(NetworkId(1))
+        .await
+        .expect("actions read");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(
+        actions.actions()[0].phase,
+        i2pr_irc_store::RegistrationActionPhase::PreJoin
+    );
+    assert_eq!(
+        actions.actions()[1].phase,
+        i2pr_irc_store::RegistrationActionPhase::FallbackRecovery
+    );
+
+    let clear_mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :action set 1 phase=pre-join\r\n")
+        .await;
+    client.await_new(clear_mark, "Set 1 actions").await;
+    let remaining = runtime
+        .control
+        .action_list(NetworkId(1))
+        .await
+        .expect("remaining phase survives");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining.actions()[0].phase,
+        i2pr_irc_store::RegistrationActionPhase::FallbackRecovery
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn simultaneous_phase_updates_from_two_sessions_do_not_overwrite_each_other() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let mut first = register(&runtime, NetworkId(1), SessionId(1), "").await;
+    let mut second = register(&runtime, NetworkId(1), SessionId(2), "").await;
+    let first_mark = first.mark();
+    let second_mark = second.mark();
+    let (_, _) = tokio::join!(
+        first.send(
+            "PRIVMSG BouncerServ :action set 1 phase=pre-join message=NickServ text=IDENTIFY first-secret\r\n"
+        ),
+        second.send(
+            "PRIVMSG BouncerServ :action set 1 phase=fallback-recovery message=NickServ text=RECOVER bot second-secret\r\n"
+        ),
+    );
+    first.await_new(first_mark, "Set 1 actions").await;
+    second.await_new(second_mark, "Set 2 actions").await;
+
+    let actions = runtime
+        .control
+        .action_list(NetworkId(1))
+        .await
+        .expect("actions read");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(
+        actions
+            .actions_in_phase(i2pr_irc_store::RegistrationActionPhase::PreJoin)
+            .count(),
+        1
+    );
+    assert_eq!(
+        actions
+            .actions_in_phase(i2pr_irc_store::RegistrationActionPhase::FallbackRecovery)
+            .count(),
+        1
     );
     runtime.stop().await;
 }
@@ -1310,6 +1585,61 @@ async fn an_action_status_reports_a_count_and_never_a_payload() {
     let reply = client.since(mark);
     assert!(!reply.contains("hunter2"), "{reply}");
     assert!(!reply.contains("NickServ"), "not even the target: {reply}");
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn config_snapshot_round_trips_phase_counts_without_action_payloads() {
+    use i2pr_irc_runtime::action::{ActionSet, RegistrationAction};
+    use i2pr_irc_store::RegistrationActionPhase as Phase;
+
+    let mut runtime = Runtime::start().await;
+    runtime
+        .bring_online(
+            1,
+            &["#room"],
+            "message-tags server-time batch",
+            "CHANTYPES=#",
+            ":bot!u@h JOIN {channel}",
+        )
+        .await;
+    let actions = ActionSet::new(vec![
+        RegistrationAction::message_in_phase("NickServ", "IDENTIFY pre-secret", Phase::PreJoin)
+            .expect("pre-join action"),
+        RegistrationAction::message("NickServ", "IDENTIFY post-secret").expect("post-join action"),
+        RegistrationAction::message_in_phase(
+            "NickServ",
+            "RECOVER recovery-secret",
+            Phase::FallbackRecovery,
+        )
+        .expect("fallback action"),
+    ])
+    .expect("bounded action set");
+    runtime
+        .control
+        .set_actions(NetworkId(1), actions)
+        .await
+        .expect("actions persist");
+
+    let snapshot = runtime
+        .control
+        .export_config()
+        .await
+        .expect("snapshot exports");
+    assert_eq!(snapshot.networks()[0].action_count, 3);
+    assert_eq!(snapshot.networks()[0].action_phase_counts, [1, 1, 1]);
+    let rendered = i2pr_irc_runtime::config_snapshot::render(&snapshot);
+    assert!(rendered.contains("action_phases=1,1,1"), "{rendered}");
+    for secret in ["pre-secret", "post-secret", "recovery-secret"] {
+        assert!(
+            !rendered.contains(secret),
+            "snapshots omit action payloads: {rendered}"
+        );
+    }
+    assert_eq!(
+        i2pr_irc_runtime::config_snapshot::parse(&rendered).expect("snapshot parses"),
+        snapshot
+    );
     runtime.stop().await;
 }
 

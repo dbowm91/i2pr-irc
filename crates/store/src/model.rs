@@ -1048,6 +1048,39 @@ pub enum RegistrationActionKind {
     Message,
 }
 
+/// When one bounded registration action is replayed in a connection generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RegistrationActionPhase {
+    /// After registration and before desired channel joins.
+    PreJoin,
+    /// After desired channel joins. This is the migrated legacy behavior.
+    #[default]
+    PostJoin,
+    /// After joins when this generation registered under a generated fallback nick.
+    FallbackRecovery,
+}
+
+impl RegistrationActionPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreJoin => "pre-join",
+            Self::PostJoin => "post-join",
+            Self::FallbackRecovery => "fallback-recovery",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "pre-join" => Ok(Self::PreJoin),
+            "post-join" => Ok(Self::PostJoin),
+            "fallback-recovery" => Ok(Self::FallbackRecovery),
+            _ => Err(StoreError::new(StoreErrorKind::Corrupt(
+                "registration action phase",
+            ))),
+        }
+    }
+}
+
 impl RegistrationActionKind {
     /// The spelling stored in the column.
     pub fn as_str(self) -> &'static str {
@@ -1078,6 +1111,7 @@ impl RegistrationActionKind {
 #[derive(Clone, Eq, PartialEq)]
 pub struct StoredRegistrationAction {
     pub kind: RegistrationActionKind,
+    pub phase: RegistrationActionPhase,
     /// The mode string, or the message target.
     pub target: String,
     /// The action text, always present in storage even for a `MODE`, where it is empty.

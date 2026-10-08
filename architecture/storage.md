@@ -27,11 +27,11 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 7
+## Schema version 8
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
-`SCHEMA_VERSION` is 7. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every database written since M002 migrates forward in place rather than being refused.
+`SCHEMA_VERSION` is 8. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every database written since M002 migrates forward in place rather than being refused.
 
 | Table | Purpose |
 |---|---|
@@ -43,7 +43,7 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 | `history_events` | bounded durable history |
 | `client_cursors` | per-`(ClientId, BufferId)` playback position |
 | `read_markers` | per-`BufferId` operator read state |
-| `registration_actions` | ordered post-registration replay list, one row per Network position |
+| `registration_actions` | ordered phased registration-action list, one row per Network position |
 | `history_search` | FTS5 **side index** over searchable history; `history_events` remains the source of truth |
 
 `history_search` is a virtual table, so its `…_data`, `…_idx`, `…_docsize`, `…_content`
@@ -170,6 +170,14 @@ model, and storage enforces the same one rather than assuming it.
 Cascading on `networks` means a deleted Network takes its actions with it, for the same reason
 it takes its buffers and history: a reused `NetworkId` must not inherit a list of commands it
 never configured.
+
+### What version 8 added, and why
+
+Version 8 adds a constrained `phase` column to `registration_actions`. The values are
+`pre-join`, `post-join`, and `fallback-recovery`; the migration defaults every existing row to
+`post-join`, preserving the previous execution order and behavior. The schema check constraint
+keeps unknown phase values out of storage, and the existing `(network_id, position)` key
+continues to preserve list order. The migration from version 7 is additive and transactional.
 
 ### Migrating version 6
 

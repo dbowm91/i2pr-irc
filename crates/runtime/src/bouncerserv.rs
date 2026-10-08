@@ -114,6 +114,8 @@ pub enum ServCommand {
     ActionSet {
         network: NetworkId,
         actions: ActionSet,
+        /// When present, replace only this phase and keep other phase lists intact.
+        replace_phase: Option<i2pr_irc_store::RegistrationActionPhase>,
     },
 }
 
@@ -160,7 +162,9 @@ impl std::fmt::Debug for ServCommand {
             Self::ActionStatus { network } => return write!(f, "ActionStatus({network:?})"),
             // Never renders the payloads. An action's text may be a service password, so
             // this arm is one of the two that has to be right by construction.
-            Self::ActionSet { network, actions } => {
+            Self::ActionSet {
+                network, actions, ..
+            } => {
                 return write!(f, "ActionSet({network:?}, {} actions)", actions.len());
             }
         };
@@ -371,7 +375,10 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                 // fails at the service while looking exactly like a working configuration.
                 let (head, body) = split_at_action_text(text);
                 let mut actions: Vec<RegistrationAction> = Vec::new();
-                let mut pending_message: Option<&str> = None;
+                let mut pending_message: Option<(&str, i2pr_irc_store::RegistrationActionPhase)> =
+                    None;
+                let mut phase = i2pr_irc_store::RegistrationActionPhase::PostJoin;
+                let mut replace_phase = None;
                 for param in head.split_whitespace().skip(3) {
                     let (key, value) = param
                         .split_once('=')
@@ -380,11 +387,19 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                         return Err(BouncerError::AttributeTooLong((*key).to_owned()));
                     }
                     match key {
+                        "phase" => {
+                            phase = i2pr_irc_store::RegistrationActionPhase::parse(value)
+                                .map_err(|_| BouncerError::ValueOutOfRange)?;
+                            replace_phase = Some(phase);
+                        }
                         "mode" => {
                             if actions.len() >= crate::action::MAX_REGISTRATION_ACTIONS {
                                 return Err(BouncerError::TooManyParameters);
                             }
-                            actions.push(RegistrationAction::mode(value).map_err(map_action)?);
+                            actions.push(
+                                RegistrationAction::mode_in_phase(value, phase)
+                                    .map_err(map_action)?,
+                            );
                         }
                         // The target is recorded and the action built when the text arrives,
                         // so `text=` belongs to the `message=` that precedes it rather than to
@@ -393,13 +408,16 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                             if actions.len() >= crate::action::MAX_REGISTRATION_ACTIONS {
                                 return Err(BouncerError::TooManyParameters);
                             }
-                            pending_message = Some(value);
+                            pending_message = Some((value, phase));
                         }
                         other => return Err(BouncerError::UnknownAttribute((*other).to_owned())),
                     }
                 }
-                if let Some(target) = pending_message {
-                    actions.push(RegistrationAction::message(target, body).map_err(map_action)?);
+                if let Some((target, message_phase)) = pending_message {
+                    actions.push(
+                        RegistrationAction::message_in_phase(target, body, message_phase)
+                            .map_err(map_action)?,
+                    );
                 } else if !body.is_empty() {
                     // A text with no target is refused rather than ignored: silently dropping
                     // it would clear the Operator's list while they believed they had written
@@ -411,7 +429,16 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                 // error the way an empty `CHANGENETWORK` is: an empty set is built and
                 // written, rather than answered locally.
                 let actions = crate::action::ActionSet::new(actions).map_err(map_action)?;
-                Ok(ServCommand::ActionSet { network, actions })
+                if replace_phase.is_some()
+                    && actions.actions().iter().any(|action| action.phase != phase)
+                {
+                    return Err(BouncerError::Usage);
+                }
+                Ok(ServCommand::ActionSet {
+                    network,
+                    actions,
+                    replace_phase,
+                })
             }
             other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
         },
@@ -641,6 +668,7 @@ mod action_matrix {
         assert!(parse("ACTION SET 1 mode=+B").is_ok());
         // `PRIVMSG` reaches the same model through `message=`, not through a verb.
         assert!(parse("ACTION SET 1 message=NickServ text=IDENTIFY pw").is_ok());
+        assert!(parse("ACTION SET 1 phase=pre-join message=NickServ text=IDENTIFY pw").is_ok());
         // A message with a space in it, which is what an identify line actually is.
         assert!(parse("ACTION SET 1 message=NickServ text=IDENTIFY hunter2").is_ok());
     }

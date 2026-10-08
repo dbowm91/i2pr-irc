@@ -1616,7 +1616,7 @@ pub(crate) fn load_registration_actions(
 ) -> Result<Vec<StoredRegistrationAction>, StoreError> {
     let mut statement = connection
         .prepare(
-            "SELECT kind, target, payload FROM registration_actions
+            "SELECT kind, target, payload, phase FROM registration_actions
              WHERE network_id=?1 ORDER BY position LIMIT ?2",
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
@@ -1631,15 +1631,18 @@ pub(crate) fn load_registration_actions(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let mut actions = Vec::new();
     for row in rows {
-        let (kind, target, payload) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        let (kind, target, payload, phase) =
+            row.map_err(|error| sql(error, CommitState::RolledBack))?;
         actions.push(StoredRegistrationAction {
             kind: RegistrationActionKind::parse(&kind)?,
+            phase: RegistrationActionPhase::parse(&phase)?,
             target,
             payload: StoredSecret::new(payload),
         });
@@ -1683,14 +1686,15 @@ pub(crate) fn save_registration_actions(
         transaction
             .execute(
                 "INSERT INTO registration_actions
-                     (network_id, position, kind, target, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (network_id, position, kind, target, payload, phase)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     to_sql_id(network.0)?,
                     position,
                     action.kind.as_str(),
                     action.target,
                     action.payload.expose(),
+                    action.phase.as_str(),
                 ],
             )
             .map_err(|error| sql(error, CommitState::RolledBack))?;

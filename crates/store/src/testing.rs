@@ -180,6 +180,34 @@ pub fn create_v6_database(path: &Path) -> Connection {
     connection
 }
 
+/// Creates a database at schema version 7 with a durable registration action.
+///
+/// The schema 7 -> 8 migration must retain that action and assign the historical
+/// post-join phase, rather than merely adding a column to an empty table.
+pub fn create_v7_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v7())
+        .expect("schema 7 applies");
+    connection
+        .execute_batch(
+            "INSERT INTO networks
+                (network_id, endpoint, endpoint_kind, nick, username, realname, display_name)
+             VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p', 1,
+                     'bot', 'user', 'bouncer', 'lab');
+             INSERT INTO registration_actions (network_id, position, kind, target, payload)
+             VALUES (1, 0, 'message', 'NickServ', 'IDENTIFY synthetic-secret');",
+        )
+        .expect("schema 7 action fixture is insertable");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 7)
+        .expect("user_version is writable");
+    connection
+}
+
 /// Seeds one Network, one Buffer, and three retained messages.
 fn seed_history_for_backfill(connection: &Connection) {
     connection

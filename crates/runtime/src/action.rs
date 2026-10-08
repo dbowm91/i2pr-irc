@@ -45,6 +45,8 @@
 use i2pr_irc_store::StoredSecret;
 use std::fmt;
 
+pub use i2pr_irc_store::RegistrationActionPhase as ActionPhase;
+
 /// Ceiling on actions one Network may store.
 ///
 /// Small because these are per-generation setup, not a scripting facility. The ceiling is a
@@ -151,6 +153,7 @@ impl fmt::Display for ActionError {
 #[derive(Clone, Eq, PartialEq)]
 pub struct RegistrationAction {
     pub kind: ActionKind,
+    pub phase: i2pr_irc_store::RegistrationActionPhase,
     /// The mode string, or the message target.
     pub target: String,
     /// The action text, or `None` for a `MODE` whose modes are in `target`.
@@ -177,9 +180,17 @@ impl fmt::Debug for RegistrationAction {
 impl RegistrationAction {
     /// A `MODE` action on the bouncer's own nick.
     pub fn mode(modes: &str) -> Result<Self, ActionError> {
+        Self::mode_in_phase(modes, i2pr_irc_store::RegistrationActionPhase::PostJoin)
+    }
+
+    pub fn mode_in_phase(
+        modes: &str,
+        phase: i2pr_irc_store::RegistrationActionPhase,
+    ) -> Result<Self, ActionError> {
         Self::validate_modes(modes)?;
         Ok(Self {
             kind: ActionKind::Mode,
+            phase,
             target: modes.to_owned(),
             text: None,
         })
@@ -187,6 +198,18 @@ impl RegistrationAction {
 
     /// A message action to an explicitly named service target.
     pub fn message(target: &str, text: &str) -> Result<Self, ActionError> {
+        Self::message_in_phase(
+            target,
+            text,
+            i2pr_irc_store::RegistrationActionPhase::PostJoin,
+        )
+    }
+
+    pub fn message_in_phase(
+        target: &str,
+        text: &str,
+        phase: i2pr_irc_store::RegistrationActionPhase,
+    ) -> Result<Self, ActionError> {
         if target.is_empty() || target.len() > MAX_ACTION_TARGET_BYTES {
             return Err(ActionError::InvalidTarget);
         }
@@ -201,6 +224,7 @@ impl RegistrationAction {
         }
         Ok(Self {
             kind: ActionKind::Message,
+            phase,
             target: target.to_owned(),
             text: Some(StoredSecret::new(text.to_owned())),
         })
@@ -241,11 +265,12 @@ impl RegistrationAction {
         kind: ActionKind,
         target: String,
         payload: StoredSecret,
+        phase: i2pr_irc_store::RegistrationActionPhase,
     ) -> Result<Self, ActionError> {
         let text = payload.expose();
         match kind {
             ActionKind::Mode => {
-                let action = Self::mode(&target)?;
+                let action = Self::mode_in_phase(&target, phase)?;
                 // A stored mode action with a payload is corrupt rather than ignored: the
                 // text would otherwise be a secret sitting in a row nothing ever emits.
                 if !text.is_empty() {
@@ -253,7 +278,7 @@ impl RegistrationAction {
                 }
                 Ok(action)
             }
-            ActionKind::Message => Self::message(&target, text),
+            ActionKind::Message => Self::message_in_phase(&target, text, phase),
         }
     }
 
@@ -275,6 +300,7 @@ impl RegistrationAction {
         };
         Some(i2pr_irc_store::StoredRegistrationAction {
             kind,
+            phase: self.phase,
             target: self.target.clone(),
             payload,
         })
@@ -322,6 +348,16 @@ impl ActionSet {
     /// The actions, in replay order.
     pub fn actions(&self) -> &[RegistrationAction] {
         &self.actions
+    }
+
+    /// Actions for one execution phase, preserving the Operator's order.
+    pub fn actions_in_phase(
+        &self,
+        phase: i2pr_irc_store::RegistrationActionPhase,
+    ) -> impl Iterator<Item = &RegistrationAction> {
+        self.actions
+            .iter()
+            .filter(move |action| action.phase == phase)
     }
 
     /// How many actions this Network replays.
@@ -508,9 +544,13 @@ mod tests {
         // And the durable round trip preserves the value without ever exposing it in a
         // format string.
         let stored = action.to_stored().expect("a durable form");
-        let rebuilt =
-            RegistrationAction::from_parts(ActionKind::Message, stored.target, stored.payload)
-                .expect("a stored action revalidates");
+        let rebuilt = RegistrationAction::from_parts(
+            ActionKind::Message,
+            stored.target,
+            stored.payload,
+            stored.phase,
+        )
+        .expect("a stored action revalidates");
         assert_eq!(
             rebuilt.frame("bot").as_deref(),
             Some("PRIVMSG NickServ :IDENTIFY hunter2\r\n")
@@ -525,6 +565,7 @@ mod tests {
             ActionKind::Mode,
             "+B".to_owned(),
             StoredSecret::new("hunter2".to_owned()),
+            i2pr_irc_store::RegistrationActionPhase::PostJoin,
         )
         .unwrap_err();
         assert_eq!(error, ActionError::PrefixedRefused);
@@ -544,6 +585,7 @@ mod tests {
                     kind,
                     target.clone(),
                     StoredSecret::new(payload.to_owned()),
+                    i2pr_irc_store::RegistrationActionPhase::PostJoin,
                 )
                 .is_err(),
                 "{kind:?} {target} must not survive revalidation"

@@ -41,7 +41,9 @@ use i2pr_irc_core::{I2pEndpoint, NetworkId};
 use i2pr_irc_store::{DesiredChannelRecord, MAX_DISPLAY_NAME_BYTES, NetworkRecord, StoredSecret};
 
 /// The only snapshot version this build writes or accepts.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
+/// Version 1 carried only a total action count; its actions use the migrated PostJoin phase.
+const LEGACY_SNAPSHOT_VERSION: u32 = 1;
 
 /// The first line of every snapshot, and the marker a parser requires before anything else.
 ///
@@ -128,6 +130,8 @@ pub struct SnapshotNetwork {
     /// The *count*, never the payloads: a stored action may carry a service credential in
     /// its text, and an export is something an Operator pastes into a support channel.
     pub action_count: u32,
+    /// Secret-free action counts in pre-join, post-join, fallback-recovery order.
+    pub action_phase_counts: [u32; 3],
 }
 
 /// A whole configuration snapshot.
@@ -166,7 +170,7 @@ fn render_network(entry: &SnapshotNetwork) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "network netid={} name={} host={} nick={} username={} realname={} \
-         auto_away={} keep_nick={} actions={}\n",
+         auto_away={} keep_nick={} actions={} action_phases={},{},{}\n",
         bouncer_networks::render_netid(entry.network),
         entry.display_name,
         entry.endpoint.as_str(),
@@ -176,6 +180,9 @@ fn render_network(entry: &SnapshotNetwork) -> String {
         on_off(entry.auto_away),
         on_off(entry.keep_nick),
         entry.action_count,
+        entry.action_phase_counts[0],
+        entry.action_phase_counts[1],
+        entry.action_phase_counts[2],
     ));
     let mut channels = entry.desired_channels.clone();
     channels.sort_by_key(|channel| channel.position);
@@ -220,8 +227,18 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         Some(line) => parse_version(line)?,
         None => return Err(ConfigError::UnsupportedVersion(0)),
     };
-    if version != SNAPSHOT_VERSION {
+    if version != SNAPSHOT_VERSION && version != LEGACY_SNAPSHOT_VERSION {
         return Err(ConfigError::UnsupportedVersion(version));
+    }
+
+    // Refuse secret-shaped lines before attempting any record conversion, so an invalid
+    // earlier action-count field cannot mask a credential pasted later in the snapshot.
+    for line in lines.iter().skip(2) {
+        if let Some(field) = split_fields(line).first()
+            && is_secret_name(field.split('=').next().unwrap_or(field))
+        {
+            return Err(ConfigError::RefusedSecret((*field).to_owned()));
+        }
     }
 
     let mut snapshot = ConfigSnapshot::default();
@@ -233,7 +250,7 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         }
         match fields[0] {
             "network" => {
-                let entry = parse_network(&fields[1..])?;
+                let entry = parse_network(&fields[1..], version)?;
                 if snapshot.networks.iter().any(|n| n.network == entry.network) {
                     return Err(ConfigError::DuplicateNetwork(entry.network));
                 }
@@ -294,7 +311,7 @@ fn split_fields(line: &str) -> Vec<&str> {
 }
 
 /// Parses one `network` line into a validated record.
-fn parse_network(fields: &[&str]) -> Result<SnapshotNetwork, ConfigError> {
+fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, ConfigError> {
     let mut netid = None;
     let mut name = None;
     let mut host = None;
@@ -304,6 +321,7 @@ fn parse_network(fields: &[&str]) -> Result<SnapshotNetwork, ConfigError> {
     let mut auto_away = None;
     let mut keep_nick = None;
     let mut actions = None;
+    let mut action_phases = None;
     for field in fields {
         // Checked before the `=` split, because the most likely way a credential reaches a
         // snapshot is an Operator pasting `sasl user=bob` onto a record line -- a field
@@ -326,6 +344,17 @@ fn parse_network(fields: &[&str]) -> Result<SnapshotNetwork, ConfigError> {
             "auto_away" => auto_away = Some(parse_on_off(value)?),
             "keep_nick" => keep_nick = Some(parse_on_off(value)?),
             "actions" => actions = Some(parse_bounded_u32("actions", value)?),
+            "action_phases" => {
+                let mut counts = [0; 3];
+                let mut parts = value.split(',');
+                for count in &mut counts {
+                    *count = parse_bounded_u32("action_phases", parts.next().unwrap_or(""))?;
+                }
+                if parts.next().is_some() {
+                    return Err(ConfigError::InvalidValue("action_phases"));
+                }
+                action_phases = Some(counts);
+            }
             other => return Err(ConfigError::UnknownAttribute(other.to_owned())),
         }
     }
@@ -335,6 +364,32 @@ fn parse_network(fields: &[&str]) -> Result<SnapshotNetwork, ConfigError> {
     }
     let endpoint = I2pEndpoint::parse(host.ok_or(ConfigError::MissingAttribute("host"))?)
         .map_err(|_| ConfigError::InvalidValue("host"))?;
+    let nick =
+        bounded_token("nick", nick.ok_or(ConfigError::MissingAttribute("nick"))?)?.to_owned();
+    let username = bounded_token(
+        "username",
+        username.ok_or(ConfigError::MissingAttribute("username"))?,
+    )?
+    .to_owned();
+    let realname = bounded_token(
+        "realname",
+        realname.ok_or(ConfigError::MissingAttribute("realname"))?,
+    )?
+    .to_owned();
+    let auto_away = auto_away.ok_or(ConfigError::MissingAttribute("auto_away"))?;
+    let keep_nick = keep_nick.ok_or(ConfigError::MissingAttribute("keep_nick"))?;
+    let action_count = actions.ok_or(ConfigError::MissingAttribute("actions"))?;
+    let action_phase_counts = match (version, action_phases) {
+        (_, Some(counts)) => counts,
+        (LEGACY_SNAPSHOT_VERSION, None) => [0, action_count, 0],
+        (SNAPSHOT_VERSION, None) => {
+            return Err(ConfigError::MissingAttribute("action_phases"));
+        }
+        _ => return Err(ConfigError::UnsupportedVersion(version)),
+    };
+    if action_phase_counts.iter().copied().sum::<u32>() != action_count {
+        return Err(ConfigError::InvalidValue("action_phases"));
+    }
     Ok(SnapshotNetwork {
         network: bouncer_networks::parse_netid(
             netid.ok_or(ConfigError::MissingAttribute("netid"))?,
@@ -342,21 +397,14 @@ fn parse_network(fields: &[&str]) -> Result<SnapshotNetwork, ConfigError> {
         .map_err(|_| ConfigError::InvalidValue("netid"))?,
         display_name: display_name.to_owned(),
         endpoint,
-        nick: bounded_token("nick", nick.ok_or(ConfigError::MissingAttribute("nick"))?)?.to_owned(),
-        username: bounded_token(
-            "username",
-            username.ok_or(ConfigError::MissingAttribute("username"))?,
-        )?
-        .to_owned(),
-        realname: bounded_token(
-            "realname",
-            realname.ok_or(ConfigError::MissingAttribute("realname"))?,
-        )?
-        .to_owned(),
-        auto_away: auto_away.ok_or(ConfigError::MissingAttribute("auto_away"))?,
-        keep_nick: keep_nick.ok_or(ConfigError::MissingAttribute("keep_nick"))?,
+        nick,
+        username,
+        realname,
+        auto_away,
+        keep_nick,
         desired_channels: Vec::new(),
-        action_count: actions.ok_or(ConfigError::MissingAttribute("actions"))?,
+        action_count,
+        action_phase_counts,
     })
 }
 
@@ -584,6 +632,7 @@ mod tests {
                         detached: true,
                     }],
                     action_count: 2,
+                    action_phase_counts: [1, 1, 0],
                 },
                 SnapshotNetwork {
                     network: NetworkId(1),
@@ -607,6 +656,7 @@ mod tests {
                         },
                     ],
                     action_count: 0,
+                    action_phase_counts: [0, 0, 0],
                 },
             ],
         }
@@ -627,6 +677,16 @@ mod tests {
         assert!(!back.networks[0].keep_nick);
         assert_eq!(back.networks[1].action_count, 2);
         assert!(back.networks[1].desired_channels[0].detached);
+    }
+
+    #[test]
+    fn legacy_snapshot_action_count_defaults_to_post_join() {
+        let text = render(&sample())
+            .replace(&format!("version {SNAPSHOT_VERSION}"), "version 1")
+            .replace(" action_phases=1,1,0", "");
+        let parsed = parse(&text).expect("version 1 snapshots remain readable");
+        assert_eq!(parsed.networks[1].action_count, 2);
+        assert_eq!(parsed.networks[1].action_phase_counts, [0, 2, 0]);
     }
 
     #[test]
@@ -676,8 +736,12 @@ mod tests {
 
     #[test]
     fn a_snapshot_from_a_future_version_is_refused_rather_than_guessed_at() {
-        let text = render(&sample()).replace(&format!("version {SNAPSHOT_VERSION}"), "version 2");
-        assert_eq!(parse(&text), Err(ConfigError::UnsupportedVersion(2)));
+        let future = SNAPSHOT_VERSION + 1;
+        let text = render(&sample()).replace(
+            &format!("version {SNAPSHOT_VERSION}"),
+            &format!("version {future}"),
+        );
+        assert_eq!(parse(&text), Err(ConfigError::UnsupportedVersion(future)));
     }
 
     #[test]

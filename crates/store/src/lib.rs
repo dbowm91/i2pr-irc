@@ -40,7 +40,7 @@ pub use model::{
 // secret vocabulary are re-exported together.
 pub use model::{
     MAX_STORED_ACTION_PAYLOAD_BYTES, MAX_STORED_ACTION_TARGET_BYTES, MAX_STORED_ACTIONS,
-    RegistrationActionKind, StoredRegistrationAction,
+    RegistrationActionKind, RegistrationActionPhase, StoredRegistrationAction,
 };
 // The durable identities below are re-exported so a caller needs one import for the
 // whole storage vocabulary and cannot accidentally mix them up with runtime types.

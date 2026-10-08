@@ -371,7 +371,11 @@ impl ControlSurface {
             ServCommand::ConfigExport => self.export_config().await,
             ServCommand::ConfigPlan => self.plan_config().await,
             ServCommand::ActionStatus { network } => self.action_status(network).await,
-            ServCommand::ActionSet { network, actions } => self.set_actions(network, actions).await,
+            ServCommand::ActionSet {
+                network,
+                actions,
+                replace_phase,
+            } => self.set_actions(network, actions, replace_phase).await,
         }
     }
 
@@ -386,7 +390,21 @@ impl ControlSurface {
             return;
         }
         match self.control.action_list(network).await {
-            Ok(actions) => self.notice(&format!("actions {}", actions.len())),
+            Ok(actions) => {
+                let pre_join = actions
+                    .actions_in_phase(i2pr_irc_store::RegistrationActionPhase::PreJoin)
+                    .count();
+                let post_join = actions
+                    .actions_in_phase(i2pr_irc_store::RegistrationActionPhase::PostJoin)
+                    .count();
+                let fallback_recovery = actions
+                    .actions_in_phase(i2pr_irc_store::RegistrationActionPhase::FallbackRecovery)
+                    .count();
+                self.notice(&format!(
+                    "actions {} pre-join={pre_join} post-join={post_join} fallback-recovery={fallback_recovery}",
+                    actions.len()
+                ));
+            }
             Err(error) => self.fail("ACTION", &map_control(error)),
         }
     }
@@ -401,13 +419,21 @@ impl ControlSurface {
     /// An empty set is a real request -- "this Network has no actions" -- and is written
     /// durably as one, so the store is never a Network's real answer while the runtime
     /// believes otherwise.
-    async fn set_actions(&mut self, network: NetworkId, actions: ActionSet) {
+    async fn set_actions(
+        &mut self,
+        network: NetworkId,
+        actions: ActionSet,
+        replace_phase: Option<i2pr_irc_store::RegistrationActionPhase>,
+    ) {
         if !self.require_network(network, "ACTION").await {
             return;
         }
-        let count = actions.len();
-        match self.control.set_actions(network, actions).await {
-            Ok(_) => self.notice(&format!("Set {count} actions")),
+        let result = match replace_phase {
+            Some(phase) => self.control.set_action_phase(network, phase, actions).await,
+            None => self.control.set_actions(network, actions).await,
+        };
+        match result {
+            Ok(count) => self.notice(&format!("Set {count} actions")),
             Err(error) => self.fail("ACTION", &map_control(error)),
         }
     }
