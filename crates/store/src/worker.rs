@@ -5,6 +5,7 @@
 //! typed overload error instead of unbounded memory growth, and blocking database
 //! work can never execute on a network owner or downstream Tokio task.
 use crate::{
+    encryption::{StoreEncryption, StoreOpenOptions},
     error::{CommitState, StoreError, StoreErrorKind},
     model::*,
     ops, schema,
@@ -20,6 +21,59 @@ use std::{
     thread::JoinHandle,
 };
 use tokio::sync::{mpsc, oneshot};
+
+/// Applies a raw 256-bit SQLCipher key before any application schema access. rusqlite's
+/// safe PRAGMA surface builds a short SQL string internally; our only temporary copy is
+/// itself zeroizing, and neither SQL text nor SQLite errors are exposed publicly.
+fn apply_encryption_key(connection: &Connection, key: crate::StoreKey) -> Result<(), StoreError> {
+    use zeroize::Zeroizing;
+
+    let bytes = key.into_bytes();
+    let mut encoded = Zeroizing::new(String::with_capacity(67));
+    encoded.push_str("x'");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes.iter() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded.push('\'');
+    drop(bytes);
+
+    connection
+        .pragma_update(None, "key", encoded.as_str())
+        .map_err(|_| StoreError::new(StoreErrorKind::KeyRejected))?;
+    let cipher_version = connection
+        .pragma_query_value(None, "cipher_version", |row| row.get::<_, String>(0))
+        .map_err(|_| StoreError::new(StoreErrorKind::EncryptionUnavailable))?;
+    if cipher_version.is_empty() {
+        return Err(StoreError::new(StoreErrorKind::EncryptionUnavailable));
+    }
+    // SQLCipher defers authentication until a page is read. Force that read before
+    // schema classification, WAL setup, migration, or worker startup.
+    connection
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| StoreError::new(StoreErrorKind::KeyRejected))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod encryption_backend_tests {
+    use rusqlite::Connection;
+
+    #[test]
+    fn bundled_backend_reports_a_cipher_version_and_fts5() {
+        let connection = Connection::open_in_memory().expect("in-memory database opens");
+        let version = connection
+            .pragma_query_value(None, "cipher_version", |row| row.get::<_, String>(0))
+            .expect("cipher_version pragma is available");
+        assert!(!version.is_empty(), "SQLCipher version is non-empty");
+        connection
+            .execute_batch("CREATE VIRTUAL TABLE cipher_fts_probe USING fts5(body)")
+            .expect("bundled SQLCipher build enables FTS5");
+    }
+}
 
 /// Explicit ingress ceiling. A caller that finds it full gets
 /// [`StoreErrorKind::QueueOverloaded`] and must degrade explicitly; it never spins,
@@ -487,11 +541,20 @@ impl Store {
     /// normal request is served. A database this build cannot serve is a startup
     /// failure, not a runtime condition the bouncer tries to work around.
     pub fn open(path: &StorePath) -> Result<Self, StoreError> {
-        Self::open_with(path, STORE_BUSY_TIMEOUT_MS)
+        Self::open_with_options(path, StoreOpenOptions::plaintext())
     }
 
     pub fn open_with(path: &StorePath, busy_timeout_ms: u32) -> Result<Self, StoreError> {
         Self::open_stalled(path, busy_timeout_ms, None)
+    }
+
+    /// Opens with an explicit encryption policy. The encrypted key is consumed and
+    /// zeroized after SQLCipher accepts it, before schema validation or migration.
+    pub fn open_with_options(
+        path: &StorePath,
+        options: StoreOpenOptions,
+    ) -> Result<Self, StoreError> {
+        Self::open_stalled_with_options(path, STORE_BUSY_TIMEOUT_MS, None, options)
     }
 
     /// Opens a store that delays every request by `stall`.
@@ -504,6 +567,17 @@ impl Store {
         path: &StorePath,
         busy_timeout_ms: u32,
         stall: Option<std::time::Duration>,
+    ) -> Result<Self, StoreError> {
+        Self::open_stalled_with_options(path, busy_timeout_ms, stall, StoreOpenOptions::plaintext())
+    }
+
+    /// Opens with an explicit encryption policy. The artificial delay is test-only.
+    #[doc(hidden)]
+    pub fn open_stalled_with_options(
+        path: &StorePath,
+        busy_timeout_ms: u32,
+        stall: Option<std::time::Duration>,
+        options: StoreOpenOptions,
     ) -> Result<Self, StoreError> {
         let mut connection = match path {
             StorePath::Memory => Connection::open_in_memory(),
@@ -518,6 +592,9 @@ impl Store {
             }
         }
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+        if let StoreEncryption::Encrypted(key) = options.encryption {
+            apply_encryption_key(&connection, key)?;
+        }
         schema::open_and_migrate(&connection, busy_timeout_ms)?;
         let shared = Arc::new(Shared {
             health: Mutex::new(StoreHealth::Ready),

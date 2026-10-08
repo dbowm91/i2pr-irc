@@ -28,7 +28,7 @@ zeroize = "1"
 # M003 storage boundary. `bundled` compiles a pinned SQLite so supported binary
 # behavior does not depend on a host library, and `default-features = false` keeps
 # the build-script/network feature set off. See architecture/dependency-review.md.
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

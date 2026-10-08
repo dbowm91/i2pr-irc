@@ -1457,9 +1457,12 @@ fn map_store(error: StoreError) -> RuntimeError {
         Kind::InvalidRequest(_) | Kind::Corrupt(_) | Kind::LimitExceeded(_) => {
             RuntimeError::InvalidConfig
         }
-        Kind::SchemaTooNew | Kind::ForeignDatabase | Kind::SqliteTooOld | Kind::Open => {
-            RuntimeError::Stopped
-        }
+        Kind::SchemaTooNew
+        | Kind::ForeignDatabase
+        | Kind::SqliteTooOld
+        | Kind::KeyRejected
+        | Kind::EncryptionUnavailable
+        | Kind::Open => RuntimeError::Stopped,
         Kind::Sqlite => RuntimeError::InvalidConfig,
     }
 }

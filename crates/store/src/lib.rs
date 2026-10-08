@@ -8,6 +8,7 @@
 //! DesiredState, identity, and history; it never restores observed membership,
 //! connection generations, join attempts, or downstream sessions. Restart rebuilds
 //! fresh supervisors and reconciles stored intent.
+mod encryption;
 pub mod error;
 pub mod model;
 mod ops;
@@ -18,6 +19,7 @@ pub use schema::{APPLICATION_ID, OpenDisposition, SCHEMA_VERSION};
 pub mod testing;
 mod worker;
 
+pub use encryption::{StoreEncryption, StoreKey, StoreOpenOptions};
 pub use error::{CommitState, StoreError, StoreErrorKind};
 pub use model::{
     BufferKind, BufferRecord, ClientRecord, DesiredChannelRecord, EventDirection,

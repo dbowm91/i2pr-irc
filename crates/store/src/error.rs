@@ -94,6 +94,12 @@ pub enum StoreErrorKind {
     /// Startup failed, so the process must not begin normal operation.
     #[error("store open failed")]
     Open,
+    /// The configured encrypted-store policy could not authenticate/decrypt the file.
+    #[error("encrypted database key rejected or database is not encrypted")]
+    KeyRejected,
+    /// This build did not expose a working SQLCipher backend.
+    #[error("SQLCipher backend unavailable")]
+    EncryptionUnavailable,
 }
 
 #[cfg(test)]

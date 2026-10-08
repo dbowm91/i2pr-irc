@@ -364,7 +364,12 @@ pub(crate) fn classify(kind: &i2pr_irc_store::StoreErrorKind) -> RuntimeError {
         Kind::InvalidRequest(_) | Kind::LimitExceeded(_) | Kind::Corrupt(_) => {
             RuntimeError::InvalidConfig
         }
-        Kind::SchemaTooNew | Kind::ForeignDatabase | Kind::SqliteTooOld | Kind::Open => {
+        Kind::SchemaTooNew
+        | Kind::ForeignDatabase
+        | Kind::SqliteTooOld
+        | Kind::KeyRejected
+        | Kind::EncryptionUnavailable
+        | Kind::Open => {
             // A database this build cannot serve prevents normal startup; it is
             // surfaced rather than being worked around.
             RuntimeError::InvalidConfig

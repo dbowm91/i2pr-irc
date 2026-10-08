@@ -15,7 +15,7 @@ StoreHandle  -> bounded mpsc (256)  ->  store worker thread
                                      rusqlite::Connection  (file, WAL)
 ```
 
-The worker uses a blocking receive, so no SQLite call ever runs on a Tokio task. Callers cannot reach the connection: `StoreHandle` exposes typed operations, and the `Request` enum is closed, so neither SQL text nor a closure can be submitted from runtime or network input.
+The worker uses a blocking receive, so no SQLite call ever runs on a Tokio task. Callers cannot reach the connection: `StoreHandle` exposes typed operations, and the `Request` enum is closed, so neither SQL text nor a closure can be submitted from runtime or network input. rusqlite is built against bundled SQLCipher with vendored OpenSSL, which serves both ordinary plaintext SQLite and explicitly keyed encrypted databases.
 
 ## Load and failure disposition
 
@@ -229,7 +229,7 @@ Migration steps are applied in order, one version at a time, so a database sever
 
 ## Open policy
 
-Open validates before serving anything: application identity (`application_id`), schema version (`user_version`), that the promised tables and columns actually exist, that the bundled SQLite supports `STRICT` (3.37.0+) **and** FTS5, that the reference indexes are present, and that the search index agrees with retained history. A database this build cannot serve is a startup failure — `ForeignDatabase`, `SchemaTooNew`, or `Corrupt` — never a condition the bouncer works around. Schema creation and migration each run in one transaction, so a partially migrated database is never accepted.
+Open validates before serving anything: application identity (`application_id`), schema version (`user_version`), that the promised tables and columns actually exist, that the bundled SQLCipher/SQLite supports `STRICT` (3.37.0+) **and** FTS5, that the reference indexes are present, and that the search index agrees with retained history. A database this build cannot serve is a startup failure — `ForeignDatabase`, `SchemaTooNew`, `Corrupt`, or a redacted key/backend error — never a condition the bouncer works around. Schema creation and migration each run in one transaction, so a partially migrated database is never accepted.
 
 A version newer than `SCHEMA_VERSION` is refused at startup. A version between `MIN_SUPPORTED_SCHEMA_VERSION` and the current one is migrated forward; an older one is refused rather than guessed at.
 
@@ -246,3 +246,9 @@ Storage is **not** authority for `ConnectionGeneration`, registration phase, joi
 ## Secrets
 
 `StoredSecret` renders as `StoredSecret([redacted])`, zeroes on drop, and exposes its value only through an explicitly named `expose()` used by reconnect authentication. `NetworkRecord`'s `Debug` therefore never contains a password. SQLite error messages are discarded and replaced with a typed kind, because a driver message can echo a bound value.
+
+## Explicit encrypted-open policy
+
+`Store::open` remains the explicit plaintext compatibility path. `Store::open_with_options` accepts either `StoreOpenOptions::plaintext()` or an encrypted option carrying a consumed `StoreKey` of exactly 32 caller-supplied random bytes. The store does not generate, derive, load, log, serialize, or retain the key in its schema. Its `Debug` output is redacted and the application-owned bytes and temporary hexadecimal encoding are zeroized after SQLCipher accepts the key. The SQLCipher connection retains the active cipher context only while the owned Store worker is alive.
+
+Encrypted open applies the key before schema access, checks the non-secret `cipher_version` pragma, and reads `sqlite_master` to force decryption/authentication before schema validation or migration. A rejected key fails closed with a redacted `KeyRejected` classification. An encrypted database opened through the plaintext path fails as a startup error; encryption mode is never guessed, and no schema is created over unreadable bytes. Encryption-at-rest protects a closed database only while the key is kept separately from it; it does not protect a compromised live process or hide IRC metadata from the bouncer.
