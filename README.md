@@ -36,6 +36,8 @@ Research lives under plans/research/. Subsystem roadmaps live under plans/subsys
 - No packaging, service, or install layer.
 - No real-client OTR interoperability qualification through a product listener; that waits on the future production listener.
 
+The standalone M010 productization milestone is planned (Research 010, ADR-0007, Plans 050-054); Plan 050 is the sole ready handoff. Planning is not an implementation claim: the executable, production listener, and secure init UX remain absent until their plans close.
+
 Router R002 (i2pr managed-app adapter) remains blocked on stable public i2pr managed-app stream/listener/lifecycle contracts.
 
 ## Conformance corpus

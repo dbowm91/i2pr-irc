@@ -86,6 +86,14 @@ M008 and M009 are closed (Plans 044-048, plus post-M009 Corrective 049).
 
 Production SAM 3.1-compatible stream provider, long-lived session ownership, I2P naming, router restart behavior, and one real mature-router application-byte qualification. The temporary in-repo SAM client is not required to repeat Java/i2pd/i2pr or mixed-router conformance; broad SAM portability belongs to the dedicated SAM library project. Proposal 170 is not required.
 
+## Standalone productization after R001 — M010 (registered)
+
+The core is closed through M009 and the portable SAM product path through R001. M010 adds the first executable and authenticated local IRC listener without altering I2P-only upstream transport. This is a separately tracked standalone-daemon subsystem (Research 010, ADR-0007, Plans 050-054).
+
+Sequence: M010-A process/bootstrap and exclusive state owner; M010-B bounded listener/authentication; M010-C exact CAP/PASS/SASL registration handoff and stable ClientId; M010-D secure local credential/SQLCipher key provisioning; M010-E production integration and evidence-based closure. Only 050 is initially ready; later plans are dependency-gated.
+
+A standalone product must work independently of i2pr managed-app contracts and Proposal 170. Installer/service packaging remains a later release line. Broad SAM portability matrices remain in the dedicated SAM library project.
+
 ## Phase 7 — i2pr managed-app integration
 
 Begins only after stable written i2pr contracts exist for app-scoped I2P streams, naming as needed, local accepted-stream delivery/listener capability, and required lifecycle/health behavior.
