@@ -1,6 +1,6 @@
 # Bouncer Core Roadmap
 
-Status: active
+Status: corrective active — M006/M007 historically closed; Corrective 042 is current readiness authority
 
 Long-term references:
 
@@ -24,6 +24,7 @@ Post-closure corrective authority:
 - plans/implementation/bouncer-core/013-post-m003-ircv3-time-history-and-queue-integrity-corrective.md
 - plans/implementation/bouncer-core/014-live-multiclient-response-routing-corrective.md
 - plans/implementation/bouncer-core/035-monitor-numeric-conformance-corrective.md
+- plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md
 
 Pre-M003 gates:
 
@@ -137,6 +138,14 @@ Canonical product/security direction remains unchanged: I2P-only upstream author
 Research 006 decomposed M005 against the M004-closed codebase. ADR-0003 freezes the only new ownership boundary: a bounded process RuntimeController and pre-bind DownstreamAdmission transfer a selected client exactly once into the existing NetworkOwner model. Plans 020-028 are registered below. All nine are closed and M005 remains complete.
 
 Corrective 034 was a post-M005 maintenance corrective raised by Corrective 033's closure evidence, and is now closed; see `plans/closure/bouncer-core/034-status.md`.
+
+M006 and M007 subsequently closed through Plans 036-041. A post-closure review found two remaining MONITOR correctness gaps and one qualification-scope gap:
+
+- 730 RPL_MONONLINE is an event containing targets reported online; absence of the preferred nick from an unrelated 730 event is not evidence that the preferred nick is free. The current implementation incorrectly shares absence semantics between 730 and the snapshot-style 303 RPL_ISON response.
+- MONITOR ISUPPORT parsing recognizes only MONITOR=<n> and rejects large positive limits; IRCv3 also permits bare MONITOR (unlimited), and this bouncer needs only one target, so every positive limit is usable.
+- Plan 041 externally exercised disruptive Eggchaos faults against a generic echo peer while the production SamProvider path externally covered latency/bandwidth/slicing. Corrective 042 strengthens blackhole/disconnect recovery evidence through the actual product path or records a precise tool limitation without overclaiming.
+
+Corrective 042 is therefore the strict current post-M007 readiness authority. Historical M006/M007 closure records remain retained and are not rewritten.
 
 Research 008 now opens the post-M005 product-completeness line. It couples M006 registration/capability downgrade with M007 identity/connectivity resilience because both operate in the same upstream generation state machine. The research also found a pre-existing MONITOR conformance defect in M005-C: the live reclaim path interprets 730/731 backwards relative to IRCv3. Corrective 035 is therefore the strict first gate before any M006/M007 implementation. The repository declares Rust 1.88 as its MSRV, but the full Rust 1.88 verification had failed in pre-existing test-formatting code while current-toolchain verification and the SAM crate's Rust 1.88 checks passed. The cause was a lint-group change rather than a defect in the repository's intent: `clippy::uninlined_format_args` is a `style` lint (warn by default, so fatal under `-D warnings`) on 1.88.0 and a `pedantic` lint (allow by default) on 1.89 and later, and the workspace sets `clippy::all = "warn"`. The **MSRV toolchain was the strict one**, so the red floor was invisible to the toolchain this repository verifies with most often. Corrective 034 closed the finding with two behavior-neutral interpolated-format-argument rewrites, both in test code, with no lint suppression, no dependency change, no script change, and no production behavior change. The declared Rust 1.88 floor and current stable now both pass `scripts/verify.sh full` green from one tree.
 
@@ -788,7 +797,7 @@ Architecture decisions requiring an ADR if encountered:
 
 ## 11. Completion definition
 
-This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path.
+This roadmap's original foundation is complete through M005. The active post-M005 product-completeness track is complete when M006-M007 are evidence-closed and the core is a durable, multi-network, multi-client IRC/IRCv3 bouncer that also behaves correctly on legacy/no-CAP/no-SASL servers and under long-running identity/connectivity churn, without any router-specific dependency or generic upstream clearnet path. M006/M007 are historically evidence-closed; Corrective 042 currently gates the clean-readiness claim for their MONITOR/adverse-network evidence.
 
 ## 12. Milestone status
 
@@ -835,3 +844,4 @@ This roadmap's original foundation is complete through M005. The active post-M00
 | M007-A / Plan 039 | closed | plans/implementation/bouncer-core/039-m007a-phased-service-actions-for-nonsasl-authentication.md | plans/closure/bouncer-core/039-status.md | M006 closed by Plan 038 |
 | M007-B / Plan 040 | closed | plans/implementation/bouncer-core/040-m007b-preferred-nick-reconnect-and-multiclient-identity-resilience.md | plans/closure/bouncer-core/040-status.md | Plan 039 closed |
 | M007-C / Plan 041 | closed | plans/implementation/bouncer-core/041-m007c-eggchaos-multiclient-adverse-qualification-and-closure.md | plans/closure/bouncer-core/041-status.md | Plan 040 closure |
+| C042 / Corrective 042 | ready | plans/implementation/bouncer-core/042-post-m007-monitor-and-adverse-qualification-corrective.md | future plans/closure/bouncer-core/042-status.md | none; strict current post-M007 readiness authority |
