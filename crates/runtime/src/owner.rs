@@ -1059,8 +1059,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
 
     fn set_phase(&self, phase: Phase, generation: Option<ConnectionGeneration>) {
         self.snapshot.send_modify(|state| {
+            let new_generation = generation.is_some() && generation != state.generation;
             state.phase = Some(phase);
             state.generation = generation;
+            if new_generation {
+                state.fallback_active = false;
+                state.reclaim_suspended = false;
+                state.reclaim_cooldown_ms = 0;
+                state.reclaim_writes = 0;
+                state.reclaim_refusals = 0;
+            }
             if matches!(phase, Phase::Idle | Phase::Backoff | Phase::Stopped) {
                 state.attached_sessions = 0;
             }
@@ -2890,20 +2898,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     SessionIntent::Forward { wire, class } => {
                         let class_label = class.as_str();
-                        if let Some(message) = Message::parse(&wire).ok()
-                            && message.command.eq_ignore_ascii_case(b"NICK")
-                            && message.params.first().is_some_and(|requested| {
-                                !state.same_nick(
-                                    &String::from_utf8_lossy(requested),
-                                    &self.context.record.nick,
-                                )
-                            })
-                            && let Some(attempt) = reclaim_attempt.as_mut()
-                        {
-                            attempt.suspended = true;
-                            self.snapshot
-                                .send_modify(|snapshot| snapshot.reclaim_suspended = true);
-                        }
+                        let suspend_reclaim = Message::parse(&wire).ok().is_some_and(|message| {
+                            message.command.eq_ignore_ascii_case(b"NICK")
+                                && message.params.first().is_some_and(|requested| {
+                                    !state.same_nick(
+                                        &String::from_utf8_lossy(requested),
+                                        &self.context.record.nick,
+                                    )
+                                })
+                        });
                         // Privacy mediation runs before anything is queued upstream and
                         // before any durable or diagnostic side effect, so a blocked
                         // frame is never transmitted, fanned out, or recorded as sent.
@@ -2948,6 +2951,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             .is_err()
                         {
                             self.report_upstream_overload(sessions, session, class_label);
+                        } else if suspend_reclaim && let Some(attempt) = reclaim_attempt.as_mut() {
+                            attempt.suspended = true;
+                            self.snapshot
+                                .send_modify(|snapshot| snapshot.reclaim_suspended = true);
                         }
                     }
                     SessionIntent::Join { channel } => {

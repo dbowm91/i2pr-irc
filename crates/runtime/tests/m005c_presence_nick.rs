@@ -1245,6 +1245,7 @@ async fn manual_nick_is_shared_and_suspends_automatic_reclaim_for_the_generation
         reconnect.contains("NICK bot\r\n"),
         "the next generation resumes from durable preferred identity: {reconnect}"
     );
+    assert!(!harness.snapshot.borrow().reclaim_suspended);
     harness.upstreams.push(replacement);
     harness.shutdown().await;
 }
