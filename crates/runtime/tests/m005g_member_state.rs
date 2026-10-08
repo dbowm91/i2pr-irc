@@ -476,6 +476,22 @@ async fn read_until(stream: &mut ScriptedStream, needle: &[u8]) -> String {
     String::from_utf8_lossy(&all).into_owned()
 }
 
+/// Proves that the upstream owner consumed every earlier frame on this connection
+/// generation. The server-originated PING is ordered after the state mutations, and
+/// its matching PONG is observed on the same scripted peer before a client attaches.
+async fn upstream_barrier(runtime: &mut Runtime, peer: usize) {
+    let token = format!("m005g-member-barrier-{peer}");
+    runtime
+        .send_upstream(peer, &format!(":srv PING :{token}\r\n"))
+        .await;
+    loop {
+        let line = read_line(&mut runtime.upstreams[peer]).await;
+        if line == format!("PONG :{token}\r\n") || line.ends_with(&format!(" PONG :{token}\r\n")) {
+            return;
+        }
+    }
+}
+
 /// The `005` tokens a session was offered.
 async fn isupport(client: &mut Client) -> String {
     let mark = client.mark();
@@ -993,14 +1009,9 @@ async fn a_mode_delta_widens_a_run_without_completing_one_that_was_never_observe
     runtime
         .send_upstream(peer, ":Op!u@h MODE #room +v Alice\r\n")
         .await;
+    upstream_barrier(&mut runtime, peer).await;
     let mut wide = register(&runtime, NetworkId(1), SessionId(1), "multi-prefix").await;
     wide.until("005").await;
-    // Two barriers. The first proves the JOIN and MODE were processed *before* the client
-    // was attached, which is the premise of the test; without it a slow scheduler can let
-    // the client register first, observe a completed run, and pass for the wrong reason --
-    // or fail depending on which order the two racing events win.
-    sync(&mut runtime, peer, &mut wide).await;
-    sync(&mut runtime, peer, &mut wide).await;
     let names = names_of(&wide.seen, "#room");
     assert!(
         names.contains("+Alice"),
