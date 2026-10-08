@@ -183,6 +183,11 @@ async fn run(config_path: &Path) -> Result<(), String> {
     if !config.store_file.is_absolute() {
         return Err("store path must resolve to an absolute path".to_owned());
     }
+    let store_metadata = fs::symlink_metadata(&config.store_file)
+        .map_err(|_| "configured store does not exist".to_owned())?;
+    if store_metadata.file_type().is_symlink() || !store_metadata.is_file() {
+        return Err("configured store path is unsafe".to_owned());
+    }
     let store = Store::open_with_options(
         &StorePath::File(config.store_file),
         StoreOpenOptions::plaintext(),
