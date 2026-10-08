@@ -149,9 +149,8 @@ async fn authenticate(
                                 .map_err(|_| ())?;
                         }
                         "REQ" => {
-                            if trailing
-                                .split_ascii_whitespace()
-                                .any(|name| name == "sasl" || name == "sasl=PLAIN")
+                            let requested = trailing.split_ascii_whitespace().collect::<Vec<_>>();
+                            if requested.len() == 1 && matches!(requested[0], "sasl" | "sasl=PLAIN")
                             {
                                 sasl_acked = true;
                                 stream
@@ -369,7 +368,7 @@ mod tests {
     async fn cap_sasl_plain_authenticates_without_consuming_registration_twice() {
         let encoded = STANDARD.encode(b"\0test\0known-high-entropy-fixture-token");
         let transcript = format!(
-            "CAP LS 302\r\nCAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE {encoded}\r\nNICK nick\r\nUSER user 0 * :fixture\r\nCAP END\r\n"
+            "CAP LS 302\r\nCAP REQ :sasl\r\nNICK nick\r\nUSER user 0 * :fixture\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE {encoded}\r\nCAP END\r\n"
         );
         let checkpoint = authenticated_fixture(transcript.as_bytes()).await;
         assert_eq!(checkpoint.profile, "test");
