@@ -30,7 +30,7 @@ pub struct AuthenticatedCheckpoint {
     nick: String,
     user: String,
     unread: Vec<u8>,
-    cap_sasl_acked: bool,
+    negotiated_capabilities: Vec<String>,
 }
 
 /// Data captured before the one-shot authenticated handoff.
@@ -39,7 +39,7 @@ pub struct RegistrationCheckpoint {
     pub nick: String,
     pub user: String,
     pub unread: Vec<u8>,
-    pub cap_sasl_acked: bool,
+    pub negotiated_capabilities: Vec<String>,
 }
 
 impl AuthenticatedCheckpoint {
@@ -53,7 +53,7 @@ impl AuthenticatedCheckpoint {
                 nick: self.nick,
                 user: self.user,
                 unread: self.unread,
-                cap_sasl_acked: self.cap_sasl_acked,
+                negotiated_capabilities: self.negotiated_capabilities,
             },
         )
     }
@@ -137,7 +137,7 @@ pub async fn authenticate(
         let mut lines = 0usize;
         let mut auth: Option<(String, AuthKind)> = None;
         let mut cap_open = false;
-        let mut sasl_acked = false;
+        let mut negotiated_capabilities = std::collections::BTreeSet::new();
         let mut nick = None;
         let mut user = None;
         let mut authenticated: Option<String> = None;
@@ -175,20 +175,41 @@ pub async fn authenticate(
                     "CAP" => match arg.to_ascii_uppercase().as_str() {
                         "LS" => {
                             cap_open = true;
-                            stream
-                                .write_all(b":i2pr-irc CAP * LS :sasl=PLAIN\r\n")
-                                .await
-                                .map_err(|_| ())?;
+                            let mut offered = i2pr_irc_runtime::downstream::DOWNSTREAM_ADVERTISED
+                                .iter()
+                                .map(|name| (*name).to_owned())
+                                .collect::<Vec<_>>();
+                            offered.push("sasl=PLAIN".to_owned());
+                            offered.sort();
+                            let line = format!(":i2pr-irc CAP * LS :{}\r\n", offered.join(" "));
+                            stream.write_all(line.as_bytes()).await.map_err(|_| ())?;
                         }
                         "REQ" => {
                             let requested = trailing.split_ascii_whitespace().collect::<Vec<_>>();
-                            if requested.len() == 1 && matches!(requested[0], "sasl" | "sasl=PLAIN")
+                            let supported = |name: &str| {
+                                name == "sasl"
+                                    || name == "sasl=PLAIN"
+                                    || i2pr_irc_runtime::downstream::DOWNSTREAM_ADVERTISED
+                                        .contains(&name)
+                            };
+                            if !requested.is_empty()
+                                && requested.len() <= 8
+                                && requested.iter().all(|name| supported(name))
                             {
-                                sasl_acked = true;
-                                stream
-                                    .write_all(b":i2pr-irc CAP * ACK :sasl\r\n")
-                                    .await
-                                    .map_err(|_| ())?;
+                                let normalized = requested
+                                    .iter()
+                                    .map(|name| {
+                                        if *name == "sasl=PLAIN" {
+                                            "sasl".to_owned()
+                                        } else {
+                                            (*name).to_owned()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                negotiated_capabilities.extend(normalized.iter().cloned());
+                                let line =
+                                    format!(":i2pr-irc CAP * ACK :{}\r\n", normalized.join(" "));
+                                stream.write_all(line.as_bytes()).await.map_err(|_| ())?;
                             } else {
                                 stream
                                     .write_all(b":i2pr-irc CAP * NAK :unsupported\r\n")
@@ -221,7 +242,7 @@ pub async fn authenticate(
                         auth = Some((profile.to_owned(), AuthKind::Pass));
                     }
                     "AUTHENTICATE" => {
-                        if !sasl_acked || authenticated.is_some() {
+                        if !negotiated_capabilities.contains("sasl") || authenticated.is_some() {
                             return Err(());
                         }
                         if arg.eq_ignore_ascii_case("PLAIN") {
@@ -301,7 +322,7 @@ pub async fn authenticate(
                         nick: nick.clone(),
                         user: user.clone(),
                         unread: std::mem::take(&mut *bytes),
-                        cap_sasl_acked: sasl_acked,
+                        negotiated_capabilities: negotiated_capabilities.into_iter().collect(),
                     });
                 }
             }
@@ -407,7 +428,7 @@ mod tests {
         let checkpoint = authenticated_fixture(transcript.as_bytes()).await;
         let (_stream, state) = checkpoint.into_parts();
         assert_eq!(state.profile, "test");
-        assert!(state.cap_sasl_acked);
+        assert!(state.negotiated_capabilities.contains(&"sasl".to_owned()));
     }
 
     #[tokio::test]
