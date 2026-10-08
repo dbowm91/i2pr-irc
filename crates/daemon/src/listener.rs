@@ -24,13 +24,45 @@ pub trait CredentialVerifier: Send + Sync + 'static {
 
 /// One authenticated stream and all bytes consumed beyond the authentication boundary.
 /// This type is intentionally not public: only the daemon may hold it before Plan 052.
-pub(crate) struct AuthenticatedCheckpoint {
-    pub(crate) stream: TcpStream,
-    pub(crate) profile: String,
-    pub(crate) nick: String,
-    pub(crate) user: String,
-    pub(crate) unread: Vec<u8>,
-    pub(crate) cap_sasl_acked: bool,
+pub struct AuthenticatedCheckpoint {
+    stream: TcpStream,
+    profile: String,
+    nick: String,
+    user: String,
+    unread: Vec<u8>,
+    cap_sasl_acked: bool,
+}
+
+/// Data captured before the one-shot authenticated handoff.
+pub struct RegistrationCheckpoint {
+    pub profile: String,
+    pub nick: String,
+    pub user: String,
+    pub unread: Vec<u8>,
+    pub cap_sasl_acked: bool,
+}
+
+impl AuthenticatedCheckpoint {
+    /// Consumes this checkpoint once, transferring both socket ownership and all
+    /// registration bytes/state to the next admission stage.
+    pub fn into_parts(self) -> (TcpStream, RegistrationCheckpoint) {
+        (
+            self.stream,
+            RegistrationCheckpoint {
+                profile: self.profile,
+                nick: self.nick,
+                user: self.user,
+                unread: self.unread,
+                cap_sasl_acked: self.cap_sasl_acked,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandshakeError {
+    Rejected,
+    Deadline,
 }
 
 pub fn validate_loopback(address: SocketAddr) -> Result<(), &'static str> {
@@ -43,6 +75,7 @@ pub fn validate_loopback(address: SocketAddr) -> Result<(), &'static str> {
 pub async fn serve(
     address: SocketAddr,
     verifier: Arc<dyn CredentialVerifier>,
+    on_authenticated: Arc<dyn Fn(AuthenticatedCheckpoint) + Send + Sync>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), String> {
     validate_loopback(address).map_err(str::to_owned)?;
@@ -65,15 +98,14 @@ pub async fn serve(
                 if !peer.ip().is_loopback() { drop(stream); continue; }
                 let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
                 let verifier = Arc::clone(&verifier);
+                let on_authenticated = Arc::clone(&on_authenticated);
                 let mut child_stop = stop.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
                     let _ = tokio::select! {
                         biased;
                         _ = wait_stop(&mut child_stop) => Ok(()),
-                        result = authenticate(stream, verifier) => result.map(|checkpoint| {
-                            let _moved_checkpoint = (checkpoint.profile, checkpoint.nick, checkpoint.user, checkpoint.unread, checkpoint.cap_sasl_acked, checkpoint.stream);
-                        }),
+                        result = authenticate(stream, verifier) => result.map(|checkpoint| on_authenticated(checkpoint)),
                     };
                 });
                 while tasks.len() > MAX_PARALLEL_HANDSHAKES {
@@ -95,10 +127,10 @@ async fn wait_stop(stop: &mut watch::Receiver<bool>) {
     let _ = stop.changed().await;
 }
 
-async fn authenticate(
+pub async fn authenticate(
     mut stream: TcpStream,
     verifier: Arc<dyn CredentialVerifier>,
-) -> Result<AuthenticatedCheckpoint, ()> {
+) -> Result<AuthenticatedCheckpoint, HandshakeError> {
     tokio::time::timeout(HANDSHAKE_DEADLINE, async move {
         let mut bytes = Zeroizing::new(Vec::with_capacity(1024));
         let mut scratch = [0u8; 1024];
@@ -279,7 +311,8 @@ async fn authenticate(
         }
     })
     .await
-    .map_err(|_| ())?
+    .map_err(|_| HandshakeError::Deadline)?
+    .map_err(|_| HandshakeError::Rejected)
 }
 
 #[derive(Clone, Copy)]
@@ -358,10 +391,11 @@ mod tests {
             b"PASS test:known-high-entropy-fixture-token\r\nNICK nick\r\nUSER user 0 * :fixture\r\nPRIVMSG #x :not consumed\r\n",
         )
         .await;
-        assert_eq!(checkpoint.profile, "test");
-        assert_eq!(checkpoint.nick, "nick");
-        assert_eq!(checkpoint.user, "user");
-        assert_eq!(checkpoint.unread, b"PRIVMSG #x :not consumed\r\n");
+        let (_stream, state) = checkpoint.into_parts();
+        assert_eq!(state.profile, "test");
+        assert_eq!(state.nick, "nick");
+        assert_eq!(state.user, "user");
+        assert_eq!(state.unread, b"PRIVMSG #x :not consumed\r\n");
     }
 
     #[tokio::test]
@@ -371,8 +405,9 @@ mod tests {
             "CAP LS 302\r\nCAP REQ :sasl\r\nNICK nick\r\nUSER user 0 * :fixture\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE {encoded}\r\nCAP END\r\n"
         );
         let checkpoint = authenticated_fixture(transcript.as_bytes()).await;
-        assert_eq!(checkpoint.profile, "test");
-        assert!(checkpoint.cap_sasl_acked);
+        let (_stream, state) = checkpoint.into_parts();
+        assert_eq!(state.profile, "test");
+        assert!(state.cap_sasl_acked);
     }
 
     #[tokio::test]
@@ -389,8 +424,9 @@ mod tests {
             client.write_all(&[*byte]).await.unwrap();
         }
         let checkpoint = server.await.unwrap();
-        assert_eq!(checkpoint.nick, "n");
-        assert!(checkpoint.unread.is_empty());
+        let (_stream, state) = checkpoint.into_parts();
+        assert_eq!(state.nick, "n");
+        assert!(state.unread.is_empty());
     }
 
     #[tokio::test]
@@ -405,7 +441,8 @@ mod tests {
             &encoded[400..]
         );
         let checkpoint = authenticated_fixture(transcript.as_bytes()).await;
-        assert_eq!(checkpoint.profile, "test");
+        let (_stream, state) = checkpoint.into_parts();
+        assert_eq!(state.profile, "test");
     }
 
     #[tokio::test]
