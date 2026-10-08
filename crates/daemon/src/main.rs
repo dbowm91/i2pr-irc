@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+pub mod listener;
+
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
 
@@ -246,7 +248,7 @@ async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.as_slice() == ["--help"] || args.is_empty() {
         println!(
-            "i2pr-irc --config <path> run\n       i2pr-irc --version\n\nThis bootstrap has no active listener; local access is added by a later milestone."
+            "i2pr-irc --config <path> run\n       i2pr-irc --version\n\nLocal listener support requires a credential verifier; this bootstrap does not provision credentials."
         );
         return ExitCode::SUCCESS;
     }

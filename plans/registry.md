@@ -27,16 +27,18 @@ Canonical direction:
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
 | Bouncer core | post-M009 complete, no active plan | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | M001-M009 remain historical product closures; Corrective 049 closed the post-M009 SAM framing defect and the registry/README/roadmap reconciliation. |
-| Standalone daemon/local access | M010 registered; 050 ready | plans/subsystems/standalone-daemon-roadmap.md | M010-A / Plan 050 | Research 010 and ADR-0007 accepted. Plans 051-054 documented but dependency-gated sequentially; no R002 dependency. |
+| Standalone daemon/local access | M010 in progress; 050 closed; 051 active | plans/subsystems/standalone-daemon-roadmap.md | M010-B / Plan 051 | Research 010 and ADR-0007 accepted. Plans 052-054 remain sequentially dependency-gated; no R002 dependency. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Roadmap | Handoff |
 |---|---|---|---|---|
-| Standalone M010-A / Plan 050 — Daemon Runtime and Process Bootstrap | ready | infrastructure + process-lifecycle invariant | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/050-m010a-daemon-runtime-bootstrap.md |
+| Standalone M010-B / Plan 051 — Local Listener and Bounded Authentication | active | security invariant + infrastructure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/051-m010b-local-listener-and-authentication.md |
 
-Plans 051-054 are dependency-gated proposed successor plans, **not** concurrently ready or active. Promote only the immediate successor after evidence-based closure of its predecessor; see standalone roadmap.
+Plans 052-054 are dependency-gated proposed successor plans, **not** concurrently ready or active. Promote only the immediate successor after evidence-based closure of its predecessor; see standalone roadmap.
+
+Plan 050 is closed with evidence at `plans/closure/standalone/050-status.md`. The daemon bootstrap is explicitly not a user-accessible standalone bouncer: it has no listener and supports only a pre-provisioned plaintext test store. Plan 051 is the sole ready handoff.
 
 ## Recently closed implementation plans
 
@@ -100,7 +102,7 @@ Plans 051-054 are dependency-gated proposed successor plans, **not** concurrentl
 
 M008 and M009 are closed. No Bouncer Core implementation plan is currently active or dependency-ready.
 
-M010 standalone daemon/local listener/bootstrap and basic secure key provisioning are now registered (Plans 050-054). Only Plan 050 is ready; Plans 051-054 await sequential predecessor closure. Full release packaging, service installers, keyring/HSM integration and optional real-client OTR qualification beyond recorded available evidence remain later decisions.
+M010 standalone daemon/local listener/bootstrap and basic secure key provisioning are registered (Plans 050-054). Plan 050 is closed, Plan 051 is active, and Plans 052-054 await sequential predecessor closure. Full release packaging, service installers, keyring/HSM integration and optional real-client OTR qualification beyond recorded available evidence remain later decisions.
 
 Later product lines intentionally remain unplanned:
 
@@ -162,4 +164,4 @@ Important retained conclusions:
 
 Corrective 049 is closed; see `plans/closure/bouncer-core/049-status.md`. It fixed a real SAM client framing defect (a reply terminator split across TCP reads was dropped, stalling the phase to its deadline) and reconciled the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
 
-M010 is registered as a new standalone-productization workstream after Research 010 and accepted ADR-0007. Plan 050 is the **sole** dependency-ready handoff on branch work/plans-050-054-m010-standalone; Plans 051-054 are proposed and sequentially gated, not implementation-active. M001-M009, C049 and R001 remain closed. R002 remains independently blocked on upstream i2pr managed-app contracts.
+M010 is registered as a new standalone-productization workstream after Research 010 and accepted ADR-0007. Plan 050 is closed; Plan 051 is the **sole active** implementation handoff on branch work/plans-050-054-m010-standalone; Plans 052-054 remain proposed and sequentially gated. M001-M009, C049 and R001 remain closed. R002 remains independently blocked on upstream i2pr managed-app contracts.

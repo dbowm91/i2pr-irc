@@ -1,6 +1,6 @@
 # Standalone M010-A / Plan 050 — Daemon Runtime and Process Bootstrap
 
-Status: ready for handoff
+Status: closed — see plans/closure/standalone/050-status.md
 Repository baseline: f325e7d5e495e36b1fc7b168c30e4b725756d22c
 Primary class: infrastructure + process-lifecycle invariant
 Roadmap: plans/subsystems/standalone-daemon-roadmap.md

@@ -97,6 +97,19 @@ def sam_findings(path,text):
             findings.append((relative,"TcpStream without a listener"))
     return findings
 
+def daemon_findings(path,text):
+    """Allow only the one authenticated downstream listener module to bind/accept."""
+    rel=Path(path).as_posix()
+    if rel.endswith("crates/daemon/src/listener.rs"):
+        findings=[]
+        production=text.split("\n#[cfg(test)]",1)[0]
+        for token in ("TcpStream::connect","std::net::TcpStream","UdpSocket","UnixListener","ToSocketAddrs","reqwest","hyper::Client","socks::"):
+            if token in production:findings.append((path,token))
+        if "validate_loopback(address)" not in production or "TcpListener::bind(address)" not in production or "listener.accept()" not in production:
+            findings.append((path,"local listener authority lacks loopback validation or exact bind/accept path"))
+        return findings
+    return []
+
 def scan_sources(root,crates=CRATES):
     found=[]
     for crate in crates:
@@ -109,8 +122,10 @@ def scan_sources(root,crates=CRATES):
             # compensated by `sam_findings`, which is the stricter predicate: it permits
             # only those two files and only TCP, so the exemption cannot become a door to
             # DNS, UDP, or a unix socket.
-            if not (crate==SAM_CRATE and _sam_allowlisted(path)):
+            daemon_listener=crate=="daemon" and path.relative_to(base).as_posix()=="src/listener.rs"
+            if not (crate==SAM_CRATE and _sam_allowlisted(path)) and not daemon_listener:
                 found.extend(source_findings(path,text))
+            found.extend(daemon_findings(path,text))
             # The CTCP module names DCC only to block it. It is the one place allowed
             # to say so, so the guard is scoped rather than blanket.
             #
@@ -122,7 +137,7 @@ def scan_sources(root,crates=CRATES):
             # hold a socket and the exact socket families even those may not use. A
             # blanket `path.name` exemption with nothing behind it would be a hole; this
             # one has a narrower predicate in front of it.
-            exempt = path.name=="ctcp.rs" or (crate==SAM_CRATE and _sam_allowlisted(path))
+            exempt = path.name=="ctcp.rs" or (crate==SAM_CRATE and _sam_allowlisted(path)) or daemon_listener
             if not exempt:
                 found.extend(dcc_findings(path,text))
             if crate==SAM_CRATE:
@@ -237,6 +252,22 @@ def positive_control_failures():
         (fixture/"crates"/"sam"/"src"/"session.rs").write_text("pub fn open() { let _s = TcpStream::connect(addr).await; }\n")
         if not scan_sources(fixture,crates=(SAM_CRATE,)):
             failures.append("sam socket authority outside the allowlist is not detected")
+    # The daemon has one reviewed bind/accept file. Its presence is a narrow exception,
+    # not a crate-wide socket exemption.
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture=Path(temporary)
+        listener=fixture/"crates"/"daemon"/"src"/"listener.rs"
+        listener.parent.mkdir(parents=True)
+        allowed="validate_loopback(address)?; TcpListener::bind(address).await; listener.accept().await;"
+        listener.write_text(allowed)
+        if scan_sources(fixture,crates=("daemon",)):
+            failures.append("daemon local listener allowlist rejects reviewed bind/accept")
+        listener.write_text(allowed+" TcpStream::connect(address).await;")
+        if not any("TcpStream::connect" in str(item) for item in scan_sources(fixture,crates=("daemon",))):
+            failures.append("daemon allowlist does not reject generic dial")
+        listener.write_text("TcpListener::bind(address).await; listener.accept().await;")
+        if not any("loopback validation" in str(item) for item in scan_sources(fixture,crates=("daemon",))):
+            failures.append("daemon allowlist does not require loopback validation")
     with tempfile.TemporaryDirectory() as temporary:
         fixture=Path(temporary)
         for crate in CRATES:(fixture/"crates"/crate/"src").mkdir(parents=True)
