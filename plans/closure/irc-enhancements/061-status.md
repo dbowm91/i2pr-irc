@@ -2,7 +2,7 @@
 
 Status: closed; operator-attested same-Network failover implemented; deployed endpoint equivalence remains unqualified
 Implementation commit: `f028a43` — `feat(runtime): add attested I2P endpoint failover`
-Closure commit: pending
+Closure commit: `ba6cc72` — `docs(plans): close plan 061 and start integration qualification`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
