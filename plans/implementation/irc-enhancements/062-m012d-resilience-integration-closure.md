@@ -4,7 +4,7 @@ Date: 2026-10-09
 Authority: Research 011, ADR-0008/0009 and IRC enhancement roadmap.
 Baseline: M010 Plan 054 independently active; maintain I2P-only typed I2pStreamProvider, per-Network owner and no generic DNS/TCP/HTTP or proxy path.
 
-Status: proposed; depends on Plans 059-061 closing or specific optional features being formally deferred on named research grounds.
+Status: active; Plans 059-061 are closed (Plan 060 production catch-up deferred on the official draft's production warning).
 Objective: qualify post-registration IRC pacing, gap evidence, conditional upstream CHATHISTORY and approved I2P endpoint failover together.
 Work packages:
 1. Run deterministic and Eggchaos campaigns: mass reconnect, fifty-channel restore, router blackout, partial IRC registrations, missed upstream messages, unsupported CHATHISTORY, upstream state/auth changes.
