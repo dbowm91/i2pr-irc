@@ -2,7 +2,7 @@
 
 Status: closed with production implementation deferred
 Disposition commit: `cd71105` — `docs(plans): defer draft chathistory and ready failover`
-Closure commit: recorded by the immediately following exact-closure commit
+Closure commit: `491b816` — `docs(plans): close plan 060 as deferred`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
