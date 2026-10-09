@@ -68,6 +68,8 @@ pub struct NetworkDiagnostics {
     pub display_name: String,
     pub phase: Option<String>,
     pub generation: Option<u64>,
+    /// Selected endpoint priority index; zero is the configured primary.
+    pub selected_endpoint_index: usize,
     /// The nick currently in use, if any.
     pub nick: Option<String>,
     pub preferred_nick: Option<String>,
@@ -227,6 +229,7 @@ pub fn project_network(
         display_name: display_name.to_owned(),
         phase: snapshot.phase.map(|phase| phase.as_str().to_owned()),
         generation: snapshot.generation.map(|generation| generation.0),
+        selected_endpoint_index: snapshot.selected_endpoint_index,
         nick: snapshot.nick.clone(),
         preferred_nick: snapshot.preferred_nick.clone(),
         fallback_active: snapshot.fallback_active,
@@ -439,7 +442,7 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
         tagged(
             "state",
             &format!(
-                "netid={netid} name={} phase={} generation={} nick={} preferred_nick={} fallback={} reclaim_suspended={} reclaim_cooldown_ms={} reclaim_writes={} reclaim_refusals={} away={} attached={} active={} \
+                "netid={netid} name={} phase={} generation={} endpoint_index={} nick={} preferred_nick={} fallback={} reclaim_suspended={} reclaim_cooldown_ms={} reclaim_writes={} reclaim_refusals={} away={} attached={} active={} \
                  passive={} attempt={} in_flight={} waiters={} next_retry_delay={} \
                  last_disposition={} last_error={}",
                 report.display_name,
@@ -447,6 +450,7 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
                 report
                     .generation
                     .map_or_else(|| "none".to_owned(), |generation| generation.to_string()),
+                report.selected_endpoint_index,
                 report.nick.as_deref().unwrap_or("none"),
                 report.preferred_nick.as_deref().unwrap_or("none"),
                 report.fallback_active,
@@ -679,6 +683,7 @@ mod tests {
                 display_name: format!("net-{index}"),
                 phase: Some("online".to_owned()),
                 generation: Some(1),
+                selected_endpoint_index: 0,
                 nick: Some("bot".to_owned()),
                 preferred_nick: Some("bot".to_owned()),
                 fallback_active: false,
@@ -788,6 +793,15 @@ mod tests {
                 line.fields
             );
         }
+    }
+
+    #[test]
+    fn selected_failover_index_is_reported_without_an_endpoint_value() {
+        let mut report = one_network(1);
+        report.networks[0].selected_endpoint_index = 3;
+        let lines = render_network(&report.networks[0]);
+        assert!(lines[0].fields.contains("endpoint_index=3"));
+        assert!(!lines[0].fields.contains("irc.example.i2p"));
     }
 
     #[test]

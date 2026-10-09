@@ -13,6 +13,13 @@ than to a generation. Deleting the Network, or shutting down, releases it exactl
 after the owner has been joined. This is what stops two Networks from ever sharing a router
 identity, and therefore what stops an observer at the bridge from correlating them.
 
+An optional endpoint group remains scoped to that same durable `NetworkId`. The configured
+primary is tried first; classified provider, timeout, protocol, and I/O failures advance to
+the next explicitly operator-attested alternate on a later generation under the existing
+reconnect backoff. Registration rejection is terminal and does not send credentials to an
+alternate. There is never more than one live stream for the Network. Process restart begins
+again at the configured primary, and diagnostics report only the selected endpoint index.
+
 ## One live owner per Network
 
 Each upstream Network has exactly one live owner. `NetworkOwner` holds that Network's `NetworkState` as a plain local value — never behind a shared lock — and is the only thing that may mutate it.

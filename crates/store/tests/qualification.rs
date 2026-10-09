@@ -82,6 +82,7 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
         network: NetworkId(network),
         display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        failover_group: None,
         nick: "bot".into(),
         username: "user".into(),
         realname: "bouncer".into(),
@@ -969,6 +970,55 @@ async fn an_operator_chosen_display_name_round_trips_and_survives_reopen() {
         loaded[0].display_name, "hidden-service",
         "an operator-chosen name is durable and is not overwritten by the fallback"
     );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn an_attested_failover_group_is_bounded_and_survives_reopen() {
+    let dir = testing::temp_dir("failover-group");
+    let path = dir.db("failover-group.sqlite3");
+    let mut configured = record(71, &[]);
+    configured.failover_group = Some(i2pr_irc_store::FailoverEndpointGroup {
+        alternates: vec![
+            I2pEndpoint::parse(&format!("{}.b32.i2p", "a".repeat(52))).unwrap(),
+            I2pEndpoint::parse(&format!("{}.b32.i2p", "b".repeat(52))).unwrap(),
+        ],
+        operator_attests_equivalence: true,
+        credentials_authorized: true,
+    });
+    let store = store_at(&path);
+    store
+        .handle()
+        .save_network(&configured)
+        .await
+        .expect("group saves");
+    store.shutdown().expect("store shuts down");
+
+    let reopened = store_at(&path);
+    let loaded = reopened
+        .handle()
+        .load_networks()
+        .await
+        .expect("records load");
+    assert_eq!(loaded[0].failover_group, configured.failover_group);
+    reopened.shutdown().expect("reopened store shuts down");
+
+    let mut invalid = configured;
+    invalid
+        .failover_group
+        .as_mut()
+        .unwrap()
+        .credentials_authorized = false;
+    let store = Store::open(&StorePath::Memory).expect("memory store opens");
+    assert!(matches!(
+        store
+            .handle()
+            .save_network(&invalid)
+            .await
+            .unwrap_err()
+            .kind(),
+        StoreErrorKind::InvalidRequest(_)
+    ));
     store.shutdown().expect("store shuts down");
 }
 
@@ -3197,6 +3247,7 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         11 => drop(testing::create_v11_database(path)),
         12 => drop(testing::create_v12_database(path)),
         13 => drop(testing::create_v13_database(path)),
+        14 => drop(testing::create_v14_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }

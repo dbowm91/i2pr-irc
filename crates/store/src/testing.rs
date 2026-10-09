@@ -22,10 +22,9 @@ use std::{
 
 /// Every table the schema contains, in SQLite's name order.
 ///
-/// The table *set* has been identical across every schema version so far; only the
-/// representation of `history_events.server_time` and `networks.display_name` changed,
-/// and only `desired_channels` gained a column.
-pub const EXPECTED_TABLES: [&str; 13] = [
+/// The table *set* has been identical across every schema version so far; later schema
+/// steps add bounded tables without changing existing event identity.
+pub const EXPECTED_TABLES: [&str; 15] = [
     "buffer_privacy",
     "buffers",
     "client_cursors",
@@ -37,6 +36,8 @@ pub const EXPECTED_TABLES: [&str; 13] = [
     // excluded by `table_names`, so listing them here would tie the promised schema to a
     // SQLite build detail.
     "history_search",
+    "network_failover",
+    "network_failover_endpoints",
     "network_secrets",
     "networks",
     "read_markers",
@@ -297,6 +298,21 @@ pub fn create_v13_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 13)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 14, immediately before endpoint failover groups.
+pub fn create_v14_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v14())
+        .expect("schema 14 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 14)
         .expect("user_version is writable");
     connection
 }

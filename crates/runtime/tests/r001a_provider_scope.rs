@@ -54,6 +54,7 @@ fn record(network: u64) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        failover_group: None,
         nick: "bot".into(),
         username: "user".into(),
         realname: "bouncer".into(),
@@ -80,15 +81,18 @@ struct ReleaseLog {
 struct ScopedProvider {
     inner: FakeI2pStreamProvider,
     log: Arc<Mutex<ReleaseLog>>,
+    endpoints: Arc<Mutex<Vec<String>>>,
 }
 
 impl ScopedProvider {
     fn new() -> (Arc<Self>, Arc<Mutex<ReleaseLog>>) {
         let log = Arc::new(Mutex::new(ReleaseLog::default()));
+        let endpoints = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
                 inner: FakeI2pStreamProvider::default(),
                 log: log.clone(),
+                endpoints,
             }),
             log,
         )
@@ -114,6 +118,10 @@ impl I2pStreamProvider for ScopedProvider {
         network: NetworkId,
         endpoint: &I2pEndpoint,
     ) -> Result<Box<dyn i2pr_irc_core::ByteStream>, i2pr_irc_core::ProviderError> {
+        self.endpoints
+            .lock()
+            .expect("endpoint log is writable")
+            .push(endpoint.as_str().to_owned());
         self.inner.connect(network, endpoint).await
     }
 
@@ -128,6 +136,65 @@ impl I2pStreamProvider for ScopedProvider {
         }
         self.inner.release(network).await
     }
+}
+
+#[tokio::test]
+async fn failed_primary_rotates_only_to_the_attested_same_network_alternate() {
+    let (provider, log) = ScopedProvider::new();
+    provider
+        .inner
+        .queue_outcome(Err(i2pr_irc_core::ProviderError::Unavailable))
+        .expect("failure queues");
+    let (store, handle) = store();
+    let reconnect = i2pr_irc_runtime::reconnect::ReconnectScheduler::new(
+        i2pr_irc_runtime::reconnect::ReconnectBudget {
+            token_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .expect("the injected budget validates");
+    let (mut controller, control) =
+        RuntimeController::with_reconnect(provider.clone(), handle, reconnect);
+    let task = tokio::spawn(async move { controller.serve().await });
+    wait_for(&control, |_| true, &log).await;
+    let mut configured = record(1);
+    configured.failover_group = Some(i2pr_irc_store::FailoverEndpointGroup {
+        alternates: vec![I2pEndpoint::parse("irc-alternate.i2p").expect("alternate parses")],
+        operator_attests_equivalence: true,
+        credentials_authorized: true,
+    });
+    control.create(configured).await.expect("network creates");
+    for _ in 0..200 {
+        if provider
+            .endpoints
+            .lock()
+            .expect("endpoint log readable")
+            .len()
+            >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let endpoints = provider
+        .endpoints
+        .lock()
+        .expect("endpoint log readable")
+        .clone();
+    assert!(
+        endpoints.len() >= 2,
+        "the alternate was attempted: {endpoints:?}"
+    );
+    assert_eq!(
+        &endpoints[..2],
+        &["irc.example.i2p".to_owned(), "irc-alternate.i2p".to_owned()],
+        "the same owner rotates from its primary to the explicitly attested alternate"
+    );
+    control.request_stop();
+    task.await
+        .expect("controller joins")
+        .expect("controller succeeds");
+    store.shutdown().expect("store shuts down");
 }
 
 /// A controller plus the handles a test drives it through.

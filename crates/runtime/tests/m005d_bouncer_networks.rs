@@ -39,6 +39,7 @@ fn record(network: u64, nick: &str) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse(&b32()).expect("a test destination"),
+        failover_group: None,
         nick: nick.to_owned(),
         username: "user".to_owned(),
         realname: "bouncer".to_owned(),
@@ -1199,6 +1200,58 @@ async fn a_credential_never_appears_in_a_service_reply() {
         !client.seen.contains("hunter2"),
         "the credential comes back from no reply, no status, and no refusal: {}",
         client.seen
+    );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn the_local_service_requires_explicit_failover_attestation_and_can_manage_alternates() {
+    let runtime = Runtime::start().await;
+    runtime.create(1).await;
+    let mut client = admit_unbound(&runtime, SessionId(101));
+    register_plain(&mut client).await;
+
+    client
+        .send("PRIVMSG BouncerServ :failover set 1 equivalent=yes credentials=yes irc-alt.i2p\r\n")
+        .await;
+    client.until("Set attested failover group").await;
+    client
+        .send("PRIVMSG BouncerServ :failover add 1 irc-next.i2p\r\n")
+        .await;
+    client.until("Added failover alternate").await;
+    let record = runtime
+        .control
+        .network_record(NetworkId(1))
+        .await
+        .expect("record reads")
+        .expect("network exists");
+    let group = record
+        .failover_group
+        .expect("operator configured alternates");
+    assert!(group.operator_attests_equivalence);
+    assert!(group.credentials_authorized);
+    assert_eq!(
+        group
+            .alternates
+            .iter()
+            .map(i2pr_irc_core::I2pEndpoint::as_str)
+            .collect::<Vec<_>>(),
+        ["irc-alt.i2p", "irc-next.i2p"]
+    );
+
+    client
+        .send("PRIVMSG BouncerServ :failover clear 1\r\n")
+        .await;
+    client.until("Cleared failover group").await;
+    assert!(
+        runtime
+            .control
+            .network_record(NetworkId(1))
+            .await
+            .expect("record reads")
+            .expect("network exists")
+            .failover_group
+            .is_none()
     );
     runtime.stop().await;
 }

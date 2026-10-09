@@ -38,6 +38,7 @@ fn synthetic_network() -> NetworkRecord {
         network: NetworkId(71),
         display_name: "sentinel-display-name-3e10".to_owned(),
         endpoint: I2pEndpoint::parse("sentinel-router.i2p").expect("test endpoint parses"),
+        failover_group: None,
         nick: "privacybot".to_owned(),
         username: "sentinel-sasl-user-71a2".to_owned(),
         realname: "synthetic qualification fixture".to_owned(),

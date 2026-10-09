@@ -47,6 +47,7 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse(&b32()).expect("a test destination"),
+        failover_group: None,
         nick: "bot".to_owned(),
         username: "user".to_owned(),
         realname: "bouncer".to_owned(),

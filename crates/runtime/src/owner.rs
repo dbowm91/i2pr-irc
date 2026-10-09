@@ -686,6 +686,9 @@ impl DesiredReconcile {
 #[derive(Clone, Debug, Default)]
 pub struct NetworkSnapshot {
     pub network: Option<NetworkId>,
+    /// Selected endpoint priority index; zero is the configured primary. Never includes
+    /// the endpoint value itself.
+    pub selected_endpoint_index: usize,
     pub phase: Option<Phase>,
     pub generation: Option<ConnectionGeneration>,
     pub nick: Option<String>,
@@ -1268,6 +1271,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             jitter_percent: 20,
         };
         let mut generation = 0u64;
+        let endpoint_count = self.context.record.endpoint_count();
+        let mut endpoint_index = 0usize;
         let mut active_gap: Option<(tokio::sync::oneshot::Sender<u64>, Instant)> = None;
         let gap_writer_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Attachments that arrived before the owner loop started. They are bounded by
@@ -1300,6 +1305,14 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 },
             };
             self.set_phase(Phase::Connecting, Some(ConnectionGeneration(generation)));
+            let selected_endpoint = self
+                .context
+                .record
+                .endpoint_at(endpoint_index)
+                .ok_or(RuntimeError::InvalidConfig)?;
+            self.snapshot.send_modify(|state| {
+                state.selected_endpoint_index = endpoint_index;
+            });
             let connection = tokio::select! {
                 _ = stopped(&mut stop) => {
                     self.set_phase(Phase::Stopped, Some(ConnectionGeneration(generation)));
@@ -1307,7 +1320,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 }
                 result = timeout_connection(
                     self.provider
-                        .connect(self.network, &self.context.record.endpoint),
+                        .connect(self.network, selected_endpoint),
                 ) => {
                     match result {
                         Ok(Ok(stream)) => Ok(stream),
@@ -1416,6 +1429,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // terminal and stops competing until it is reconciled.
             if matches!(&outcome, Err(RuntimeError::Registration)) {
                 self.reconnect.mark_terminal(self.network);
+            }
+            if outcome.as_ref().is_err_and(should_rotate_endpoint) && endpoint_count > 1 {
+                endpoint_index = (endpoint_index + 1) % endpoint_count;
             }
             let entropy = jitter_entropy(self.network, generation, self.reconnect.entropy_seed());
             let delay = if matches!(&outcome, Err(RuntimeError::NickExhausted)) {
@@ -4263,6 +4279,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             ":bouncer NOTICE {nick} :Bouncer could not accept that command for upstream delivery ({class} refused)\r\n"
         ));
     }
+}
+
+fn should_rotate_endpoint(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Provider(_)
+            | RuntimeError::Timeout
+            | RuntimeError::Protocol
+            | RuntimeError::Io(_)
+    )
 }
 
 /// Stopping an owner removes it from process-wide accounting.

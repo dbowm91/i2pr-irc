@@ -1,4 +1,4 @@
-//! Schema versions 1 through 14 and their transactional migration harness.
+//! Schema versions 1 through 15 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -23,8 +23,9 @@ use rusqlite::Connection;
 /// a fail-closed marker while stricter persistent ceilings prune existing history;
 /// version 11 records whether each event has a derived FTS row; version 12 adds bounded
 /// detached-channel activity policies, disabled for existing rows by default; version 13
-/// adds literal local watch rules; version 14 adds bounded connection-gap dispositions.
-pub const SCHEMA_VERSION: i64 = 14;
+/// adds literal local watch rules; version 14 adds bounded connection-gap dispositions;
+/// version 15 adds optional, explicitly attested same-Network failover groups.
+pub const SCHEMA_VERSION: i64 = 15;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -450,6 +451,26 @@ pub(crate) fn schema_v14() -> String {
     format!("{}{}", schema_v13(), CONNECTION_GAPS_V14)
 }
 
+pub(crate) fn schema_v15() -> String {
+    format!("{}{}", schema_v14(), NETWORK_FAILOVER_V15)
+}
+
+const NETWORK_FAILOVER_V15: &str = r#"
+CREATE TABLE network_failover (
+    network_id              INTEGER PRIMARY KEY REFERENCES networks(network_id) ON DELETE CASCADE,
+    operator_equivalent     INTEGER NOT NULL CHECK (operator_equivalent = 1),
+    credentials_authorized  INTEGER NOT NULL CHECK (credentials_authorized = 1)
+) STRICT;
+CREATE TABLE network_failover_endpoints (
+    network_id      INTEGER NOT NULL REFERENCES network_failover(network_id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL CHECK (position BETWEEN 1 AND 7),
+    endpoint        TEXT NOT NULL,
+    endpoint_kind   INTEGER NOT NULL,
+    PRIMARY KEY (network_id, position),
+    UNIQUE (network_id, endpoint)
+) STRICT;
+"#;
+
 const CONNECTION_GAPS_V14: &str = r#"
 CREATE TABLE connection_gaps (
     network_id      INTEGER NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
@@ -678,7 +699,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v14())
+                .execute_batch(&schema_v15())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -761,6 +782,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "buffer_privacy",
     "watch_rules",
     "connection_gaps",
+    "network_failover",
+    "network_failover_endpoints",
 ];
 
 /// Indexes this build promises, beyond the presence of their table.
@@ -879,6 +902,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             11 => migrate_11_to_12(transaction)?,
             12 => migrate_12_to_13(transaction)?,
             13 => migrate_13_to_14(transaction)?,
+            14 => migrate_14_to_15(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -920,6 +944,14 @@ fn migrate_12_to_13(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
 
 fn migrate_13_to_14(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(CONNECTION_GAPS_V14)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_14_to_15(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(NETWORK_FAILOVER_V15)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;

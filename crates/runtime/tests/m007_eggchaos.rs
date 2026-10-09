@@ -493,6 +493,7 @@ fn record() -> NetworkRecord {
         network: NETWORK,
         display_name: "eggchaos-qualification".into(),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("I2P endpoint parses"),
+        failover_group: None,
         nick: "bot".into(),
         username: "user".into(),
         realname: "qualification".into(),

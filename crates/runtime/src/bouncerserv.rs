@@ -70,6 +70,20 @@ pub enum ServCommand {
     NetworkDelete {
         network: NetworkId,
     },
+    /// Start an operator-attested failover group with its first alternate.
+    FailoverSet {
+        network: NetworkId,
+        endpoint: i2pr_irc_core::I2pEndpoint,
+    },
+    /// Add one alternate to an already-attested group.
+    FailoverAdd {
+        network: NetworkId,
+        endpoint: i2pr_irc_core::I2pEndpoint,
+    },
+    /// Return to the single configured primary endpoint.
+    FailoverClear {
+        network: NetworkId,
+    },
     /// Report one channel's presentation policy on one Network.
     ChannelStatus {
         network: NetworkId,
@@ -195,6 +209,9 @@ impl std::fmt::Debug for ServCommand {
                 return write!(f, "NetworkUpdate({network:?}, {fields:?})");
             }
             Self::NetworkDelete { network } => return write!(f, "NetworkDelete({network:?})"),
+            Self::FailoverSet { network, .. } => return write!(f, "FailoverSet({network:?})"),
+            Self::FailoverAdd { network, .. } => return write!(f, "FailoverAdd({network:?})"),
+            Self::FailoverClear { network } => return write!(f, "FailoverClear({network:?})"),
             Self::ChannelStatus { network, channel } => {
                 return write!(f, "ChannelStatus({network:?}, {channel})");
             }
@@ -277,6 +294,8 @@ pub const HELP_TEXT: &str = concat!(
     " | network create name=<name> host=<i2p-destination> [nickname=<nick>] [username=<user>] [realname=<text>]",
     " | network update <netid> [name=<name>] [nickname=<nick>] [username=<user>] [realname=<text>]",
     " | network delete <netid>",
+    " | failover set <netid> equivalent=yes credentials=yes <alternate.i2p>",
+    " | failover add <netid> <alternate.i2p> | failover clear <netid>",
     " | channel status <netid> <channel>",
     " | channel detach <netid> <channel>",
     " | channel attach <netid> <channel>",
@@ -298,6 +317,15 @@ pub const HELP_TEXT: &str = concat!(
     " | action status <netid>",
     " | action set <netid> [mode=<modes>] [message=<serv> text=<text>]",
 );
+
+fn parse_failover_endpoint(raw: &str) -> Result<i2pr_irc_core::I2pEndpoint, BouncerError> {
+    let endpoint =
+        i2pr_irc_core::I2pEndpoint::parse(raw).map_err(|_| BouncerError::ValueOutOfRange)?;
+    if raw.len() > 240 || endpoint.kind() == i2pr_irc_core::I2pEndpointKind::Destination {
+        return Err(BouncerError::ValueOutOfRange);
+    }
+    Ok(endpoint)
+}
 
 /// Parses one command line.
 ///
@@ -356,6 +384,33 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                 fields: serv_fields(&words[3.min(words.len())..], false)?,
             }),
             "DELETE" => Ok(ServCommand::NetworkDelete { network: netid(2)? }),
+            other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+        },
+        "FAILOVER" => match word(1).to_ascii_uppercase().as_str() {
+            "SET" => {
+                if words.len() != 6 || word(3) != "equivalent=yes" || word(4) != "credentials=yes" {
+                    return Err(BouncerError::Usage);
+                }
+                Ok(ServCommand::FailoverSet {
+                    network: netid(2)?,
+                    endpoint: parse_failover_endpoint(word(5))?,
+                })
+            }
+            "ADD" => {
+                if words.len() != 4 {
+                    return Err(BouncerError::Usage);
+                }
+                Ok(ServCommand::FailoverAdd {
+                    network: netid(2)?,
+                    endpoint: parse_failover_endpoint(word(3))?,
+                })
+            }
+            "CLEAR" => {
+                if words.len() != 3 {
+                    return Err(BouncerError::Usage);
+                }
+                Ok(ServCommand::FailoverClear { network: netid(2)? })
+            }
             other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
         },
         "CHANNEL" => {
@@ -786,6 +841,9 @@ mod tests {
             "network create name=lab host=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.b32.i2p",
             "network update 1 name=other",
             "network delete 1",
+            "failover set 1 equivalent=yes credentials=yes irc-alt.i2p",
+            "failover add 1 irc-next.i2p",
+            "failover clear 1",
             "channel status 1 #room",
             "channel detach 1 #room",
             "channel attach 1 #room",
@@ -881,6 +939,10 @@ mod tests {
         assert!(parse("network create name=lab").is_err());
         // An update needs at least one field.
         assert!(parse("network update 1").is_err());
+        assert!(parse("failover set 1 equivalent=no credentials=yes irc-alt.i2p").is_err());
+        assert!(parse("failover set 1 equivalent=yes credentials=yes").is_err());
+        assert!(parse("failover add 1 not-an-i2p-host").is_err());
+        assert!(parse("failover clear 1 extra").is_err());
         // A channel argument is validated as a channel name.
         assert!(parse("channel detach 1 a,b").is_err());
         assert!(parse("channel detach 1 #room extra").is_err());

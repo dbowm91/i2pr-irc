@@ -38,14 +38,18 @@
 
 use crate::bouncer_networks::{self, BouncerError};
 use i2pr_irc_core::{I2pEndpoint, NetworkId};
-use i2pr_irc_store::{DesiredChannelRecord, MAX_DISPLAY_NAME_BYTES, NetworkRecord, StoredSecret};
+use i2pr_irc_store::{
+    DesiredChannelRecord, FailoverEndpointGroup, MAX_DISPLAY_NAME_BYTES, NetworkRecord,
+    StoredSecret,
+};
 
 /// The only snapshot version this build writes or accepts.
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 /// Version 1 carried only a total action count; its actions use the migrated PostJoin phase.
 const LEGACY_SNAPSHOT_VERSION: u32 = 1;
 /// Version 2 introduced explicit action phase counts and defaults activity policy to off.
-const PREVIOUS_SNAPSHOT_VERSION: u32 = 2;
+const PREVIOUS_SNAPSHOT_V2: u32 = 2;
+const PREVIOUS_SNAPSHOT_VERSION: u32 = 3;
 
 /// The first line of every snapshot, and the marker a parser requires before anything else.
 ///
@@ -54,11 +58,11 @@ const PREVIOUS_SNAPSHOT_VERSION: u32 = 2;
 /// to look like configuration.
 pub const SNAPSHOT_MAGIC: &str = "#i2pr-bouncer-config";
 
-/// Ceiling on lines in one snapshot.
-///
-/// One more than the ceiling on Networks, because a Network with no channels still
-/// contributes a header and the format has a leading magic line.
-pub const MAX_SNAPSHOT_LINES: usize = crate::catalog::MAX_SUPERVISED_NETWORKS + 1;
+/// Ceiling on lines in one snapshot, including maximum per-Network channels, endpoint
+/// declarations and alternate endpoints, plus the magic/version headers.
+pub const MAX_SNAPSHOT_LINES: usize = crate::catalog::MAX_SUPERVISED_NETWORKS
+    * (MAX_SNAPSHOT_CHANNELS + i2pr_irc_store::MAX_NETWORK_ENDPOINTS + 2)
+    + 1;
 
 /// Ceiling on channels in one Network.
 ///
@@ -121,6 +125,10 @@ pub struct SnapshotNetwork {
     pub network: NetworkId,
     pub display_name: String,
     pub endpoint: I2pEndpoint,
+    pub failover_group: Option<FailoverEndpointGroup>,
+    /// Legacy snapshots do not represent failover settings. In that case, keep the
+    /// already stored setting when applying an update.
+    pub retain_existing_failover: bool,
     pub nick: String,
     pub username: String,
     pub realname: String,
@@ -186,6 +194,14 @@ fn render_network(entry: &SnapshotNetwork) -> String {
         entry.action_phase_counts[1],
         entry.action_phase_counts[2],
     ));
+    if let Some(group) = &entry.failover_group {
+        out.push_str("failover equivalent=operator credentials=operator\n");
+        for endpoint in &group.alternates {
+            out.push_str(&format!("alternate host={}\n", endpoint.as_str()));
+        }
+    } else {
+        out.push_str("failover mode=disabled\n");
+    }
     let mut channels = entry.desired_channels.clone();
     channels.sort_by_key(|channel| channel.position);
     for channel in channels {
@@ -232,10 +248,13 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         Some(line) => parse_version(line)?,
         None => return Err(ConfigError::UnsupportedVersion(0)),
     };
-    if version != SNAPSHOT_VERSION
-        && version != PREVIOUS_SNAPSHOT_VERSION
-        && version != LEGACY_SNAPSHOT_VERSION
-    {
+    if !matches!(
+        version,
+        SNAPSHOT_VERSION
+            | PREVIOUS_SNAPSHOT_VERSION
+            | PREVIOUS_SNAPSHOT_V2
+            | LEGACY_SNAPSHOT_VERSION
+    ) {
         return Err(ConfigError::UnsupportedVersion(version));
     }
 
@@ -251,6 +270,8 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
 
     let mut snapshot = ConfigSnapshot::default();
     let mut current: Option<usize> = None;
+    let mut failover_declared = std::collections::BTreeSet::new();
+    let mut failover_disabled = std::collections::BTreeSet::new();
     for line in lines.iter().skip(2) {
         let fields = split_fields(line);
         if fields.is_empty() {
@@ -276,6 +297,57 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 }
                 entry.desired_channels.push(channel);
             }
+            "failover" => {
+                let Some(index) = current else {
+                    return Err(ConfigError::OrphanChannel);
+                };
+                if version != SNAPSHOT_VERSION || !failover_declared.insert(index) {
+                    return Err(ConfigError::InvalidValue("failover"));
+                }
+                if fields.len() == 2 && fields[1] == "mode=disabled" {
+                    failover_disabled.insert(index);
+                } else if fields.len() == 3
+                    && fields[1] == "equivalent=operator"
+                    && fields[2] == "credentials=operator"
+                {
+                    snapshot.networks[index].failover_group = Some(FailoverEndpointGroup {
+                        alternates: Vec::new(),
+                        operator_attests_equivalence: true,
+                        credentials_authorized: true,
+                    });
+                } else {
+                    return Err(ConfigError::InvalidValue("failover"));
+                }
+            }
+            "alternate" => {
+                let Some(index) = current else {
+                    return Err(ConfigError::OrphanChannel);
+                };
+                if !failover_declared.contains(&index)
+                    || failover_disabled.contains(&index)
+                    || fields.len() != 2
+                {
+                    return Err(ConfigError::InvalidValue("alternate"));
+                }
+                let Some(value) = fields[1].strip_prefix("host=") else {
+                    return Err(ConfigError::InvalidValue("alternate"));
+                };
+                let endpoint = I2pEndpoint::parse(value)
+                    .map_err(|_| ConfigError::InvalidValue("alternate"))?;
+                if value.len() > 240
+                    || endpoint.kind() == i2pr_irc_core::I2pEndpointKind::Destination
+                {
+                    return Err(ConfigError::InvalidValue("alternate"));
+                }
+                let group = snapshot.networks[index]
+                    .failover_group
+                    .as_mut()
+                    .expect("declaration makes group");
+                if group.alternates.len() >= i2pr_irc_store::MAX_NETWORK_ENDPOINTS - 1 {
+                    return Err(ConfigError::InvalidValue("alternate"));
+                }
+                group.alternates.push(endpoint);
+            }
             // A credential cannot be represented, so seeing one means the text was not
             // produced by this renderer or was edited to add one. Either way it is refused
             // with a name, not silently dropped.
@@ -283,6 +355,31 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 return Err(ConfigError::RefusedSecret(other.to_owned()));
             }
             other => return Err(ConfigError::UnknownAttribute(other.to_owned())),
+        }
+    }
+    if version == SNAPSHOT_VERSION && failover_declared.len() != snapshot.networks.len() {
+        return Err(ConfigError::InvalidValue("missing failover policy"));
+    }
+    for index in failover_declared {
+        if snapshot.networks[index]
+            .failover_group
+            .as_ref()
+            .is_some_and(|group| group.alternates.is_empty())
+        {
+            return Err(ConfigError::InvalidValue("empty failover group"));
+        }
+    }
+    for entry in &snapshot.networks {
+        if let Some(group) = &entry.failover_group {
+            let mut endpoints = std::collections::BTreeSet::new();
+            endpoints.insert(entry.endpoint.as_str());
+            if group
+                .alternates
+                .iter()
+                .any(|endpoint| !endpoints.insert(endpoint.as_str()))
+            {
+                return Err(ConfigError::InvalidValue("duplicate failover endpoint"));
+            }
         }
     }
     snapshot.networks.sort_by_key(|entry| entry.network);
@@ -390,7 +487,7 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
     let action_phase_counts = match (version, action_phases) {
         (_, Some(counts)) => counts,
         (LEGACY_SNAPSHOT_VERSION, None) => [0, action_count, 0],
-        (PREVIOUS_SNAPSHOT_VERSION | SNAPSHOT_VERSION, None) => {
+        (PREVIOUS_SNAPSHOT_V2 | PREVIOUS_SNAPSHOT_VERSION | SNAPSHOT_VERSION, None) => {
             return Err(ConfigError::MissingAttribute("action_phases"));
         }
         _ => return Err(ConfigError::UnsupportedVersion(version)),
@@ -405,6 +502,8 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
         .map_err(|_| ConfigError::InvalidValue("netid"))?,
         display_name: display_name.to_owned(),
         endpoint,
+        failover_group: None,
+        retain_existing_failover: version != SNAPSHOT_VERSION,
         nick,
         username,
         realname,
@@ -550,23 +649,23 @@ pub fn plan(snapshot: &ConfigSnapshot, existing: &[NetworkRecord]) -> ImportPlan
             Some(record) if record.display_name != entry.display_name => {
                 steps.push(ImportStep::Conflict(entry.network));
             }
-            Some(_) => {
+            Some(existing_record) => {
                 updates += 1;
-                steps.push(ImportStep::Update(
-                    entry.to_record_with(
-                        // Carrying the stored credential across is what makes an update an
-                        // update. `to_record` produces `sasl: None` because the snapshot format
-                        // cannot represent a credential, and writing that field through would
-                        // erase a secret the snapshot never saw -- a data-loss bug that would
-                        // look like a successful restore. Merging it here, where both the
-                        // snapshot entry and the stored record are in scope, is the only place
-                        // the two can be combined.
-                        existing
-                            .iter()
-                            .find(|record| record.network == entry.network)
-                            .and_then(|record| record.sasl.clone()),
-                    ),
-                ));
+                steps.push(ImportStep::Update(entry.to_record_with(
+                    // Carrying the stored credential across is what makes an update an
+                    // update. `to_record` produces `sasl: None` because the snapshot format
+                    // cannot represent a credential, and writing that field through would
+                    // erase a secret the snapshot never saw -- a data-loss bug that would
+                    // look like a successful restore. Merging it here, where both the
+                    // snapshot entry and the stored record are in scope, is the only place
+                    // the two can be combined.
+                    existing_record.sasl.clone(),
+                    if entry.retain_existing_failover {
+                        existing_record.failover_group.clone()
+                    } else {
+                        entry.failover_group.clone()
+                    },
+                )));
             }
             None => {
                 creates += 1;
@@ -592,7 +691,7 @@ impl SnapshotNetwork {
     /// import can never carry one *in*. Use [`Self::to_record_with`] to preserve a stored
     /// credential across an update.
     pub fn to_record(&self) -> NetworkRecord {
-        self.to_record_with(None)
+        self.to_record_with(None, self.failover_group.clone())
     }
 
     /// The durable record for this entry, carrying `credential` through unchanged.
@@ -600,11 +699,16 @@ impl SnapshotNetwork {
     /// The credential is never *derived* here: it comes from the record already in the
     /// store, so this can only ever preserve what was already stored and can never invent
     /// or modify one.
-    pub fn to_record_with(&self, credential: Option<(String, StoredSecret)>) -> NetworkRecord {
+    pub fn to_record_with(
+        &self,
+        credential: Option<(String, StoredSecret)>,
+        failover_group: Option<FailoverEndpointGroup>,
+    ) -> NetworkRecord {
         NetworkRecord {
             network: self.network,
             display_name: self.display_name.clone(),
             endpoint: self.endpoint.clone(),
+            failover_group,
             nick: self.nick.clone(),
             username: self.username.clone(),
             realname: self.realname.clone(),
@@ -660,6 +764,8 @@ mod tests {
                     network: NetworkId(2),
                     display_name: "second".to_owned(),
                     endpoint: I2pEndpoint::parse(&b32('c')).expect("a destination"),
+                    failover_group: None,
+                    retain_existing_failover: false,
                     nick: "two".to_owned(),
                     username: "user2".to_owned(),
                     realname: "Two".to_owned(),
@@ -678,6 +784,8 @@ mod tests {
                     network: NetworkId(1),
                     display_name: "first".to_owned(),
                     endpoint: I2pEndpoint::parse(&b32('a')).expect("a destination"),
+                    failover_group: None,
+                    retain_existing_failover: false,
                     nick: "one".to_owned(),
                     username: "user1".to_owned(),
                     realname: "One".to_owned(),
@@ -726,6 +834,11 @@ mod tests {
         let text = render(&sample())
             .replace(&format!("version {SNAPSHOT_VERSION}"), "version 1")
             .replace(" action_phases=1,1,0", "");
+        let text = text
+            .lines()
+            .filter(|line| !line.starts_with("failover ") && !line.starts_with("alternate "))
+            .collect::<Vec<_>>()
+            .join("\n");
         let parsed = parse(&text).expect("version 1 snapshots remain readable");
         assert_eq!(parsed.networks[1].action_count, 2);
         assert_eq!(parsed.networks[1].action_phase_counts, [0, 2, 0]);
@@ -892,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn more_networks_than_the_runtime_supervises_is_refused() {
+    fn more_lines_than_the_snapshot_ceiling_is_refused() {
         let mut text = format!("{SNAPSHOT_MAGIC}\nversion {SNAPSHOT_VERSION}\n");
         for index in 0..=crate::catalog::MAX_SUPERVISED_NETWORKS {
             text.push_str(&format!(
@@ -902,6 +1015,7 @@ mod tests {
                 b32('a')
             ));
         }
+        text.push_str(&"\n".repeat(MAX_SNAPSHOT_LINES));
         assert_eq!(parse(&text), Err(ConfigError::TooManyLines));
     }
 
@@ -964,5 +1078,56 @@ mod tests {
                 "a line the control surface could not carry: {line}"
             );
         }
+    }
+
+    #[test]
+    fn an_operator_attested_failover_group_round_trips_and_legacy_import_preserves_it() {
+        let mut snapshot = sample();
+        snapshot.networks[0].failover_group = Some(FailoverEndpointGroup {
+            alternates: vec![I2pEndpoint::parse(&b32('d')).expect("alternate parses")],
+            operator_attests_equivalence: true,
+            credentials_authorized: true,
+        });
+        let rendered = render(&snapshot);
+        let parsed = parse(&rendered).expect("attested group parses");
+        let mut expected = snapshot.clone();
+        expected.networks.sort_by_key(|entry| entry.network);
+        assert_eq!(parsed, expected);
+        assert!(rendered.contains("failover equivalent=operator credentials=operator"));
+
+        let mut primary = entry(1).to_record();
+        primary.failover_group = Some(FailoverEndpointGroup {
+            alternates: vec![I2pEndpoint::parse(&b32('e')).expect("stored alternate parses")],
+            operator_attests_equivalence: true,
+            credentials_authorized: true,
+        });
+        let previous = rendered
+            .lines()
+            .filter(|line| !line.starts_with("failover ") && !line.starts_with("alternate "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("version 4", "version 3");
+        let parsed_previous = parse(&previous).expect("previous version parses");
+        assert!(parsed_previous.networks[0].retain_existing_failover);
+        let update = plan(&parsed_previous, std::slice::from_ref(&primary));
+        let ImportStep::Update(updated) = &update.steps[0] else {
+            panic!("expected update")
+        };
+        assert_eq!(updated.failover_group, primary.failover_group);
+    }
+
+    #[test]
+    fn snapshot_parser_rejects_duplicate_failover_alternates() {
+        let mut snapshot = sample();
+        let endpoint = I2pEndpoint::parse("irc-alternate.i2p").expect("alternate parses");
+        snapshot.networks[0].failover_group = Some(FailoverEndpointGroup {
+            alternates: vec![endpoint.clone(), endpoint],
+            operator_attests_equivalence: true,
+            credentials_authorized: true,
+        });
+        assert_eq!(
+            parse(&render(&snapshot)),
+            Err(ConfigError::InvalidValue("duplicate failover endpoint"))
+        );
     }
 }

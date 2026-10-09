@@ -15,6 +15,7 @@ fn network() -> NetworkRecord {
         network: NetworkId(1),
         display_name: "net-1".to_owned(),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("I2P endpoint parses"),
+        failover_group: None,
         nick: "bot".to_owned(),
         username: "user".to_owned(),
         realname: "bouncer".to_owned(),

@@ -73,8 +73,10 @@ bouncer can read back what it wrote.
 
 ```
 #i2pr-bouncer-config
-version 3
+version 4
 network netid=1 name=lab host=…b32.i2p nick=bot username=user realname=bouncer auto_away=off keep_nick=off actions=1 action_phases=0,1,0
+failover equivalent=operator credentials=operator
+alternate host=irc-alternate.i2p
 channel target=#one position=0 detached=off relay_detached=none reattach_on=off detach_after_secs=off
 ```
 
@@ -92,10 +94,19 @@ that their secret was refused rather than being sent looking for a syntax proble
 **Unknown versions are refused, never guessed.** A format that guessed would import a Network
 with fields missing and the Operator would find out from a failed connection.
 
-Version 3 adds optional-per-version channel activity attributes to the versioned snapshot.
-Version 1 and 2 channel rows remain accepted with disabled activity defaults. New exports
-include `relay_detached`, `reattach_on`, and `detach_after_secs` so a policy round-trip does
-not silently reset them.
+Version 4 adds explicit failover policy lines. `failover mode=disabled` keeps the
+single-endpoint behavior; an enabled group records both Operator attestations and one
+`alternate host=...` line per ordered alternate. Raw destinations are refused as alternates
+because exports must fit one IRC frame; `.i2p` names and base32 forms are accepted. Version
+1-3 imports preserve the existing stored failover group, since those formats could not
+represent it. Version 3 introduced channel activity attributes, and version 1-2 channel
+rows remain accepted with disabled activity defaults.
+
+`FAILOVER SET <netid> equivalent=yes credentials=yes <alternate.i2p>` begins an explicitly
+attested group, `FAILOVER ADD <netid> <alternate.i2p>` adds up to seven alternates, and
+`FAILOVER CLEAR <netid>` returns to one endpoint. Each change commits through the controller
+and restarts that Network owner. No alternate is inferred from an address suffix or public
+server list.
 
 ## Detached channel activity controls
 

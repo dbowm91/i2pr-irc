@@ -371,6 +371,10 @@ pub struct NetworkRecord {
     /// never derived from the endpoint or from any local path.
     pub display_name: String,
     pub endpoint: I2pEndpoint,
+    /// Operator-approved alternate endpoints for the same logical IRC Network.
+    /// A non-empty group is never inferred from endpoint names and must carry both
+    /// explicit trust attestations below.
+    pub failover_group: Option<FailoverEndpointGroup>,
     pub nick: String,
     pub username: String,
     pub realname: String,
@@ -390,6 +394,20 @@ pub struct NetworkRecord {
     /// forever, and that traffic must not begin without being asked for.
     pub keep_nick: bool,
 }
+
+/// Bounded alternate I2P endpoints with explicit operator trust scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailoverEndpointGroup {
+    /// Alternates; the NetworkRecord endpoint remains the primary.
+    pub alternates: Vec<I2pEndpoint>,
+    /// The Operator confirms the alternates represent this same logical IRC Network.
+    pub operator_attests_equivalence: bool,
+    /// The Operator confirms configured authentication is valid for each alternate.
+    pub credentials_authorized: bool,
+}
+
+/// Maximum configured endpoints, including the primary.
+pub const MAX_NETWORK_ENDPOINTS: usize = 8;
 
 /// Longest accepted `display_name`. A name is a single protocol token, so it is
 /// bounded like one.
@@ -419,11 +437,48 @@ pub fn valid_display_name(name: &str) -> bool {
 }
 
 impl NetworkRecord {
+    /// Number of configured endpoints, including the primary.
+    pub fn endpoint_count(&self) -> usize {
+        1 + self
+            .failover_group
+            .as_ref()
+            .map_or(0, |group| group.alternates.len())
+    }
+
+    /// Returns one endpoint by stable priority order: primary first, then alternates.
+    pub fn endpoint_at(&self, index: usize) -> Option<&I2pEndpoint> {
+        if index == 0 {
+            Some(&self.endpoint)
+        } else {
+            self.failover_group
+                .as_ref()
+                .and_then(|group| group.alternates.get(index - 1))
+        }
+    }
+
     /// Applies the same domain constraints as fresh configuration. Corrupt durable
     /// state is rejected rather than repaired into a plausible-looking default.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !valid_display_name(&self.display_name) {
             return Err("display name");
+        }
+        if let Some(group) = &self.failover_group {
+            if group.alternates.is_empty()
+                || group.alternates.len() >= MAX_NETWORK_ENDPOINTS
+                || !group.operator_attests_equivalence
+                || !group.credentials_authorized
+            {
+                return Err("failover trust declaration");
+            }
+            let mut endpoints = std::collections::BTreeSet::new();
+            endpoints.insert(self.endpoint.as_str().to_owned());
+            if group.alternates.iter().any(|endpoint| {
+                endpoint.as_str().len() > 240
+                    || endpoint.kind() == i2pr_irc_core::I2pEndpointKind::Destination
+                    || !endpoints.insert(endpoint.as_str().to_owned())
+            }) {
+                return Err("failover endpoint form or duplicate");
+            }
         }
         if self.nick.is_empty() || self.nick.len() > 64 {
             return Err("nick length");
@@ -770,6 +825,7 @@ mod tests {
             network: NetworkId(1),
             display_name: fallback_display_name(NetworkId(1)),
             endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
+            failover_group: None,
             nick: "bot".into(),
             username: "user".into(),
             realname: "bouncer".into(),
@@ -786,6 +842,42 @@ mod tests {
         let mut with_secret = record();
         with_secret.sasl = Some(("bot".into(), StoredSecret::new("hunter2".into())));
         assert_eq!(with_secret.validate(), Ok(()));
+    }
+
+    #[test]
+    fn failover_groups_require_attestation_bounded_name_endpoints_and_unique_targets() {
+        let alternate = I2pEndpoint::parse("irc-alt.i2p").expect("name endpoint parses");
+        let mut configured = record();
+        configured.failover_group = Some(FailoverEndpointGroup {
+            alternates: vec![alternate.clone()],
+            operator_attests_equivalence: true,
+            credentials_authorized: true,
+        });
+        assert_eq!(configured.validate(), Ok(()));
+
+        configured
+            .failover_group
+            .as_mut()
+            .unwrap()
+            .credentials_authorized = false;
+        assert_eq!(configured.validate(), Err("failover trust declaration"));
+        configured
+            .failover_group
+            .as_mut()
+            .unwrap()
+            .credentials_authorized = true;
+        configured.failover_group.as_mut().unwrap().alternates = vec![configured.endpoint.clone()];
+        assert_eq!(
+            configured.validate(),
+            Err("failover endpoint form or duplicate")
+        );
+        configured.failover_group.as_mut().unwrap().alternates = vec![alternate.clone(), alternate];
+        assert_eq!(
+            configured.validate(),
+            Err("failover endpoint form or duplicate")
+        );
+        configured.failover_group.as_mut().unwrap().alternates = vec![];
+        assert_eq!(configured.validate(), Err("failover trust declaration"));
     }
 
     #[test]

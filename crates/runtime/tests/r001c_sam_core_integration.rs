@@ -56,6 +56,7 @@ fn record(network: u64) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        failover_group: None,
         nick: "bot".into(),
         username: "user".into(),
         realname: "bouncer".into(),

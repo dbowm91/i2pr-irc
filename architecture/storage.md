@@ -27,11 +27,11 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 14
+## Schema version 15
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
-`SCHEMA_VERSION` is 14. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every supported older database migrates forward in place rather than being refused.
+`SCHEMA_VERSION` is 15. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every supported older database migrates forward in place rather than being refused.
 
 | Table | Purpose |
 |---|---|
@@ -46,6 +46,8 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 | `registration_actions` | ordered phased registration-action list, one row per Network position |
 | `history_search` | FTS5 **side index** over searchable history; `history_events` remains the source of truth |
 | `connection_gaps` | latest bounded sequence of observation-gap dispositions and monotonic durations |
+| `network_failover` | explicit operator trust and credential-scope attestations for one endpoint group |
+| `network_failover_endpoints` | up to seven ordered typed I2P alternates per Network |
 
 `history_search` is a virtual table, so its `…_data`, `…_idx`, `…_docsize`, `…_content`
 and `…_config` shadow tables are excluded from the promised set: they are SQLite's own
@@ -277,6 +279,17 @@ sequence. Rows contain only an optional monotonic elapsed duration and one of `o
 `reconnected`, or `interrupted`. The Store keeps no wall-clock claim, endpoint, or message
 payload. A later gap converts any prior open row to `interrupted`, whose duration remains
 unknown. Network deletion cascades the records with the rest of that Network's data.
+
+### Version 15 endpoint failover
+
+Version 15 adds an optional failover declaration and ordered alternate endpoint table.
+Both stored trust flags are constrained to `1`; an absent declaration means the old
+single-endpoint behavior. Rust validation caps the group at eight total endpoints,
+rejects duplicates and requires both operator attestations. Alternates use `.i2p` name
+or base32 forms so the versioned configuration snapshot can carry each on one bounded
+IRC line; raw destinations remain supported for a primary endpoint but are not accepted
+as alternates. Every previous schema migrates with no group, so an upgrade never starts
+using a second endpoint without explicit configuration.
 
 ## Desired versus observed state
 

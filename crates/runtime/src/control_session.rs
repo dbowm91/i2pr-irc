@@ -253,6 +253,52 @@ impl ControlSurface {
                     self.finish(self.control.delete(network).await, &verb, "Deleted network")
                 }
             }
+            ServCommand::FailoverSet { network, endpoint } => {
+                let Some(mut record) = self.record(network, &verb).await else {
+                    return;
+                };
+                record.failover_group = Some(i2pr_irc_store::FailoverEndpointGroup {
+                    alternates: vec![endpoint],
+                    operator_attests_equivalence: true,
+                    credentials_authorized: true,
+                });
+                self.finish_unit(
+                    self.control.change(record).await,
+                    &verb,
+                    "Set attested failover group",
+                );
+            }
+            ServCommand::FailoverAdd { network, endpoint } => {
+                let Some(mut record) = self.record(network, &verb).await else {
+                    return;
+                };
+                let Some(group) = record.failover_group.as_mut() else {
+                    return self.fail(&verb, &BouncerError::Usage);
+                };
+                if group.alternates.len() >= i2pr_irc_store::MAX_NETWORK_ENDPOINTS - 1 {
+                    return self.fail(&verb, &BouncerError::TooManyParameters);
+                }
+                if group.alternates.contains(&endpoint) || record.endpoint == endpoint {
+                    return self.fail(&verb, &BouncerError::ValueOutOfRange);
+                }
+                group.alternates.push(endpoint);
+                self.finish_unit(
+                    self.control.change(record).await,
+                    &verb,
+                    "Added failover alternate",
+                );
+            }
+            ServCommand::FailoverClear { network } => {
+                let Some(mut record) = self.record(network, &verb).await else {
+                    return;
+                };
+                record.failover_group = None;
+                self.finish_unit(
+                    self.control.change(record).await,
+                    &verb,
+                    "Cleared failover group",
+                );
+            }
             ServCommand::ChannelStatus { network, channel } => {
                 let Some(record) = self.record(network, &verb).await else {
                     return;
@@ -799,6 +845,7 @@ fn new_record(fields: bouncer_networks::NetworkFields) -> Result<NetworkRecord, 
             .name
             .unwrap_or_else(|| i2pr_irc_store::fallback_display_name(NetworkId(0))),
         endpoint,
+        failover_group: None,
         nick: fields.nickname.unwrap_or_else(|| "bouncer".to_owned()),
         username: fields.username.unwrap_or_else(|| "bouncer".to_owned()),
         realname: fields.realname.unwrap_or_else(|| "bouncer".to_owned()),

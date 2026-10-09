@@ -36,6 +36,7 @@ async fn journal_for(handle: &StoreHandle) -> HistoryJournal {
             network: NetworkId(1),
             display_name: fallback_display_name(NetworkId(1)),
             endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+            failover_group: None,
             nick: "bot".into(),
             username: "user".into(),
             realname: "bouncer".into(),

@@ -120,9 +120,11 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
                 )));
             }
         };
+        let network_id = NetworkId(from_sql_id(network)?);
         let record = NetworkRecord {
-            network: NetworkId(from_sql_id(network)?),
+            network: network_id,
             endpoint,
+            failover_group: load_failover_group(connection, network_id)?,
             nick,
             username,
             realname,
@@ -230,6 +232,70 @@ fn load_desired_channels(
     Ok(channels)
 }
 
+fn load_failover_group(
+    connection: &Connection,
+    network: NetworkId,
+) -> Result<Option<FailoverEndpointGroup>, StoreError> {
+    let network_id = to_sql_id(network.0)?;
+    let declaration: Option<(i64, i64)> = connection
+        .query_row(
+            "SELECT operator_equivalent, credentials_authorized FROM network_failover WHERE network_id=?1",
+            [network_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let Some((equivalent, credentials)) = declaration else {
+        return Ok(None);
+    };
+    if equivalent != 1 || credentials != 1 {
+        return Err(StoreError::new(StoreErrorKind::Corrupt(
+            "failover trust declaration",
+        )));
+    }
+    let mut statement = connection
+        .prepare("SELECT position, endpoint, endpoint_kind FROM network_failover_endpoints WHERE network_id=?1 ORDER BY position")
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let rows = statement
+        .query_map([network_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    let mut alternates = Vec::new();
+    for row in rows {
+        let (position, raw, kind) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
+        if position != (alternates.len() + 1) as i64
+            || alternates.len() >= MAX_NETWORK_ENDPOINTS - 1
+        {
+            return Err(StoreError::new(StoreErrorKind::Corrupt(
+                "failover endpoint sequence",
+            )));
+        }
+        let endpoint = I2pEndpoint::parse(&raw)
+            .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("failover endpoint")))?;
+        if kind_code(endpoint.kind()) != kind {
+            return Err(StoreError::new(StoreErrorKind::Corrupt(
+                "failover endpoint kind",
+            )));
+        }
+        alternates.push(endpoint);
+    }
+    if alternates.is_empty() {
+        return Err(StoreError::new(StoreErrorKind::Corrupt(
+            "empty failover group",
+        )));
+    }
+    Ok(Some(FailoverEndpointGroup {
+        alternates,
+        operator_attests_equivalence: true,
+        credentials_authorized: true,
+    }))
+}
+
 /// Creates or replaces a Network's durable configuration in one transaction.
 pub(crate) fn save_network(
     connection: &mut Connection,
@@ -287,6 +353,28 @@ pub(crate) fn save_network(
             ],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
+    transaction
+        .execute(
+            "DELETE FROM network_failover WHERE network_id=?1",
+            [network],
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    if let Some(group) = &record.failover_group {
+        transaction
+            .execute(
+                "INSERT INTO network_failover (network_id, operator_equivalent, credentials_authorized) VALUES (?1, 1, 1)",
+                [network],
+            )
+            .map_err(|error| sql(error, CommitState::RolledBack))?;
+        for (index, endpoint) in group.alternates.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO network_failover_endpoints (network_id, position, endpoint, endpoint_kind) VALUES (?1, ?2, ?3, ?4)",
+                    params![network, (index + 1) as i64, endpoint.as_str(), kind_code(endpoint.kind())],
+                )
+                .map_err(|error| sql(error, CommitState::RolledBack))?;
+        }
+    }
     // Secrets are replaced wholesale so removing a credential cannot leave a stale
     // password row behind that a later load would silently adopt.
     transaction

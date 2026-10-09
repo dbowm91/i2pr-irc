@@ -81,6 +81,7 @@ fn record_as(network: u64, channels: &[DesiredChannelRecord], nick: &str) -> Net
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        failover_group: None,
         nick: nick.into(),
         username: "user".into(),
         realname: "bouncer".into(),

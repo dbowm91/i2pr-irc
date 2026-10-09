@@ -912,6 +912,8 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 network: record.network,
                 display_name: record.display_name.clone(),
                 endpoint: record.endpoint.clone(),
+                failover_group: record.failover_group.clone(),
+                retain_existing_failover: false,
                 nick: record.nick.clone(),
                 username: record.username.clone(),
                 realname: record.realname.clone(),

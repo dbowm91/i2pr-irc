@@ -63,6 +63,7 @@ fn record(network: u64, nick: &str, sasl: Option<(&str, &str)>) -> NetworkRecord
         network: NetworkId(network),
         display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        failover_group: None,
         nick: nick.into(),
         username: "user".into(),
         realname: "bouncer".into(),
