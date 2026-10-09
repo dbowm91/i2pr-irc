@@ -36,7 +36,7 @@ Canonical direction:
 | Plan | Status | Class | Roadmap | Handoff |
 |---|---|---|---|---|
 | Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
-| IRC M011-D / Plan 058 — Integrated Privacy Policy Qualification and M011 Closure | ready | qualification + milestone closure | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
+| IRC M011-D / Plan 058 — Integrated Privacy Policy Qualification and M011 Closure | active | qualification + milestone closure | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
 
 Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
 
@@ -49,7 +49,7 @@ Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemo
 | M011-A | 055 — per-buffer privacy, bounded ephemeral/no-history | closed | plans/implementation/irc-enhancements/055-m011a-buffer-retention-modes-and-schema.md |
 | M011-B | 056 — activity-based detached policy | closed | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
 | M011-C | 057 — local watch/highlight notifications | closed | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
-| M011-D | 058 — integrated privacy closure | ready | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
+| M011-D | 058 — integrated privacy closure | active | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
 | M012-A | 059 — IRC command pacing and upstream outage gaps | proposed after M011 | plans/implementation/irc-enhancements/059-m012a-command-pacing-and-upstream-gap-ledger.md |
 | M012-B | 060 — optional upstream CHATHISTORY recovery | proposed; live server support research-gated | plans/implementation/irc-enhancements/060-m012b-conditional-upstream-chathistory-reconciliation.md |
 | M012-C | 061 — verified same-network I2P endpoint failover | proposed; equivalence research-gated | plans/implementation/irc-enhancements/061-m012c-verified-network-equivalent-i2p-failover.md |

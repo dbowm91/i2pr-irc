@@ -14,7 +14,7 @@ M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 act
   -> M011-A / 055 buffer privacy + migrations [closed]
   -> M011-B / 056 detached activity policy [closed]
   -> M011-C / 057 local watch and notification [closed]
-  -> M011-D / 058 integration/closure [ready]
+  -> M011-D / 058 integration/closure [active]
   -> M012-A / 059 IRC pacing and upstream gap records [proposed after 058]
   -> M012-B / 060 conditional upstream history reconciliation [proposed after 059; server-capability gated]
   -> M012-C / 061 verified same-network I2P endpoint failover [proposed after 060]
