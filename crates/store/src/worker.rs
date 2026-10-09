@@ -616,7 +616,6 @@ impl Store {
             apply_encryption_key(&connection, key)?;
         }
         schema::open_and_migrate(&connection, busy_timeout_ms)?;
-        ops::resume_pending_purges(&mut connection)?;
         let shared = Arc::new(Shared {
             health: Mutex::new(StoreHealth::Ready),
             closing: AtomicBool::new(false),
@@ -687,6 +686,8 @@ impl Drop for Store {
 /// bounded park is therefore what guarantees `Store::close` can always join this
 /// thread, at the cost of a small bounded shutdown latency.
 const WORKER_PARK: std::time::Duration = std::time::Duration::from_millis(25);
+/// A busy request queue still gives privacy purges occasional bounded progress.
+const PURGE_PROGRESS_EVERY: u8 = 16;
 
 /// The single owner of the connection. It never leaves this loop.
 fn run_worker(
@@ -698,6 +699,7 @@ fn run_worker(
     // Requests are taken with a blocking receive so the owned thread parks without a
     // reactor and no SQLite call ever runs on a Tokio worker.
     let stopping = false;
+    let mut requests_since_purge = 0u8;
     loop {
         let request = match receiver.try_recv() {
             Ok(request) => request,
@@ -707,7 +709,12 @@ fn run_worker(
                 }
                 match shutdown.recv_timeout(WORKER_PARK) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Privacy purges advance in bounded transactions while the
+                        // connection has no caller request to serve.
+                        let _ = ops::progress_pending_purges(connection);
+                        continue;
+                    }
                 }
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -732,6 +739,11 @@ fn run_worker(
         // A canceled caller, a typed storage error, and an overload rejection are
         // ordinary outcomes: none of them may look like a dead store.
         execute(connection, request);
+        requests_since_purge = requests_since_purge.saturating_add(1);
+        if requests_since_purge >= PURGE_PROGRESS_EVERY {
+            let _ = ops::progress_pending_purges(connection);
+            requests_since_purge = 0;
+        }
     }
     shared.set_health(StoreHealth::Stopped);
 }

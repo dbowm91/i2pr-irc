@@ -1858,7 +1858,7 @@ async fn saturate_upstream_queue(client: &mut DrainingClient, lines: u32) {
             // Paced deliberately. A client that outruns the owner's bounded
             // session-event queue is refused at *that* boundary, which would test a
             // different ceiling than the one under examination here.
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
     if !chunk.is_empty() {

@@ -248,6 +248,48 @@ where
     }
 }
 
+async fn wait_for_history(runtime: &Runtime, network: NetworkId, targets: &[(&str, usize)]) {
+    let mut buffers = Vec::with_capacity(targets.len());
+    for (target, _) in targets {
+        buffers.push(
+            runtime
+                .store
+                .1
+                .resolve_buffer(network, i2pr_irc_store::BufferKind::Channel, target)
+                .await
+                .expect("history buffer resolves")
+                .buffer,
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut ready = true;
+            for ((_, minimum), buffer) in targets.iter().zip(&buffers) {
+                let events = runtime
+                    .store
+                    .1
+                    .query_history(&i2pr_irc_store::HistoryQuery {
+                        buffer: *buffer,
+                        bound: i2pr_irc_store::HistoryQueryBound {
+                            after: None,
+                            before: None,
+                            limit: i2pr_irc_store::MAX_HISTORY_QUERY_EVENTS,
+                        },
+                    })
+                    .await
+                    .expect("history query succeeds");
+                ready &= events.len() >= *minimum;
+            }
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("upstream events reach durable history");
+}
+
 struct Client {
     end: ScriptedStream,
     _script: i2pr_irc_testkit::FaultController,
@@ -596,9 +638,8 @@ async fn a_search_never_crosses_a_network_or_reaches_another_client() {
             "2026-01-01T00:00:00.000Z",
         )
         .await;
-    // Let the first Network's ingestion drain before the second Network speaks, so the
-    // assertion below is about scoping rather than about timing.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_history(&runtime, NetworkId(1), &[("#room", 1)]).await;
+    wait_for_history(&runtime, NetworkId(2), &[("#room", 1)]).await;
 
     let mut first = register(&runtime, NetworkId(1), SessionId(1), "soju.im/search").await;
     let mut second = register(&runtime, NetworkId(2), SessionId(2), "soju.im/search").await;
@@ -657,7 +698,7 @@ async fn a_search_spans_several_buffers_of_one_network() {
             "2026-01-01T00:00:01.000Z",
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_history(&runtime, NetworkId(1), &[("#room", 1), ("#other", 1)]).await;
 
     let mut client = register(&runtime, NetworkId(1), SessionId(1), "soju.im/search").await;
     let both = client.mark();
@@ -712,7 +753,7 @@ async fn a_search_scoped_by_sender_and_time_answers_exactly_what_was_asked() {
             "2026-01-01T00:00:10.000Z",
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_history(&runtime, NetworkId(1), &[("#room", 3)]).await;
 
     let mut client = register(&runtime, NetworkId(1), SessionId(1), "soju.im/search").await;
     // Drain the live fan-out first. The upstream messages above are still reaching this
@@ -808,7 +849,7 @@ async fn a_search_never_becomes_an_expression_evaluator() {
             "2026-01-01T00:00:00.000Z",
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_history(&runtime, NetworkId(1), &[("#room", 1)]).await;
 
     let mut client = register(
         &runtime,
@@ -872,7 +913,37 @@ async fn retention_removes_what_a_search_can_find() {
             "2026-01-01T00:00:01.000Z",
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let buffer = runtime
+        .store
+        .1
+        .resolve_buffer(NetworkId(1), i2pr_irc_store::BufferKind::Channel, "#room")
+        .await
+        .expect("channel buffer resolves")
+        .buffer;
+    let retained = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let retained = runtime
+                .store
+                .1
+                .query_history(&i2pr_irc_store::HistoryQuery {
+                    buffer,
+                    bound: i2pr_irc_store::HistoryQueryBound {
+                        after: None,
+                        before: None,
+                        limit: 10,
+                    },
+                })
+                .await
+                .expect("history query");
+            if retained.len() == 2 {
+                break retained;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both upstream events reached history");
+    assert_eq!(retained.len(), 2, "both upstream events reached history");
 
     // The store is driven directly here: retention is an Operator action, not something
     // a client can cause over the wire.
@@ -946,7 +1017,7 @@ async fn a_restarted_runtime_answers_the_same_search_identically() {
             "2026-01-01T00:00:01.000Z",
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_history(&runtime, NetworkId(1), &[("#room", 2)]).await;
 
     let mut before = register(&runtime, NetworkId(1), SessionId(1), "soju.im/search").await;
     let mark = before.mark();

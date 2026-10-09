@@ -298,6 +298,47 @@ impl ControlSurface {
                     )
                 }
             }
+            ServCommand::HistoryStatus {
+                network,
+                kind,
+                target,
+            } => {
+                match self
+                    .control
+                    .buffer_retention(network, kind, target.clone(), None)
+                    .await
+                {
+                    Ok(policy) => {
+                        let name = match policy.policy {
+                            Some(i2pr_irc_store::HistoryPrivacyPolicy::Persistent) => "persistent",
+                            Some(i2pr_irc_store::HistoryPrivacyPolicy::Ephemeral) => "ephemeral",
+                            Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory) => "no-history",
+                            None => "inherit (persistent default)",
+                        };
+                        self.notice(&format!("history {target}: {name}"));
+                    }
+                    Err(error) => self.fail(&verb, &map_control(error)),
+                }
+            }
+            ServCommand::HistorySet {
+                network,
+                kind,
+                target,
+                policy,
+            } => {
+                let requested = i2pr_irc_store::BufferRetentionPolicy {
+                    policy,
+                    ..Default::default()
+                };
+                match self
+                    .control
+                    .buffer_retention(network, kind, target.clone(), Some(Some(requested)))
+                    .await
+                {
+                    Ok(_) => self.notice(&format!("history policy updated for {target}")),
+                    Err(error) => self.fail(&verb, &map_control(error)),
+                }
+            }
             ServCommand::PresenceStatus { network } => {
                 self.policy_status(network, "auto_away", &verb).await
             }

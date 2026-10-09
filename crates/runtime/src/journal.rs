@@ -25,13 +25,21 @@
 use crate::{RuntimeError, catalog::classify};
 use i2pr_irc_core::{Casemapping, NetworkId, WallClock, WallTime};
 use i2pr_irc_store::{
-    BufferId, BufferKind, EventDirection, HistoryEvent, HistoryEventId, HistoryQuery,
-    HistoryQueryBound, MAX_HISTORY_BATCH, MAX_HISTORY_QUERY_BYTES, MAX_HISTORY_QUERY_EVENTS,
-    NewHistoryEvent, RetentionReport, RetentionRequest, StoreHandle,
+    BufferId, BufferKind, BufferRetentionPolicy, EventDirection, HistoryEvent, HistoryEventId,
+    HistoryPrivacyPolicy, HistoryQuery, HistoryQueryBound, MAX_HISTORY_BATCH,
+    MAX_HISTORY_QUERY_BYTES, MAX_HISTORY_QUERY_EVENTS, NewHistoryEvent, RetentionReport,
+    RetentionRequest, StoreHandle,
 };
 use i2pr_irc_wire::IrcTimestamp;
 use i2pr_irc_wire::Message;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use zeroize::Zeroize;
+
+/// Process-local ephemeral history has both a global event and byte ceiling. The
+/// tighter per-buffer ceiling prevents one busy channel monopolizing the ring.
+const EPHEMERAL_MAX_EVENTS: usize = 512;
+const EPHEMERAL_MAX_BUFFER_EVENTS: usize = 128;
+const EPHEMERAL_MAX_BYTES: usize = 1024 * 1024;
 
 /// Bounded automatic backlog delivered to one legacy client, in events and bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,10 +127,121 @@ pub struct JournalHealth {
 pub enum IngestOutcome {
     /// The event was durably accepted and has canonical order.
     Recorded { event: HistoryEventId },
+    /// The event entered the process-local ephemeral ring.
+    Ephemeral,
     /// The line is not history-eligible and was intentionally not stored.
     Skipped,
     /// History degraded; delivery semantics are unaffected.
     StoreUnavailable,
+}
+
+#[derive(Default)]
+struct EphemeralHistory {
+    events: VecDeque<HistoryEvent>,
+    search: BTreeMap<HistoryEventId, i2pr_irc_store::SearchFields>,
+    bytes: usize,
+    next_event: u64,
+}
+
+impl EphemeralHistory {
+    fn push(
+        &mut self,
+        mut event: HistoryEvent,
+        search: Option<i2pr_irc_store::SearchFields>,
+    ) -> Option<HistoryEventId> {
+        let size = event.payload.len();
+        if size > EPHEMERAL_MAX_BYTES {
+            event.payload.zeroize();
+            return None;
+        }
+        while self.events.len() >= EPHEMERAL_MAX_EVENTS
+            || self.bytes.saturating_add(size) > EPHEMERAL_MAX_BYTES
+            || self
+                .events
+                .iter()
+                .filter(|old| old.buffer == event.buffer)
+                .count()
+                >= EPHEMERAL_MAX_BUFFER_EVENTS
+        {
+            let mut old = self.events.pop_front()?;
+            self.bytes = self.bytes.saturating_sub(old.payload.len());
+            old.payload.zeroize();
+            if let Some(mut fields) = self.search.remove(&old.event) {
+                fields.sender.zeroize();
+                fields.target.zeroize();
+                fields.body.zeroize();
+            }
+        }
+        self.next_event = self.next_event.saturating_add(1).max(1);
+        // Durable SQLite identities fit in signed 63-bit rowids. High-bit IDs
+        // therefore remain disjoint from durable events on a mixed Network.
+        event.event = HistoryEventId((1u64 << 63) | self.next_event);
+        let identity = event.event;
+        self.bytes += size;
+        self.events.push_back(event);
+        if let Some(search) = search {
+            self.search.insert(identity, search);
+        }
+        Some(identity)
+    }
+
+    fn after(
+        &self,
+        buffer: BufferId,
+        after: Option<HistoryEventId>,
+        limit: usize,
+    ) -> Vec<HistoryEvent> {
+        self.events
+            .iter()
+            .filter(|event| event.buffer == buffer && after.is_none_or(|id| event.event > id))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    fn remove_buffer(&mut self, buffer: BufferId) {
+        let mut kept = VecDeque::with_capacity(self.events.len());
+        while let Some(mut event) = self.events.pop_front() {
+            if event.buffer == buffer {
+                self.bytes = self.bytes.saturating_sub(event.payload.len());
+                event.payload.zeroize();
+                if let Some(mut fields) = self.search.remove(&event.event) {
+                    fields.sender.zeroize();
+                    fields.target.zeroize();
+                    fields.body.zeroize();
+                }
+            } else {
+                kept.push_back(event);
+            }
+        }
+        self.events = kept;
+    }
+}
+
+impl Drop for EphemeralHistory {
+    fn drop(&mut self) {
+        for event in &mut self.events {
+            event.payload.zeroize();
+        }
+        for fields in self.search.values_mut() {
+            fields.sender.zeroize();
+            fields.target.zeroize();
+            fields.body.zeroize();
+        }
+    }
+}
+
+fn limit_ephemeral_bytes(events: Vec<HistoryEvent>, budget: usize) -> Vec<HistoryEvent> {
+    let mut remaining = budget;
+    let mut out = Vec::new();
+    for event in events {
+        if event.payload.len() > remaining {
+            break;
+        }
+        remaining -= event.payload.len();
+        out.push(event);
+    }
+    out
 }
 
 /// Per-generation durable history journal.
@@ -133,6 +252,11 @@ pub struct HistoryJournal {
     casemapping: Casemapping,
     /// Resolved wire targets, so a target is resolved durably once and then cached.
     resolved: BTreeMap<(BufferKind, String), BufferId>,
+    targets: BTreeMap<BufferId, String>,
+    policies: BTreeMap<BufferId, BufferRetentionPolicy>,
+    ephemeral: EphemeralHistory,
+    ephemeral_cursors: BTreeMap<(i2pr_irc_core::ClientId, BufferId), HistoryEventId>,
+    ephemeral_markers: BTreeMap<BufferId, HistoryEventId>,
     backlog: BacklogCap,
     retention: RetentionPolicy,
     health: JournalHealth,
@@ -156,6 +280,11 @@ impl HistoryJournal {
             wall,
             casemapping,
             resolved: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            policies: BTreeMap::new(),
+            ephemeral: EphemeralHistory::default(),
+            ephemeral_cursors: BTreeMap::new(),
+            ephemeral_markers: BTreeMap::new(),
             backlog: BacklogCap::DEFAULT,
             retention: RetentionPolicy::default(),
             health: JournalHealth::default(),
@@ -257,8 +386,69 @@ impl HistoryJournal {
             return Err(RuntimeError::QueueOverloaded);
         }
         self.resolved.insert((kind, folded), record.buffer);
+        self.targets.insert(record.buffer, record.target.clone());
+        let policy = self
+            .store
+            .get_buffer_retention(record.buffer)
+            .await
+            .map_err(|error| classify(error.kind()))?;
+        self.policies.insert(record.buffer, policy);
         self.health.buffer_resolutions = self.health.buffer_resolutions.saturating_add(1);
         Ok(record.buffer)
+    }
+
+    /// The cached policy for an already-resolved buffer. Resolution populates the
+    /// cache before that buffer can enter the owner's ingestion target map.
+    pub fn retention_policy(&self, buffer: BufferId) -> BufferRetentionPolicy {
+        self.policies.get(&buffer).copied().unwrap_or_default()
+    }
+
+    async fn current_retention_policy(
+        &self,
+        buffer: BufferId,
+    ) -> Result<BufferRetentionPolicy, RuntimeError> {
+        self.store
+            .get_buffer_retention(buffer)
+            .await
+            .map_err(|error| classify(error.kind()))
+    }
+
+    /// Commits a buffer policy and updates the generation-local cache only after the
+    /// store confirms it. Leaving ephemeral mode immediately zeroes that buffer's ring.
+    pub async fn set_retention_policy(
+        &mut self,
+        buffer: BufferId,
+        policy: BufferRetentionPolicy,
+    ) -> Result<(), RuntimeError> {
+        self.store
+            .set_buffer_retention(buffer, policy)
+            .await
+            .map_err(|error| classify(error.kind()))?;
+        self.policies.insert(buffer, policy);
+        if policy.policy != Some(HistoryPrivacyPolicy::Ephemeral) {
+            self.ephemeral.remove_buffer(buffer);
+            self.ephemeral_cursors
+                .retain(|(_, existing), _| *existing != buffer);
+            self.ephemeral_markers.remove(&buffer);
+        }
+        Ok(())
+    }
+
+    /// Applies a policy already committed by the serialized controller. Keeping
+    /// owner-observed ingestion off the Store request queue prevents high traffic
+    /// from turning one policy read per message into backpressure on IRC routing.
+    pub fn apply_committed_retention_policy(
+        &mut self,
+        buffer: BufferId,
+        policy: BufferRetentionPolicy,
+    ) {
+        self.policies.insert(buffer, policy);
+        if policy.policy != Some(HistoryPrivacyPolicy::Ephemeral) {
+            self.ephemeral.remove_buffer(buffer);
+            self.ephemeral_cursors
+                .retain(|(_, existing), _| *existing != buffer);
+            self.ephemeral_markers.remove(&buffer);
+        }
     }
 
     /// Ingests one validated upstream line.
@@ -270,6 +460,17 @@ impl HistoryJournal {
         buffer: BufferId,
         message: &Message,
     ) -> Result<IngestOutcome, RuntimeError> {
+        let policy = self.retention_policy(buffer);
+        if policy.policy != Some(HistoryPrivacyPolicy::Ephemeral) {
+            self.ephemeral.remove_buffer(buffer);
+            self.ephemeral_cursors
+                .retain(|(_, existing), _| *existing != buffer);
+            self.ephemeral_markers.remove(&buffer);
+        }
+        if policy.policy == Some(HistoryPrivacyPolicy::NoHistory) {
+            // No-history fails closed before payload or search-field derivation.
+            return Ok(IngestOutcome::Skipped);
+        }
         let command = String::from_utf8_lossy(&message.command).to_ascii_uppercase();
         if !matches!(command.as_str(), "PRIVMSG" | "NOTICE") {
             return Ok(IngestOutcome::Skipped);
@@ -279,24 +480,52 @@ impl HistoryJournal {
         if is_numeric(&message.command) {
             return Ok(IngestOutcome::Skipped);
         }
+        let received_at = self.wall.now();
+        let server_time = message.server_time();
+        let msgid = message.msgid().map(str::to_owned);
+        let direction = self.direction_of(message);
+        let event_class = command.clone();
+        let payload = bounded_payload(message)?;
+        if policy.policy == Some(HistoryPrivacyPolicy::Ephemeral) {
+            let search = (!is_otr_message(message)).then(|| search_fields(message));
+            let stored = self.ephemeral.push(
+                HistoryEvent {
+                    event: HistoryEventId(0),
+                    network: self.network,
+                    buffer,
+                    received_at,
+                    server_time,
+                    msgid,
+                    direction,
+                    event_class,
+                    payload,
+                },
+                search,
+            );
+            return Ok(if stored.is_some() {
+                IngestOutcome::Ephemeral
+            } else {
+                IngestOutcome::Skipped
+            });
+        }
         let event = NewHistoryEvent {
             network: self.network,
             buffer,
-            received_at: self.wall.now(),
+            received_at,
             // Preserved exactly as the upstream stated it, including millisecond
             // precision and a leap second. `None` means the upstream sent none and
             // it is never invented from local time.
-            server_time: message.server_time(),
-            msgid: message.msgid().map(str::to_owned),
-            direction: self.direction_of(message),
-            event_class: command,
-            payload: bounded_payload(message)?,
+            server_time,
+            msgid,
+            direction,
+            event_class,
+            payload,
             // Derived here, from the message this function already decoded, rather than
             // left to the store to re-parse a stored line. The store could do it, and
             // would have to carry protocol knowledge to; deriving it here means the
             // search representation is produced exactly once, at the moment the message
             // was understood.
-            search: Some(search_fields(message)),
+            search: (!is_otr_message(message)).then(|| search_fields(message)),
         };
         self.append(vec![event]).await
     }
@@ -378,6 +607,15 @@ impl HistoryJournal {
         cap: BacklogCap,
     ) -> Result<Vec<HistoryEvent>, RuntimeError> {
         cap.validate()?;
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            let after = self.ephemeral_cursors.get(&(client, buffer)).copied();
+            return Ok(limit_ephemeral_bytes(
+                self.ephemeral.after(buffer, after, cap.events),
+                cap.bytes,
+            ));
+        }
         let after = self
             .store
             .get_cursor(client, buffer)
@@ -435,6 +673,22 @@ impl HistoryJournal {
             // An inverted range would return a misleading "complete" answer.
             return Err(RuntimeError::InvalidConfig);
         }
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            return Ok(self
+                .ephemeral
+                .events
+                .iter()
+                .filter(|event| {
+                    event.buffer == buffer
+                        && after.is_none_or(|id| event.event > id)
+                        && before.is_none_or(|id| event.event < id)
+                })
+                .take(limit)
+                .cloned()
+                .collect());
+        }
         self.store
             .query_history(&HistoryQuery {
                 buffer,
@@ -455,6 +709,16 @@ impl HistoryJournal {
         buffer: BufferId,
         to: HistoryEventId,
     ) -> Result<HistoryEventId, RuntimeError> {
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            let cursor = self
+                .ephemeral_cursors
+                .entry((client, buffer))
+                .and_modify(|cursor| *cursor = (*cursor).max(to))
+                .or_insert(to);
+            return Ok(*cursor);
+        }
         match self.store.advance_cursor(client, buffer, to).await {
             Ok(event) => {
                 self.health.cursors_advanced = self.health.cursors_advanced.saturating_add(1);
@@ -473,6 +737,11 @@ impl HistoryJournal {
         client: i2pr_irc_core::ClientId,
         buffer: BufferId,
     ) -> Result<Option<HistoryEventId>, RuntimeError> {
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            return Ok(self.ephemeral_cursors.get(&(client, buffer)).copied());
+        }
         self.store
             .get_cursor(client, buffer)
             .await
@@ -483,6 +752,11 @@ impl HistoryJournal {
         &self,
         buffer: BufferId,
     ) -> Result<Option<HistoryEventId>, RuntimeError> {
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            return Ok(self.ephemeral_markers.get(&buffer).copied());
+        }
         self.store
             .get_read_marker(buffer)
             .await
@@ -499,10 +773,41 @@ impl HistoryJournal {
         upper: IrcTimestamp,
         limit: usize,
     ) -> Result<Vec<i2pr_irc_store::RecentTarget>, RuntimeError> {
-        self.store
+        let mut result = self
+            .store
             .recent_targets(self.network, lower, upper, limit)
             .await
-            .map_err(|error| classify(error.kind()))
+            .map_err(|error| classify(error.kind()))?;
+        let mut by_buffer = BTreeMap::<BufferId, &HistoryEvent>::new();
+        for event in &self.ephemeral.events {
+            let time = event
+                .server_time
+                .unwrap_or_else(|| crate::chathistory::local_timestamp(event.received_at));
+            if time < lower || time > upper {
+                continue;
+            }
+            let replace = by_buffer
+                .get(&event.buffer)
+                .is_none_or(|current| event.event > current.event);
+            if replace {
+                by_buffer.insert(event.buffer, event);
+            }
+        }
+        for (buffer, event) in by_buffer {
+            if let Some(target) = self.targets.get(&buffer) {
+                result.push(i2pr_irc_store::RecentTarget {
+                    buffer,
+                    target: target.clone(),
+                    newest: event
+                        .server_time
+                        .unwrap_or_else(|| crate::chathistory::local_timestamp(event.received_at)),
+                    newest_event: event.event,
+                });
+            }
+        }
+        result.sort_by_key(|target| std::cmp::Reverse(target.newest));
+        result.truncate(limit);
+        Ok(result)
     }
 
     /// Resolves an upstream `msgid=` reference within this Network.
@@ -515,10 +820,32 @@ impl HistoryJournal {
         network: NetworkId,
         msgid: &str,
     ) -> Result<i2pr_irc_store::MsgidLookup, RuntimeError> {
-        self.store
+        let mut matches: Vec<_> = self
+            .ephemeral
+            .events
+            .iter()
+            .filter(|event| event.network == network && event.msgid.as_deref() == Some(msgid))
+            .map(|event| event.event)
+            .take(9)
+            .collect();
+        let durable = self
+            .store
             .resolve_msgid(network, msgid)
             .await
-            .map_err(|error| classify(error.kind()))
+            .map_err(|error| classify(error.kind()))?;
+        match durable {
+            i2pr_irc_store::MsgidLookup::Unique(event) => matches.push(event),
+            i2pr_irc_store::MsgidLookup::Ambiguous(events) => matches.extend(events),
+            i2pr_irc_store::MsgidLookup::Missing => {}
+        }
+        matches.sort_unstable();
+        matches.dedup();
+        matches.truncate(9);
+        Ok(match matches.as_slice() {
+            [] => i2pr_irc_store::MsgidLookup::Missing,
+            [event] => i2pr_irc_store::MsgidLookup::Unique(*event),
+            _ => i2pr_irc_store::MsgidLookup::Ambiguous(matches),
+        })
     }
 
     /// Reads one bounded window centred on an anchor event, for `AROUND`.
@@ -529,6 +856,34 @@ impl HistoryJournal {
         &self,
         request: &i2pr_irc_store::HistoryAround,
     ) -> Result<Vec<HistoryEvent>, RuntimeError> {
+        request
+            .validate()
+            .map_err(|_| RuntimeError::InvalidConfig)?;
+        if self.current_retention_policy(request.buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            let matches: Vec<_> = self
+                .ephemeral
+                .events
+                .iter()
+                .filter(|event| event.buffer == request.buffer)
+                .collect();
+            let Some(anchor) = matches
+                .iter()
+                .position(|event| event.event == request.anchor)
+            else {
+                return Ok(Vec::new());
+            };
+            let start = anchor.saturating_sub(request.before);
+            let end = anchor
+                .saturating_add(request.after)
+                .saturating_add(1)
+                .min(matches.len());
+            return Ok(matches[start..end]
+                .iter()
+                .map(|event| (*event).clone())
+                .collect());
+        }
         self.store
             .history_around(request)
             .await
@@ -545,6 +900,34 @@ impl HistoryJournal {
         buffer: BufferId,
         reference: IrcTimestamp,
     ) -> Result<i2pr_irc_store::NearestEvent, RuntimeError> {
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            let mut before = None;
+            let mut after = None;
+            let mut exact = false;
+            for event in self
+                .ephemeral
+                .events
+                .iter()
+                .filter(|event| event.buffer == buffer)
+            {
+                let time = event
+                    .server_time
+                    .unwrap_or_else(|| crate::chathistory::local_timestamp(event.received_at));
+                if time <= reference {
+                    before = Some(event.event);
+                    exact |= time == reference;
+                } else if after.is_none() {
+                    after = Some(event.event);
+                }
+            }
+            return Ok(i2pr_irc_store::NearestEvent {
+                before,
+                after,
+                exact,
+            });
+        }
         self.store
             .nearest_event(buffer, reference)
             .await
@@ -556,10 +939,59 @@ impl HistoryJournal {
         &self,
         query: &i2pr_irc_store::SearchQuery,
     ) -> Result<Vec<i2pr_irc_store::SearchHit>, RuntimeError> {
-        self.store
+        query.validate().map_err(|_| RuntimeError::InvalidConfig)?;
+        if query.network != self.network {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        let mut hits = self
+            .store
             .search(query)
             .await
-            .map_err(|error| classify(error.kind()))
+            .map_err(|error| classify(error.kind()))?;
+        for event in &self.ephemeral.events {
+            if event.network != query.network
+                || (!query.buffers.is_empty() && !query.buffers.contains(&event.buffer))
+            {
+                continue;
+            }
+            let Some(fields) = self.ephemeral.search.get(&event.event) else {
+                continue;
+            };
+            if query
+                .sender
+                .as_ref()
+                .is_some_and(|sender| !fields.sender.eq_ignore_ascii_case(sender))
+            {
+                continue;
+            }
+            let timestamp = event
+                .server_time
+                .unwrap_or_else(|| crate::chathistory::local_timestamp(event.received_at));
+            if query.after.is_some_and(|after| timestamp < after)
+                || query.before.is_some_and(|before| timestamp >= before)
+            {
+                continue;
+            }
+            let haystack =
+                format!("{} {} {}", fields.sender, fields.target, fields.body).to_ascii_lowercase();
+            if !query
+                .terms
+                .iter()
+                .all(|term| haystack.contains(&term.as_str().to_ascii_lowercase()))
+            {
+                continue;
+            }
+            hits.push(i2pr_irc_store::SearchHit {
+                event: event.event,
+                buffer: event.buffer,
+                sender: fields.sender.clone(),
+                target: fields.target.clone(),
+                body: fields.body.clone(),
+            });
+        }
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.event));
+        hits.truncate(query.limit);
+        Ok(hits)
     }
 
     /// The Network this journal belongs to.
@@ -599,6 +1031,16 @@ impl HistoryJournal {
         buffer: BufferId,
         to: HistoryEventId,
     ) -> Result<HistoryEventId, RuntimeError> {
+        if self.current_retention_policy(buffer).await?.policy
+            == Some(HistoryPrivacyPolicy::Ephemeral)
+        {
+            let marker = self
+                .ephemeral_markers
+                .entry(buffer)
+                .and_modify(|marker| *marker = (*marker).max(to))
+                .or_insert(to);
+            return Ok(*marker);
+        }
         self.store
             .advance_read_marker(buffer, to)
             .await
@@ -671,6 +1113,14 @@ fn search_fields(message: &Message) -> i2pr_irc_store::SearchFields {
             .map(|param| String::from_utf8_lossy(param).into_owned())
             .unwrap_or_default(),
     }
+}
+
+/// OTR payloads remain opaque bytes and are never interpreted as searchable text.
+fn is_otr_message(message: &Message) -> bool {
+    message
+        .params
+        .iter()
+        .any(|param| param.starts_with(b"?OTR") || param.starts_with(b"\x01?OTR"))
 }
 
 /// Builds the bounded canonical payload for one event.

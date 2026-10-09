@@ -752,12 +752,10 @@ async fn encrypted_store_otr_transcript_fanout_history_and_restart_stay_opaque()
         })
         .await
         .expect("opaque transcript search completes");
-    assert!(!opaque_search.is_empty());
-    assert!(opaque_search.iter().all(|hit| {
-        !hit.sender.contains(ENDPOINT_PLAINTEXT)
-            && !hit.target.contains(ENDPOINT_PLAINTEXT)
-            && !hit.body.contains(ENDPOINT_PLAINTEXT)
-    }));
+    assert!(
+        opaque_search.is_empty(),
+        "OTR ciphertext is retained as an opaque frame but never indexed"
+    );
     for (event, frame) in history
         .iter()
         .zip(inbound.into_iter().chain([after_detach]))

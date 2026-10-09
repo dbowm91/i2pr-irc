@@ -1,4 +1,4 @@
-//! Schema versions 1 through 9 and their transactional migration harness.
+//! Schema versions 1 through 11 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -19,8 +19,10 @@ use rusqlite::Connection;
 /// indexes history reference lookup needs; see [`HISTORY_SEARCH_V6`],
 /// [`HISTORY_REFERENCE_INDEXES_V6`], and [`migrate_5_to_6`]. Version 7 adds the bounded
 /// registration-action table; version 8 adds action phases and migrates prior rows to
-/// `post-join`.
-pub const SCHEMA_VERSION: i64 = 9;
+/// `post-join`; version 9 adds per-buffer history privacy and retention; version 10 adds
+/// a fail-closed marker while stricter persistent ceilings prune existing history;
+/// version 11 records whether each event has a derived FTS row.
+pub const SCHEMA_VERSION: i64 = 11;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -426,6 +428,22 @@ pub(crate) fn schema_v9() -> String {
     format!("{}{}", schema_v8(), BUFFER_PRIVACY_V9)
 }
 
+pub(crate) fn schema_v10() -> String {
+    format!("{}{}", schema_v9(), BUFFER_RETENTION_V10)
+}
+
+pub(crate) fn schema_v11() -> String {
+    format!("{}{}", schema_v10(), SEARCH_INDEXED_V11)
+}
+
+const BUFFER_RETENTION_V10: &str = r#"
+ALTER TABLE buffer_privacy ADD COLUMN retention_pending INTEGER NOT NULL DEFAULT 0 CHECK (retention_pending IN (0,1));
+"#;
+
+const SEARCH_INDEXED_V11: &str = r#"
+ALTER TABLE history_events ADD COLUMN search_indexed INTEGER NOT NULL DEFAULT 1 CHECK (search_indexed IN (0,1));
+"#;
+
 /// Fills in the derived state migration 6 added, for a schema 6 fixture.
 ///
 /// A genuine v6 database has its `effective_time` populated and its FTS side index built,
@@ -614,7 +632,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v9())
+                .execute_batch(&schema_v11())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -730,12 +748,19 @@ fn verify_search_index(connection: &Connection) -> Result<(), StoreError> {
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     let searchable: i64 = connection
         .query_row(
-            "SELECT count(*) FROM history_events WHERE event_class IN ('PRIVMSG','NOTICE')",
+            "SELECT count(*) FROM history_events WHERE event_class IN ('PRIVMSG','NOTICE') AND search_indexed=1",
             [],
             |row| row.get(0),
         )
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
-    if indexed != searchable {
+    let invalid: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM history_search s LEFT JOIN history_events h ON h.event_id=s.rowid WHERE h.event_id IS NULL OR h.search_indexed=0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    if indexed != searchable || invalid != 0 {
         return Err(StoreError::new(StoreErrorKind::Corrupt(
             "search index disagrees with retained history",
         )));
@@ -757,6 +782,7 @@ const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     // sends no `server-time` resolves against an empty index.
     ("history_events", "effective_time"),
     ("registration_actions", "phase"),
+    ("history_events", "search_indexed"),
 ];
 
 /// Confirms every promised column is present on its table.
@@ -797,10 +823,28 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             6 => migrate_6_to_7(transaction)?,
             7 => migrate_7_to_8(transaction)?,
             8 => migrate_8_to_9(transaction)?,
+            9 => migrate_9_to_10(transaction)?,
+            10 => migrate_10_to_11(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
     }
+    Ok(())
+}
+
+fn migrate_9_to_10(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(BUFFER_RETENTION_V10)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_10_to_11(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(SEARCH_INDEXED_V11)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     Ok(())
 }
 

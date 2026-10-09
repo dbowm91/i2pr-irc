@@ -12,8 +12,8 @@ use i2pr_irc_runtime::{
     session::SessionCapabilities,
 };
 use i2pr_irc_store::{
-    BufferKind, EventDirection, HistoryEvent, NetworkRecord, Store, StoreHandle, StorePath,
-    fallback_display_name,
+    BufferKind, BufferRetentionPolicy, EventDirection, HistoryEvent, HistoryPrivacyPolicy,
+    NetworkRecord, SearchQuery, SearchTerm, Store, StoreHandle, StorePath, fallback_display_name,
 };
 use i2pr_irc_wire::Message;
 
@@ -144,6 +144,190 @@ async fn local_outgoing_messages_are_omitted_until_an_upstream_echo_exists() {
         0,
         "no local write may appear as history"
     );
+}
+
+#[tokio::test]
+async fn ephemeral_history_is_bounded_memory_only_and_lost_on_journal_restart() {
+    let (_store, handle) = store();
+    let mut journal = journal_for(&handle, VirtualWallClock::default(), &[]).await;
+    let buffer = journal
+        .resolve_buffer(BufferKind::Channel, "#ephemeral")
+        .await
+        .expect("buffer resolves");
+    journal
+        .set_retention_policy(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::Ephemeral),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ephemeral policy commits");
+    let outcome = journal
+        .ingest(
+            buffer,
+            &message(":a!b@c PRIVMSG #ephemeral :memory-only\r\n"),
+        )
+        .await
+        .expect("ephemeral ingest succeeds");
+    assert_eq!(outcome, IngestOutcome::Ephemeral);
+    assert_eq!(
+        handle
+            .query_history(&i2pr_irc_store::HistoryQuery {
+                buffer,
+                bound: i2pr_irc_store::HistoryQueryBound {
+                    after: None,
+                    before: None,
+                    limit: 10,
+                },
+            })
+            .await
+            .expect("durable query succeeds")
+            .len(),
+        0,
+        "ephemeral content never reaches SQLite"
+    );
+    assert_eq!(
+        journal
+            .backlog(ClientId(1), buffer, BacklogCap::DEFAULT)
+            .await
+            .expect("memory backlog reads")[0]
+            .payload,
+        b":a!b@c PRIVMSG #ephemeral :memory-only"
+    );
+    let memory_query = SearchQuery {
+        network: NetworkId(1),
+        buffers: vec![buffer],
+        sender: None,
+        after: None,
+        before: None,
+        terms: vec![SearchTerm::parse("memory").expect("term parses")],
+        limit: 10,
+    };
+    assert_eq!(
+        journal
+            .store_search(&memory_query)
+            .await
+            .expect("ephemeral search is local")
+            .len(),
+        1
+    );
+    journal
+        .ingest(
+            buffer,
+            &message(":a!b@c PRIVMSG #ephemeral :?OTR:secretfragment\r\n"),
+        )
+        .await
+        .expect("opaque OTR frame remains retainable");
+    let otr_query = SearchQuery {
+        terms: vec![SearchTerm::parse("secretfragment").expect("term parses")],
+        ..memory_query
+    };
+    assert!(
+        journal
+            .store_search(&otr_query)
+            .await
+            .expect("opaque OTR is not searchable")
+            .is_empty()
+    );
+    let range = journal
+        .backlog_range(buffer, None, None, 10)
+        .await
+        .expect("ephemeral CHATHISTORY range reads");
+    assert_eq!(range.len(), 2);
+    let around = journal
+        .history_around(&i2pr_irc_store::HistoryAround {
+            buffer,
+            anchor: range[0].event,
+            before: 0,
+            after: 1,
+        })
+        .await
+        .expect("ephemeral around query reads");
+    assert_eq!(around.len(), 2);
+    journal
+        .advance_cursor(ClientId(1), buffer, range[0].event)
+        .await
+        .expect("ephemeral cursor advances in memory");
+    assert_eq!(
+        journal
+            .cursor(ClientId(1), buffer)
+            .await
+            .expect("ephemeral cursor reads"),
+        Some(range[0].event)
+    );
+    journal
+        .set_read_marker(buffer, range[1].event)
+        .await
+        .expect("ephemeral marker advances in memory");
+    assert_eq!(
+        journal
+            .read_marker(buffer)
+            .await
+            .expect("ephemeral marker reads"),
+        Some(range[1].event)
+    );
+    let mut restarted = journal_for(&handle, VirtualWallClock::default(), &[]).await;
+    let restarted_buffer = restarted
+        .resolve_buffer(BufferKind::Channel, "#ephemeral")
+        .await
+        .expect("buffer resolves after restart");
+    assert!(
+        restarted
+            .backlog(ClientId(1), restarted_buffer, BacklogCap::DEFAULT)
+            .await
+            .expect("restarted memory backlog reads")
+            .is_empty(),
+        "ephemeral ring is owned by one journal generation"
+    );
+}
+
+#[tokio::test]
+async fn persistent_otr_payload_is_retained_opaque_without_fts_derivation() {
+    let (_store, handle) = store();
+    let mut journal = journal_for(&handle, VirtualWallClock::default(), &[]).await;
+    let buffer = journal
+        .resolve_buffer(BufferKind::Channel, "#otr")
+        .await
+        .expect("buffer resolves");
+    let raw = b":alice!u@host PRIVMSG #otr :?OTR:secretfragment\r\n";
+    assert!(matches!(
+        journal
+            .ingest(buffer, &message(std::str::from_utf8(raw).expect("utf8")))
+            .await
+            .expect("OTR event ingests"),
+        IngestOutcome::Recorded { .. }
+    ));
+    let rows = handle
+        .query_history(&i2pr_irc_store::HistoryQuery {
+            buffer,
+            bound: i2pr_irc_store::HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("history reads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].payload,
+        raw.strip_suffix(b"\r\n").expect("terminator")
+    );
+    let hits = journal
+        .store_search(&SearchQuery {
+            network: NetworkId(1),
+            buffers: vec![buffer],
+            sender: None,
+            after: None,
+            before: None,
+            terms: vec![SearchTerm::parse("secretfragment").expect("term parses")],
+            limit: 10,
+        })
+        .await
+        .expect("search returns");
+    assert!(hits.is_empty(), "OTR content never creates FTS terms");
 }
 
 #[tokio::test]

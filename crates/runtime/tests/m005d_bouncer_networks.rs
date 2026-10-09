@@ -997,6 +997,55 @@ async fn the_local_service_administers_presence_and_channel_policy() {
     client.until("Attached channel").await;
 
     client
+        .send("PRIVMSG BouncerServ :history status 1 channel #room\r\n")
+        .await;
+    client
+        .until("history #room: inherit (persistent default)")
+        .await;
+    client
+        .send("PRIVMSG BouncerServ :history set 1 channel #room no-history\r\n")
+        .await;
+    client.until("history policy updated for #room").await;
+    let channel = runtime
+        .store
+        .1
+        .resolve_buffer(NetworkId(1), i2pr_irc_store::BufferKind::Channel, "#room")
+        .await
+        .expect("channel buffer resolves")
+        .buffer;
+    assert_eq!(
+        runtime
+            .store
+            .1
+            .get_buffer_retention(channel)
+            .await
+            .expect("channel retention reads")
+            .policy,
+        Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory)
+    );
+    client
+        .send("PRIVMSG BouncerServ :history set 1 query Alice ephemeral\r\n")
+        .await;
+    client.until("history policy updated for Alice").await;
+    let query = runtime
+        .store
+        .1
+        .resolve_buffer(NetworkId(1), i2pr_irc_store::BufferKind::Query, "Alice")
+        .await
+        .expect("query buffer resolves")
+        .buffer;
+    assert_eq!(
+        runtime
+            .store
+            .1
+            .get_buffer_retention(query)
+            .await
+            .expect("query retention reads")
+            .policy,
+        Some(i2pr_irc_store::HistoryPrivacyPolicy::Ephemeral)
+    );
+
+    client
         .send("PRIVMSG BouncerServ :presence set 1 auto_away=on\r\n")
         .await;
     client.until("Updated presence policy").await;

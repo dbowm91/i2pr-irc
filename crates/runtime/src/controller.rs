@@ -32,7 +32,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use i2pr_irc_core::{I2pStreamProvider, NetworkId};
-use i2pr_irc_store::{NetworkRecord, SavedNetwork, StoreError, StoreHandle};
+use i2pr_irc_store::{
+    BufferKind, BufferRetentionPolicy, NetworkRecord, SavedNetwork, StoreError, StoreHandle,
+};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -205,6 +207,14 @@ pub enum ControlRequest {
         auto_away: Option<bool>,
         keep_nick: Option<bool>,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    /// Read or replace one bounded per-buffer privacy policy.
+    BufferRetention {
+        network: NetworkId,
+        kind: BufferKind,
+        target: String,
+        policy: Option<Option<BufferRetentionPolicy>>,
+        reply: oneshot::Sender<Result<BufferRetentionPolicy, RuntimeError>>,
     },
     /// Hand one already-registered local session to a live owner.
     ///
@@ -490,6 +500,24 @@ impl RuntimeControlHandle {
             network,
             auto_away,
             keep_nick,
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn buffer_retention(
+        &self,
+        network: NetworkId,
+        kind: BufferKind,
+        target: String,
+        policy: Option<Option<BufferRetentionPolicy>>,
+    ) -> Result<BufferRetentionPolicy, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::BufferRetention {
+            network,
+            kind,
+            target,
+            policy,
             reply,
         })?;
         response.await.unwrap_or(Err(RuntimeError::Stopped))
@@ -1158,6 +1186,49 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                     self.set_presence_policy(network, auto_away, keep_nick)
                         .await,
                 );
+            }
+            ControlRequest::BufferRetention {
+                network,
+                kind,
+                target,
+                policy,
+                reply,
+            } => {
+                let result = async {
+                    if !self.records.contains_key(&network) {
+                        return Err(RuntimeError::InvalidConfig);
+                    }
+                    let buffer = self
+                        .catalog
+                        .store()
+                        .resolve_buffer(network, kind, &target)
+                        .await
+                        .map_err(|error| crate::catalog::classify(error.kind()))?
+                        .buffer;
+                    if let Some(policy) = policy {
+                        self.catalog
+                            .store()
+                            .set_buffer_retention(buffer, policy.unwrap_or_default())
+                            .await
+                            .map_err(|error| crate::catalog::classify(error.kind()))?;
+                        if let Some(owner) = self.catalog.get(network) {
+                            owner
+                                .sync_buffer_privacy(
+                                    kind,
+                                    target.clone(),
+                                    policy.unwrap_or_default(),
+                                )
+                                .await?;
+                        }
+                    }
+                    self.catalog
+                        .store()
+                        .get_buffer_retention(buffer)
+                        .await
+                        .map_err(|error| crate::catalog::classify(error.kind()))
+                }
+                .await;
+                let _ = reply.send(result);
             }
             ControlRequest::Stop { reply } => {
                 self.stopping = true;

@@ -1691,9 +1691,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // Resolved conversation targets, populated from authoritative membership and
         // from client intents. A target is only resolved durably once.
         let mut buffers: BTreeMap<String, BufferId> = BTreeMap::new();
+        let mut query_buffers: BTreeMap<String, BufferId> = BTreeMap::new();
+        let mut no_history_buffers: BTreeSet<BufferId> = BTreeSet::new();
         for channel in state.joined_channels() {
             if let Ok(buffer) = journal.resolve_buffer(BufferKind::Channel, &channel).await {
                 buffers.insert(casemapped(&channel), buffer);
+                if journal.retention_policy(buffer).policy
+                    == Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory)
+                {
+                    no_history_buffers.insert(buffer);
+                }
             }
         }
         let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestItem>(INGEST_QUEUE_CAPACITY);
@@ -1810,7 +1817,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &mut presence_of,
                             &mut state,
                             &mut journal,
-                            &buffers,
+                            &mut buffers,
+                            &mut query_buffers,
+                            &mut no_history_buffers,
                             &mut reconcile,
                             advertised_downstream.iter().cloned().collect(),
                             used_fallback_nick,
@@ -1896,6 +1905,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                         snapshot.history_recorded =
                                             snapshot.history_recorded.saturating_add(1)
                                     }),
+                                Ok(IngestOutcome::Ephemeral) => self.snapshot.send_modify(
+                                    |snapshot| {
+                                        snapshot.history_recorded =
+                                            snapshot.history_recorded.saturating_add(1)
+                                    },
+                                ),
                                 Ok(IngestOutcome::Skipped) => self.snapshot.send_modify(
                                     |snapshot| {
                                         snapshot.history_skipped =
@@ -2140,6 +2155,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &sessions,
                             &control_tx,
                             &buffers,
+                            &query_buffers,
+                            &no_history_buffers,
                             &ingest_tx,
                             &mut router,
                         ) {
@@ -2197,6 +2214,11 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             match journal.resolve_buffer(BufferKind::Channel, &channel).await {
                                 Ok(buffer) => {
                                     buffers.insert(casemapped(&channel), buffer);
+                                    if journal.retention_policy(buffer).policy
+                                        == Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory)
+                                    {
+                                        no_history_buffers.insert(buffer);
+                                    }
                                 }
                                 Err(_) => {
                                     self.snapshot.send_modify(|snapshot| {
@@ -2204,6 +2226,25 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                             snapshot.history_dropped.saturating_add(1)
                                         });
                                 }
+                            }
+                        }
+                        if let Some((BufferKind::Query, peer)) =
+                            history_buffer_target(&message, &state.nick)
+                            && !query_buffers.contains_key(&casemapped(peer))
+                        {
+                            match journal.resolve_buffer(BufferKind::Query, peer).await {
+                                Ok(buffer) => {
+                                    query_buffers.insert(casemapped(peer), buffer);
+                                    if journal.retention_policy(buffer).policy
+                                        == Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory)
+                                    {
+                                        no_history_buffers.insert(buffer);
+                                    }
+                                }
+                                Err(_) => self.snapshot.send_modify(|snapshot| {
+                                    snapshot.history_dropped =
+                                        snapshot.history_dropped.saturating_add(1)
+                                }),
                             }
                         }
                         // A reattach whose membership was still absent is projected here,
@@ -2298,7 +2339,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // could not reach them would have to reimplement the client's own path, and two
         // implementations of "reattach a channel" is how they start disagreeing.
         journal: &mut crate::journal::HistoryJournal,
-        buffers: &BTreeMap<String, BufferId>,
+        buffers: &mut BTreeMap<String, BufferId>,
+        query_buffers: &mut BTreeMap<String, BufferId>,
+        no_history_buffers: &mut BTreeSet<BufferId>,
         reconcile: &mut DesiredReconcile,
         // What this generation advertises, for a session attaching right now. Passed in
         // rather than read from the snapshot: `watch` shares one lock between reads and
@@ -2404,6 +2447,34 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     )
                     .await;
                     Ok(())
+                };
+                let _ = reply.send(outcome);
+            }
+            SupervisorCommand::BufferPrivacy {
+                kind,
+                target,
+                policy,
+                reply,
+            } => {
+                let outcome = match journal.resolve_buffer(kind, &target).await {
+                    Ok(buffer) => {
+                        journal.apply_committed_retention_policy(buffer, policy);
+                        match kind {
+                            BufferKind::Channel => {
+                                buffers.insert(casemapped(&target), buffer);
+                            }
+                            BufferKind::Query => {
+                                query_buffers.insert(casemapped(&target), buffer);
+                            }
+                        }
+                        if policy.policy == Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory) {
+                            no_history_buffers.insert(buffer);
+                        } else {
+                            no_history_buffers.remove(&buffer);
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 };
                 let _ = reply.send(outcome);
             }
@@ -2519,6 +2590,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         sessions: &BTreeMap<SessionId, SessionTask>,
         control_tx: &mpsc::Sender<Vec<u8>>,
         buffers: &BTreeMap<String, BufferId>,
+        query_buffers: &BTreeMap<String, BufferId>,
+        no_history_buffers: &BTreeSet<BufferId>,
         ingest_tx: &mpsc::Sender<IngestItem>,
         router: &mut ResponseRouter,
     ) -> Result<FanoutReport, RuntimeError> {
@@ -2704,8 +2777,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         }
         // Only a message with a known buffer target is history-eligible. Eligibility
         // itself is decided by the journal, not here.
-        let target = history_target(message);
-        if let Some(buffer) = target.and_then(|target| buffers.get(target))
+        let resolved_buffer =
+            history_buffer_target(message, &state.nick).and_then(|(kind, target)| {
+                let key = casemapped(target);
+                match kind {
+                    BufferKind::Channel => buffers.get(&key),
+                    BufferKind::Query => query_buffers.get(&key),
+                }
+            });
+        if let Some(buffer) = resolved_buffer
+            && !no_history_buffers.contains(buffer)
             && ingest_tx
                 .try_send(IngestItem {
                     buffer: *buffer,
@@ -4000,22 +4081,26 @@ fn rebuild_reply(message: &Message, downstream_label: Option<&str>) -> Vec<u8> {
 ///
 /// Only PRIVMSG and NOTICE carry history in this milestone. A status prefix (server or
 /// nick!user@host) identifies a channel target; a bare nick is a direct-message peer.
-fn history_target(message: &Message) -> Option<&str> {
+fn history_buffer_target<'a>(
+    message: &'a Message,
+    own_nick: &str,
+) -> Option<(BufferKind, &'a str)> {
     let command = &message.command;
     if !command.eq_ignore_ascii_case(b"PRIVMSG") && !command.eq_ignore_ascii_case(b"NOTICE") {
         return None;
     }
     let target = std::str::from_utf8(message.params.first()?).ok()?;
-    let prefix = message
+    let prefix_nick = message
         .prefix
         .as_ref()
         .and_then(|prefix| std::str::from_utf8(prefix).ok())
-        .map(|prefix| prefix.rsplit_once('!').map_or(prefix, |(_, rest)| rest))
-        .unwrap_or(target);
+        .map(|prefix| prefix.split_once('!').map_or(prefix, |(nick, _)| nick));
     Some(if target.starts_with(['#', '&']) {
-        target
+        (BufferKind::Channel, target)
+    } else if prefix_nick.is_some_and(|nick| casemapped(nick) == casemapped(own_nick)) {
+        (BufferKind::Query, target)
     } else {
-        prefix
+        (BufferKind::Query, prefix_nick?)
     })
 }
 
@@ -4075,8 +4160,8 @@ fn detached_fanout(state: &NetworkState, message: &Message) -> DetachedFanout {
         return DetachedFanout::Deliver;
     }
     if command.eq_ignore_ascii_case(b"PRIVMSG") || command.eq_ignore_ascii_case(b"NOTICE") {
-        return match history_target(message) {
-            Some(target) if is_channel_target(target) && state.is_detached(target) => {
+        return match history_buffer_target(message, &state.nick) {
+            Some((BufferKind::Channel, target)) if state.is_detached(target) => {
                 DetachedFanout::Suppress
             }
             _ => DetachedFanout::Deliver,
@@ -4323,6 +4408,25 @@ pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_messages_resolve_to_the_peer_buffer() {
+        let inbound = Message::parse(b":Alice!u@host PRIVMSG bot :hello\r\n").expect("parses");
+        assert_eq!(
+            history_buffer_target(&inbound, "bot"),
+            Some((BufferKind::Query, "Alice"))
+        );
+        let echo = Message::parse(b":bot!u@host PRIVMSG Alice :hello\r\n").expect("parses");
+        assert_eq!(
+            history_buffer_target(&echo, "bot"),
+            Some((BufferKind::Query, "Alice"))
+        );
+        let channel = Message::parse(b":Alice!u@host PRIVMSG #room :hello\r\n").expect("parses");
+        assert_eq!(
+            history_buffer_target(&channel, "bot"),
+            Some((BufferKind::Channel, "#room"))
+        );
+    }
 
     fn generation() -> ConnectionGeneration {
         ConnectionGeneration(1)

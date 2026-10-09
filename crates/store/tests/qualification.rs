@@ -245,6 +245,203 @@ async fn no_history_policy_prevents_durable_event_and_search_index_writes() {
     store.shutdown().expect("store shuts down");
 }
 
+#[tokio::test]
+async fn persistent_event_ceiling_prunes_events_and_search_rows_together() {
+    let dir = testing::temp_dir("buffer-event-ceiling");
+    let path = dir.db("retention.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle();
+    handle
+        .save_network(&record(1, &[]))
+        .await
+        .expect("network saves");
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#bounded")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    handle
+        .set_buffer_retention(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::Persistent),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("retention policy commits");
+    let event = NewHistoryEvent {
+        network: NetworkId(1),
+        buffer,
+        received_at: WallTime(1),
+        server_time: None,
+        msgid: None,
+        direction: EventDirection::Inbound,
+        event_class: "PRIVMSG".into(),
+        payload: b":a!b@c PRIVMSG #bounded :term".to_vec(),
+        search: Some(SearchFields {
+            sender: "a".into(),
+            target: "#bounded".into(),
+            body: "term".into(),
+        }),
+    };
+    handle
+        .append_history(&[event.clone(), event.clone(), event])
+        .await
+        .expect("events append");
+    handle
+        .set_buffer_retention(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::Persistent),
+                max_events: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("existing history is trimmed to the new ceiling");
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        2
+    );
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_search"),
+        2
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn persistent_age_ceiling_excludes_expired_events_and_search_rows() {
+    let dir = testing::temp_dir("buffer-age-ceiling");
+    let path = dir.db("retention.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle();
+    handle
+        .save_network(&record(1, &[]))
+        .await
+        .expect("network saves");
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#aged")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    handle
+        .set_buffer_retention(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::Persistent),
+                max_age_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("age ceiling commits");
+    let event = NewHistoryEvent {
+        network: NetworkId(1),
+        buffer,
+        received_at: WallTime(1),
+        server_time: None,
+        msgid: None,
+        direction: EventDirection::Inbound,
+        event_class: "PRIVMSG".into(),
+        payload: b":a!b@c PRIVMSG #aged :old-term".to_vec(),
+        search: Some(SearchFields {
+            sender: "a".into(),
+            target: "#aged".into(),
+            body: "old-term".into(),
+        }),
+    };
+    handle
+        .append_history(std::slice::from_ref(&event))
+        .await
+        .expect("append handles expired event");
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        0
+    );
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_search"),
+        0
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
+async fn pending_privacy_purge_cannot_be_cleared_by_policy_relaxation() {
+    let dir = testing::temp_dir("buffer-purge-relaxation");
+    let path = dir.db("retention.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle();
+    handle
+        .save_network(&record(1, &[]))
+        .await
+        .expect("network saves");
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#private")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    let event = NewHistoryEvent {
+        network: NetworkId(1),
+        buffer,
+        received_at: WallTime(1),
+        server_time: None,
+        msgid: None,
+        direction: EventDirection::Inbound,
+        event_class: "PRIVMSG".into(),
+        payload: b":a!b@c PRIVMSG #private :secret".to_vec(),
+        search: None,
+    };
+    for _ in 0..40 {
+        handle
+            .append_history(&vec![event.clone(); 256])
+            .await
+            .expect("bounded batch appends");
+    }
+    handle
+        .set_buffer_retention(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::NoHistory),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("strict policy and purge marker commit");
+    let clear = handle
+        .set_buffer_retention(buffer, BufferRetentionPolicy::default())
+        .await
+        .expect_err("a pending purge cannot be cleared");
+    assert!(matches!(
+        clear.kind(),
+        StoreErrorKind::InvalidRequest("cannot clear retention while purge is pending")
+    ));
+    handle
+        .set_buffer_retention(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::Persistent),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("relaxation records persistent intent");
+    let mut post_purge_event = event;
+    post_purge_event.payload = b":a!b@c PRIVMSG #private :safe-after-purge".to_vec();
+    handle
+        .append_history(std::slice::from_ref(&post_purge_event))
+        .await
+        .expect("new persistent event may append");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        1,
+        "all pre-transition rows are purged before persistent history resumes"
+    );
+    store.shutdown().expect("store shuts down");
+}
+
 // ------------------------------------------------------- schema 1 -> 2 migration
 
 /// Builds a v1 database holding `events` history rows.
@@ -2629,37 +2826,7 @@ async fn registration_actions_survive_a_restart_in_the_order_they_were_written()
 async fn schema_seven_actions_migrate_to_post_join() {
     let dir = testing::temp_dir("actions-phase-migration");
     let path = dir.db("actions.sqlite3");
-    let store = store_at(&path);
-    store
-        .handle()
-        .save_network(&record(1, &[]))
-        .await
-        .expect("network saves");
-    store
-        .handle()
-        .save_registration_actions(
-            NetworkId(1),
-            &[stored_action(
-                RegistrationActionKind::Message,
-                "NickServ",
-                "IDENTIFY synthetic-secret",
-            )],
-        )
-        .await
-        .expect("legacy action saves");
-    store.shutdown().expect("store shuts down");
-
-    // Turn the v8 fixture into the actual v7 table shape. This models a shipped v7
-    // database whose action rows have no phase column, rather than merely changing its
-    // header while leaving a v8 table behind.
-    let old = testing::raw(&path);
-    old.execute_batch(
-        "ALTER TABLE registration_actions DROP COLUMN phase; DROP TABLE buffer_privacy;",
-    )
-    .expect("the v7 table has no phase column");
-    old.pragma_update(None, "user_version", 7_i64)
-        .expect("the fixture declares schema 7");
-    drop(old);
+    drop(testing::create_v7_database(&path));
     assert_eq!(testing::identity(&path).1, 7);
 
     let migrated = store_at(&path);
@@ -2865,6 +3032,8 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         6 => drop(testing::create_v6_database(path)),
         7 => drop(testing::create_v7_database(path)),
         8 => drop(testing::create_v8_database(path)),
+        9 => drop(testing::create_v9_database(path)),
+        10 => drop(testing::create_v10_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }

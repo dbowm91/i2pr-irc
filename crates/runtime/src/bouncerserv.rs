@@ -70,6 +70,19 @@ pub enum ServCommand {
     ChannelDetach { network: NetworkId, channel: String },
     /// Resume presenting one detached channel.
     ChannelAttach { network: NetworkId, channel: String },
+    /// Read one buffer's history privacy mode.
+    HistoryStatus {
+        network: NetworkId,
+        kind: i2pr_irc_store::BufferKind,
+        target: String,
+    },
+    /// Set or inherit one buffer's history privacy mode.
+    HistorySet {
+        network: NetworkId,
+        kind: i2pr_irc_store::BufferKind,
+        target: String,
+        policy: Option<i2pr_irc_store::HistoryPrivacyPolicy>,
+    },
     /// Report one Network's presence policy.
     PresenceStatus { network: NetworkId },
     /// Change one Network's auto-away policy.
@@ -140,6 +153,21 @@ impl std::fmt::Debug for ServCommand {
             Self::ChannelAttach { network, channel } => {
                 return write!(f, "ChannelAttach({network:?}, {channel})");
             }
+            Self::HistoryStatus {
+                network,
+                kind,
+                target,
+            } => {
+                return write!(f, "HistoryStatus({network:?}, {kind:?}, {target})");
+            }
+            Self::HistorySet {
+                network,
+                kind,
+                target,
+                policy,
+            } => {
+                return write!(f, "HistorySet({network:?}, {kind:?}, {target}, {policy:?})");
+            }
             Self::PresenceStatus { network } => return write!(f, "PresenceStatus({network:?})"),
             Self::PresenceSet { network, auto_away } => {
                 return write!(f, "PresenceSet({network:?}, {auto_away})");
@@ -188,6 +216,8 @@ pub const HELP_TEXT: &str = concat!(
     " | channel status <netid> <channel>",
     " | channel detach <netid> <channel>",
     " | channel attach <netid> <channel>",
+    " | history status <netid> <channel|query> <target>",
+    " | history set <netid> <channel|query> <target> <persistent|ephemeral|no-history|inherit>",
     " | presence status <netid>",
     " | presence set <netid> auto_away=on|off",
     " | nick status <netid>",
@@ -284,6 +314,47 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                     channel: channel(3)?,
                 }),
                 other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+            }
+        }
+        "HISTORY" => {
+            let network = netid(2)?;
+            if words.len() != 5 && words.len() != 6 {
+                return Err(BouncerError::Usage);
+            }
+            let kind = match word(3) {
+                "channel" => i2pr_irc_store::BufferKind::Channel,
+                "query" => i2pr_irc_store::BufferKind::Query,
+                _ => return Err(BouncerError::ValueOutOfRange),
+            };
+            let target = word(4);
+            if target.is_empty()
+                || target.len() > i2pr_irc_store::MAX_TARGET_BYTES
+                || !target.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(BouncerError::ValueOutOfRange);
+            }
+            match word(1).to_ascii_uppercase().as_str() {
+                "STATUS" if words.len() == 5 => Ok(ServCommand::HistoryStatus {
+                    network,
+                    kind,
+                    target: target.to_owned(),
+                }),
+                "SET" if words.len() == 6 => {
+                    let policy = match word(5) {
+                        "persistent" => Some(i2pr_irc_store::HistoryPrivacyPolicy::Persistent),
+                        "ephemeral" => Some(i2pr_irc_store::HistoryPrivacyPolicy::Ephemeral),
+                        "no-history" => Some(i2pr_irc_store::HistoryPrivacyPolicy::NoHistory),
+                        "inherit" => None,
+                        _ => return Err(BouncerError::ValueOutOfRange),
+                    };
+                    Ok(ServCommand::HistorySet {
+                        network,
+                        kind,
+                        target: target.to_owned(),
+                        policy,
+                    })
+                }
+                _ => Err(BouncerError::Usage),
             }
         }
         "PRESENCE" => match word(1).to_ascii_uppercase().as_str() {
@@ -547,6 +618,10 @@ mod tests {
             "channel status 1 #room",
             "channel detach 1 #room",
             "channel attach 1 #room",
+            "history status 1 channel #room",
+            "history set 1 channel #room no-history",
+            "history set 1 query alice ephemeral",
+            "history set 1 query alice inherit",
             "presence status 1",
             "presence set 1 auto_away=on",
             "nick status 1",

@@ -179,20 +179,30 @@ Version 8 adds a constrained `phase` column to `registration_actions`. The value
 keeps unknown phase values out of storage, and the existing `(network_id, position)` key
 continues to preserve list order. The migration from version 7 is additive and transactional.
 
-### What version 9 adds, and its current limits
+### What versions 9 through 11 add
 
 Version 9 adds `buffer_privacy`, keyed by stable `BufferId`, for explicit persistent,
 ephemeral, or no-history overrides and bounded persistent age/event/byte ceilings. No
 row means the legacy-compatible persistent default. Stricter modes set `purge_pending`
 before deleting up to 4096 event and FTS rows in one transaction; history queries and
-appends refuse the buffer while deletion is pending. Store startup resumes deletion in
+appends refuse the buffer while deletion is pending. The store worker resumes deletion in
 bounded transactions, and the transition removes per-buffer cursor and marker references.
-This is logical deletion and does not claim physical erasure from WAL files, backups,
-or snapshots.
+Version 10 adds `retention_pending`, which hides a buffer while newly tightened persistent
+age/event/byte ceilings prune older rows in bounded batches. Append applies those ceilings
+and keeps FTS rows, cursors, and markers consistent. This is logical deletion and does not
+claim physical erasure from WAL files, backups, or snapshots.
 
-The current implementation does not yet provide the process-local ephemeral ring or
-enforce the optional persistent age/event/byte ceilings. Those controls remain open in
-M011-A; do not describe ephemeral history as available to clients.
+Version 11 adds `history_events.search_indexed`. It records whether an event has derived FTS
+fields, allowing opaque OTR ciphertext to remain in history without a searchable plaintext
+row. Startup verifies that every marked event has exactly one FTS row and that no FTS row
+points at an event marked unindexed.
+
+The runtime keeps ephemeral history in a process-local ring capped at 512 events, 1 MiB,
+and 128 events per buffer. Eviction zeroizes retained payload and derived search fields;
+process exit loses the ring. No-history avoids payload construction and durable writes.
+Persistent OTR ciphertext may be retained as opaque payload but is excluded from derived
+search fields. Per-buffer policy is administered locally through `BouncerServ` commands
+`history status` and `history set`; `inherit` restores the persistent default.
 
 ### Migrating version 6
 
