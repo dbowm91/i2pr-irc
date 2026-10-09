@@ -70,6 +70,11 @@ pub enum ServCommand {
     ChannelDetach { network: NetworkId, channel: String },
     /// Resume presenting one detached channel.
     ChannelAttach { network: NetworkId, channel: String },
+    ChannelActivitySet {
+        network: NetworkId,
+        channel: String,
+        policy: i2pr_irc_store::ChannelActivityPolicy,
+    },
     /// Read one buffer's history privacy mode.
     HistoryStatus {
         network: NetworkId,
@@ -153,6 +158,11 @@ impl std::fmt::Debug for ServCommand {
             Self::ChannelAttach { network, channel } => {
                 return write!(f, "ChannelAttach({network:?}, {channel})");
             }
+            Self::ChannelActivitySet {
+                network,
+                channel,
+                policy,
+            } => return write!(f, "ChannelActivitySet({network:?}, {channel}, {policy:?})"),
             Self::HistoryStatus {
                 network,
                 kind,
@@ -216,6 +226,7 @@ pub const HELP_TEXT: &str = concat!(
     " | channel status <netid> <channel>",
     " | channel detach <netid> <channel>",
     " | channel attach <netid> <channel>",
+    " | channel activity <netid> <channel> relay=<none|mentions|all> reattach=<off|message|mention> detach_after=<off|1..86400>",
     " | history status <netid> <channel|query> <target>",
     " | history set <netid> <channel|query> <target> <persistent|ephemeral|no-history|inherit>",
     " | presence status <netid>",
@@ -294,6 +305,60 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
         },
         "CHANNEL" => {
             let network = netid(2)?;
+            if word(1).eq_ignore_ascii_case("ACTIVITY") {
+                if words.len() != 7 {
+                    return Err(BouncerError::Usage);
+                }
+                let mut relay = None;
+                let mut reattach = None;
+                let mut detach_after = None;
+                for field in &words[4..] {
+                    let (key, value) = field.split_once('=').ok_or(BouncerError::Usage)?;
+                    match key {
+                        "relay" if relay.is_none() => {
+                            relay = Some(match value {
+                                "none" => i2pr_irc_store::RelayDetached::None,
+                                "mentions" => i2pr_irc_store::RelayDetached::Mentions,
+                                "all" => i2pr_irc_store::RelayDetached::All,
+                                _ => return Err(BouncerError::ValueOutOfRange),
+                            })
+                        }
+                        "reattach" if reattach.is_none() => {
+                            reattach = Some(match value {
+                                "off" => i2pr_irc_store::ReattachOn::Off,
+                                "message" => i2pr_irc_store::ReattachOn::Message,
+                                "mention" => i2pr_irc_store::ReattachOn::Mention,
+                                _ => return Err(BouncerError::ValueOutOfRange),
+                            })
+                        }
+                        "detach_after" if detach_after.is_none() => {
+                            detach_after = Some(if value == "off" {
+                                None
+                            } else {
+                                Some(
+                                    value
+                                        .parse::<u32>()
+                                        .map_err(|_| BouncerError::ValueOutOfRange)?,
+                                )
+                            })
+                        }
+                        _ => return Err(BouncerError::UnsupportedAttribute(key.to_owned())),
+                    }
+                }
+                let policy = i2pr_irc_store::ChannelActivityPolicy {
+                    relay_detached: relay.ok_or(BouncerError::Usage)?,
+                    reattach_on: reattach.ok_or(BouncerError::Usage)?,
+                    detach_after_secs: detach_after.ok_or(BouncerError::Usage)?,
+                };
+                policy
+                    .validate()
+                    .map_err(|_| BouncerError::ValueOutOfRange)?;
+                return Ok(ServCommand::ChannelActivitySet {
+                    network,
+                    channel: channel(3)?,
+                    policy,
+                });
+            }
             // Exactly three arguments. A trailing word here is a client that miscounted,
             // and ignoring it would mean administrating a channel the client did not
             // name while believing it named the one it typed.
@@ -618,6 +683,8 @@ mod tests {
             "channel status 1 #room",
             "channel detach 1 #room",
             "channel attach 1 #room",
+            "channel activity 1 #room relay=mentions reattach=mention detach_after=3600",
+            "channel activity 1 #room detach_after=off reattach=off relay=none",
             "history status 1 channel #room",
             "history set 1 channel #room no-history",
             "history set 1 query alice ephemeral",
@@ -639,6 +706,18 @@ mod tests {
             "action set 1",
         ] {
             parse(line).unwrap_or_else(|error| panic!("{line:?} must parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn channel_activity_policy_rejects_duplicates_unknown_fields_and_unbounded_durations() {
+        for line in [
+            "channel activity 1 #room relay=all reattach=off detach_after=0",
+            "channel activity 1 #room relay=all reattach=off detach_after=86401",
+            "channel activity 1 #room relay=all relay=none reattach=off",
+            "channel activity 1 #room relay=all reattach=off detach_after=off extra=1",
+        ] {
+            assert!(parse(line).is_err(), "{line:?} must be refused");
         }
     }
 

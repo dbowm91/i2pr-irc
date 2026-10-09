@@ -50,6 +50,7 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
                 target: (*target).to_owned(),
                 position: index,
                 detached: false,
+                activity: i2pr_irc_store::ChannelActivityPolicy::default(),
             })
             .collect(),
         auto_away: false,
@@ -1054,6 +1055,7 @@ async fn an_import_applies_a_snapshot_one_network_at_a_time_and_reports_progress
                 target: "#restored".to_owned(),
                 position: 0,
                 detached: false,
+                activity: i2pr_irc_store::ChannelActivityPolicy::default(),
             }],
             action_count: 0,
             action_phase_counts: [0, 0, 0],

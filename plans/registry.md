@@ -36,7 +36,7 @@ Canonical direction:
 | Plan | Status | Class | Roadmap | Handoff |
 |---|---|---|---|---|
 | Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
-| IRC M011-B / Plan 056 — Activity-Aware Detached Channels and Reattachment | ready | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
+| IRC M011-B / Plan 056 — Activity-Aware Detached Channels and Reattachment | active | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
 
 Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
 

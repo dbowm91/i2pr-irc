@@ -860,6 +860,12 @@ pub trait ChannelPolicy: Send + Sync {
         channel: &str,
         detached: bool,
     ) -> Result<bool, StoreError>;
+    async fn set_activity(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+    ) -> Result<bool, StoreError>;
     /// Re-reads this Network's durable desired channels.
     async fn load(&self) -> Result<Vec<NetworkRecord>, StoreError>;
 }
@@ -877,6 +883,16 @@ impl ChannelPolicy for StoreChannelPolicy {
     ) -> Result<bool, StoreError> {
         self.0
             .set_desired_channel_detached(network, channel, detached)
+            .await
+    }
+    async fn set_activity(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+    ) -> Result<bool, StoreError> {
+        self.0
+            .set_channel_activity_policy(network, channel, activity)
             .await
     }
     async fn load(&self) -> Result<Vec<NetworkRecord>, StoreError> {
@@ -1783,6 +1799,23 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let mut reconcile_tick = tokio::time::interval(DESIRED_RECONCILE_INTERVAL);
         reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut awaiting_pong: Option<(Instant, String)> = None;
+        // One bounded inactivity deadline per desired channel. The interval is the
+        // single owner timer wheel; it creates no per-channel tasks and is rebuilt
+        // from durable policy with fresh monotonic deadlines for every generation.
+        let mut activity_deadlines: BTreeMap<String, Instant> = state
+            .channel_activity_targets()
+            .iter()
+            .filter_map(|(channel, policy)| {
+                policy.detach_after_secs.map(|seconds| {
+                    (
+                        channel.clone(),
+                        Instant::now() + std::time::Duration::from_secs(u64::from(seconds)),
+                    )
+                })
+            })
+            .collect();
+        let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let outcome = loop {
             // Deferred desired membership is relieved at the top of every turn, not only
             // on the keepalive tick. A committed JOIN or PART is operator intent the
@@ -1821,6 +1854,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &mut query_buffers,
                             &mut no_history_buffers,
                             &mut reconcile,
+                            &mut activity_deadlines,
                             advertised_downstream.iter().cloned().collect(),
                             used_fallback_nick,
                             &fallback,
@@ -1940,6 +1974,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 snapshot.desired_reconcile_drained.saturating_add(drained);
                             snapshot.desired_reconcile_pending = pending;
                         });
+                    }
+                }
+                _ = activity_tick.tick() => {
+                    let now = Instant::now();
+                    let due: Vec<String> = activity_deadlines.iter().filter(|(channel, deadline)| **deadline <= now && !state.is_detached(channel)).map(|(channel, _)| channel.clone()).collect();
+                    for channel in due {
+                        activity_deadlines.remove(&channel);
+                        self.apply_detach(&sessions, &mut state, None, &channel).await;
+                        self.publish_state(&state);
                     }
                 }
                 _ = reclaim.tick() => {
@@ -2148,6 +2191,29 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 advertised_downstream = now;
                             }
                         }
+                        // Channel activity is decided only from parsed, owner-observed
+                        // PRIVMSG/NOTICE events. OTR payloads remain opaque and are not
+                        // used as mention text or activity triggers.
+                        if (message.command.eq_ignore_ascii_case(b"PRIVMSG") || message.command.eq_ignore_ascii_case(b"NOTICE"))
+                            && let Some((BufferKind::Channel, target)) = history_buffer_target(&message, &state.nick)
+                        {
+                            let policy = state.channel_activity_policy(target);
+                            if let Some(seconds) = policy.detach_after_secs {
+                            let timer_target = state.activity_target_name(target).unwrap_or(target);
+                            activity_deadlines.insert(timer_target.to_owned(), Instant::now() + std::time::Duration::from_secs(u64::from(seconds)));
+                            }
+                            let body = message.params.get(1).map(|bytes| String::from_utf8_lossy(bytes).into_owned()).unwrap_or_default();
+                            let opaque = crate::journal::is_otr_message(&message);
+                            let should_reattach = match policy.reattach_on {
+                                i2pr_irc_store::ReattachOn::Off => false,
+                                i2pr_irc_store::ReattachOn::Message => true,
+                                i2pr_irc_store::ReattachOn::Mention => !opaque && contains_nick_mention(&state, &body, &state.nick),
+                            };
+                            if state.is_detached(target) && should_reattach && Self::is_observed_member(&state, target) {
+                                self.apply_reattach(&mut sessions, &mut state, None, target, &mut journal, &buffers, &normal_tx, generation, &mut reconcile).await;
+                                self.publish_state(&state);
+                            }
+                        }
                         match self.apply_upstream_line(
                             &raw,
                             &message,
@@ -2343,6 +2409,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         query_buffers: &mut BTreeMap<String, BufferId>,
         no_history_buffers: &mut BTreeSet<BufferId>,
         reconcile: &mut DesiredReconcile,
+        activity_deadlines: &mut BTreeMap<String, Instant>,
         // What this generation advertises, for a session attaching right now. Passed in
         // rather than read from the snapshot: `watch` shares one lock between reads and
         // writes, and attaching writes to that same snapshot, so a borrow held across the
@@ -2439,6 +2506,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 // from a client's own `PART :detach`.
                 let outcome = if detached {
                     self.apply_detach(sessions, state, None, &channel).await;
+                    if let Some(target) = state.activity_target_name(&channel) {
+                        activity_deadlines.remove(target);
+                    }
                     Ok(())
                 } else {
                     self.apply_reattach(
@@ -2446,7 +2516,69 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         reconcile,
                     )
                     .await;
+                    if let (Some(target), Some(seconds)) = (
+                        state.activity_target_name(&channel).map(str::to_owned),
+                        state.channel_activity_policy(&channel).detach_after_secs,
+                    ) {
+                        activity_deadlines.insert(
+                            target,
+                            Instant::now() + std::time::Duration::from_secs(u64::from(seconds)),
+                        );
+                    }
                     Ok(())
+                };
+                let _ = reply.send(outcome);
+            }
+            SupervisorCommand::ChannelActivityPolicy {
+                channel,
+                activity,
+                reply,
+            } => {
+                let outcome = match self
+                    .policy
+                    .set_activity(self.network, &channel, activity)
+                    .await
+                {
+                    Ok(true) => {
+                        state.set_channel_activity_policy(&channel, activity);
+                        let timer_target = state
+                            .activity_target_name(&channel)
+                            .unwrap_or(&channel)
+                            .to_owned();
+                        if let Some(seconds) = activity.detach_after_secs {
+                            activity_deadlines.insert(
+                                timer_target.clone(),
+                                Instant::now() + std::time::Duration::from_secs(u64::from(seconds)),
+                            );
+                        } else {
+                            activity_deadlines.remove(&timer_target);
+                        }
+                        Ok(())
+                    }
+                    Ok(false) => Err(RuntimeError::InvalidConfig),
+                    Err(error) if error.commit_state() == CommitState::Unknown => {
+                        match self.durable_channel_activity(&channel).await {
+                            Some(actual) if actual == activity => {
+                                state.set_channel_activity_policy(&channel, actual);
+                                let timer_target = state
+                                    .activity_target_name(&channel)
+                                    .unwrap_or(&channel)
+                                    .to_owned();
+                                if let Some(seconds) = actual.detach_after_secs {
+                                    activity_deadlines.insert(
+                                        timer_target.clone(),
+                                        Instant::now()
+                                            + std::time::Duration::from_secs(u64::from(seconds)),
+                                    );
+                                } else {
+                                    activity_deadlines.remove(&timer_target);
+                                }
+                                Ok(())
+                            }
+                            _ => Err(RuntimeError::InvalidConfig),
+                        }
+                    }
+                    Err(_) => Err(RuntimeError::InvalidConfig),
                 };
                 let _ = reply.send(outcome);
             }
@@ -3276,6 +3408,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         journal: &mut crate::journal::HistoryJournal,
         buffers: &BTreeMap<String, BufferId>,
     ) {
+        let buffer = buffers.get(&casemapped(channel)).copied();
         for task in sessions.values() {
             let handle = task.handle();
             // A synthetic JOIN precedes the projection so a client sees the same ordered
@@ -3298,6 +3431,31 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 channel,
                 read_markers.as_ref(),
             );
+            // Reattachment exposes only the retained history this stable client has
+            // not already acknowledged. The journal applies current privacy policy,
+            // and playback is bounded in both events and bytes just like initial join.
+            if crate::playback::wants_backlog(handle.capabilities())
+                && let Some(buffer) = buffer
+            {
+                let outcome = crate::playback::deliver_buffer(
+                    journal,
+                    handle,
+                    task.client(),
+                    task.session(),
+                    buffer,
+                    crate::journal::BacklogCap::DEFAULT,
+                )
+                .await;
+                self.snapshot.send_modify(|snapshot| {
+                    snapshot.backlog_delivered = snapshot
+                        .backlog_delivered
+                        .saturating_add(outcome.delivered as u64);
+                    snapshot.backlog_truncated |= outcome.more_pending;
+                    if outcome.overflowed {
+                        snapshot.last_error = Some("backlog-overflow");
+                    }
+                });
+            }
         }
     }
 
@@ -3549,6 +3707,23 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             .map(|entry| entry.detached)
     }
 
+    async fn durable_channel_activity(
+        &self,
+        channel: &str,
+    ) -> Option<i2pr_irc_store::ChannelActivityPolicy> {
+        let records = self.policy.load().await.ok()?;
+        records
+            .iter()
+            .find(|record| record.network == self.network)?
+            .desired_channels
+            .iter()
+            .find(|entry| {
+                i2pr_irc_core::Casemapping::Rfc1459.fold(entry.target.as_bytes())
+                    == i2pr_irc_core::Casemapping::Rfc1459.fold(channel.as_bytes())
+            })
+            .map(|entry| entry.activity)
+    }
+
     /// Reads this Network's durable channel policy for a fresh generation.
     ///
     /// A store that cannot answer falls back to the record this owner was built from.
@@ -3567,6 +3742,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         .map(|entry| crate::state::DesiredChannelPolicy {
                             target: entry.target.clone(),
                             detached: entry.detached,
+                            activity: entry.activity,
                         })
                         .collect()
                 })
@@ -3581,6 +3757,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     .map(|entry| crate::state::DesiredChannelPolicy {
                         target: entry.target.clone(),
                         detached: entry.detached,
+                        activity: entry.activity,
                     })
                     .collect()
             }
@@ -4162,7 +4339,22 @@ fn detached_fanout(state: &NetworkState, message: &Message) -> DetachedFanout {
     if command.eq_ignore_ascii_case(b"PRIVMSG") || command.eq_ignore_ascii_case(b"NOTICE") {
         return match history_buffer_target(message, &state.nick) {
             Some((BufferKind::Channel, target)) if state.is_detached(target) => {
-                DetachedFanout::Suppress
+                let policy = state.channel_activity_policy(target);
+                let text = message
+                    .params
+                    .get(1)
+                    .map(|body| String::from_utf8_lossy(body).into_owned())
+                    .unwrap_or_default();
+                match policy.relay_detached {
+                    i2pr_irc_store::RelayDetached::All => DetachedFanout::Deliver,
+                    i2pr_irc_store::RelayDetached::Mentions
+                        if !crate::journal::is_otr_message(message)
+                            && contains_nick_mention(state, &text, &state.nick) =>
+                    {
+                        DetachedFanout::Deliver
+                    }
+                    _ => DetachedFanout::Suppress,
+                }
             }
             _ => DetachedFanout::Deliver,
         };
@@ -4171,6 +4363,26 @@ fn detached_fanout(state: &NetworkState, message: &Message) -> DetachedFanout {
         return redact_quit_channels(state, message);
     }
     DetachedFanout::Deliver
+}
+
+fn contains_nick_mention(state: &NetworkState, text: &str, nick: &str) -> bool {
+    if nick.is_empty() || nick.len() > 64 {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let needle = nick.as_bytes();
+    if needle.len() > bytes.len() {
+        return false;
+    }
+    let is_nick_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || b"-[]\\`^{}_ |".contains(&byte) && byte != b' ';
+    (0..=bytes.len() - needle.len()).any(|start| {
+        let end = start + needle.len();
+        (start == 0 || !is_nick_byte(bytes[start - 1]))
+            && (end == bytes.len() || !is_nick_byte(bytes[end]))
+            && std::str::from_utf8(&bytes[start..end])
+                .is_ok_and(|candidate| state.same_nick(candidate, nick))
+    })
 }
 
 /// Rebuilds a `QUIT` without naming any detached channel.
@@ -4408,6 +4620,37 @@ pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_mentions_use_irc_casemapping_and_nick_token_boundaries() {
+        let state = NetworkState::new("Bot[", &[]);
+        assert!(contains_nick_mention(&state, "hello bot{!", "Bot["));
+        assert!(contains_nick_mention(&state, "(BOT[):", "Bot["));
+        assert!(!contains_nick_mention(&state, "robot[", "Bot["));
+        assert!(!contains_nick_mention(&state, "bot[ter", "Bot["));
+    }
+
+    #[test]
+    fn detached_relay_modes_only_release_eligible_channel_messages() {
+        let desired = [crate::state::DesiredChannelPolicy {
+            target: "#room".to_owned(),
+            detached: true,
+            activity: i2pr_irc_store::ChannelActivityPolicy {
+                relay_detached: i2pr_irc_store::RelayDetached::Mentions,
+                ..Default::default()
+            },
+        }];
+        let state = NetworkState::new("bot", &desired);
+        let ordinary =
+            Message::parse(b":alice!u@h PRIVMSG #room :hello\r\n").expect("valid message");
+        let mention =
+            Message::parse(b":alice!u@h PRIVMSG #room :hello bot!\r\n").expect("valid message");
+        let otr =
+            Message::parse(b":alice!u@h PRIVMSG #room :?OTR:bot!\r\n").expect("valid message");
+        assert_eq!(detached_fanout(&state, &ordinary), DetachedFanout::Suppress);
+        assert_eq!(detached_fanout(&state, &mention), DetachedFanout::Deliver);
+        assert_eq!(detached_fanout(&state, &otr), DetachedFanout::Suppress);
+    }
 
     #[test]
     fn direct_messages_resolve_to_the_peer_buffer() {

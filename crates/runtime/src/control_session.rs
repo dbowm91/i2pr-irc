@@ -266,12 +266,27 @@ impl ControlSurface {
                     // record rather than from the snapshot, which carries no per-channel
                     // detail on purpose.
                     Some(entry) => self.notice(&format!(
-                        "{channel} {}",
+                        "{channel} {} relay={} reattach={} detach_after={}",
                         if entry.detached {
                             "detached"
                         } else {
                             "attached"
-                        }
+                        },
+                        match entry.activity.relay_detached {
+                            i2pr_irc_store::RelayDetached::None => "none",
+                            i2pr_irc_store::RelayDetached::Mentions => "mentions",
+                            i2pr_irc_store::RelayDetached::All => "all",
+                        },
+                        match entry.activity.reattach_on {
+                            i2pr_irc_store::ReattachOn::Off => "off",
+                            i2pr_irc_store::ReattachOn::Message => "message",
+                            i2pr_irc_store::ReattachOn::Mention => "mention",
+                        },
+                        entry
+                            .activity
+                            .detach_after_secs
+                            .map(|seconds| seconds.to_string())
+                            .unwrap_or_else(|| "off".to_owned()),
                     )),
                     None => self.fail(&verb, &BouncerError::NoSuchChannel(channel)),
                 }
@@ -295,6 +310,21 @@ impl ControlSurface {
                             .await,
                         &verb,
                         "Attached channel",
+                    )
+                }
+            }
+            ServCommand::ChannelActivitySet {
+                network,
+                channel,
+                policy,
+            } => {
+                if self.require_network(network, &verb).await {
+                    self.finish_unit(
+                        self.control
+                            .set_channel_activity_policy(network, channel, policy)
+                            .await,
+                        &verb,
+                        "Updated channel activity policy",
                     )
                 }
             }

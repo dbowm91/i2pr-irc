@@ -1,4 +1,4 @@
-//! Schema versions 1 through 11 and their transactional migration harness.
+//! Schema versions 1 through 12 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -21,8 +21,9 @@ use rusqlite::Connection;
 /// registration-action table; version 8 adds action phases and migrates prior rows to
 /// `post-join`; version 9 adds per-buffer history privacy and retention; version 10 adds
 /// a fail-closed marker while stricter persistent ceilings prune existing history;
-/// version 11 records whether each event has a derived FTS row.
-pub const SCHEMA_VERSION: i64 = 11;
+/// version 11 records whether each event has a derived FTS row; version 12 adds bounded
+/// detached-channel activity policies, disabled for existing rows by default.
+pub const SCHEMA_VERSION: i64 = 12;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -436,12 +437,22 @@ pub(crate) fn schema_v11() -> String {
     format!("{}{}", schema_v10(), SEARCH_INDEXED_V11)
 }
 
+pub(crate) fn schema_v12() -> String {
+    format!("{}{}", schema_v11(), CHANNEL_ACTIVITY_V12)
+}
+
 const BUFFER_RETENTION_V10: &str = r#"
 ALTER TABLE buffer_privacy ADD COLUMN retention_pending INTEGER NOT NULL DEFAULT 0 CHECK (retention_pending IN (0,1));
 "#;
 
 const SEARCH_INDEXED_V11: &str = r#"
 ALTER TABLE history_events ADD COLUMN search_indexed INTEGER NOT NULL DEFAULT 1 CHECK (search_indexed IN (0,1));
+"#;
+
+const CHANNEL_ACTIVITY_V12: &str = r#"
+ALTER TABLE desired_channels ADD COLUMN relay_detached TEXT NOT NULL DEFAULT 'none' CHECK (relay_detached IN ('none','mentions','all'));
+ALTER TABLE desired_channels ADD COLUMN reattach_on TEXT NOT NULL DEFAULT 'off' CHECK (reattach_on IN ('off','message','mention'));
+ALTER TABLE desired_channels ADD COLUMN detach_after_secs INTEGER CHECK (detach_after_secs IS NULL OR detach_after_secs BETWEEN 1 AND 86400);
 "#;
 
 /// Fills in the derived state migration 6 added, for a schema 6 fixture.
@@ -632,7 +643,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v11())
+                .execute_batch(&schema_v12())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -783,6 +794,9 @@ const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("history_events", "effective_time"),
     ("registration_actions", "phase"),
     ("history_events", "search_indexed"),
+    ("desired_channels", "relay_detached"),
+    ("desired_channels", "reattach_on"),
+    ("desired_channels", "detach_after_secs"),
 ];
 
 /// Confirms every promised column is present on its table.
@@ -825,6 +839,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             8 => migrate_8_to_9(transaction)?,
             9 => migrate_9_to_10(transaction)?,
             10 => migrate_10_to_11(transaction)?,
+            11 => migrate_11_to_12(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -842,6 +857,14 @@ fn migrate_9_to_10(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
 
 fn migrate_10_to_11(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(SEARCH_INDEXED_V11)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_11_to_12(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(CHANNEL_ACTIVITY_V12)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;

@@ -1964,6 +1964,61 @@ async fn detaching_an_unknown_channel_is_reported_rather_than_invented() {
 }
 
 #[tokio::test]
+async fn channel_activity_policy_round_trips_and_unknown_channels_are_not_created() {
+    let dir = testing::temp_dir("activitypolicy");
+    let path = dir.db("activitypolicy.sqlite3");
+    let store = store_at(&path);
+    store
+        .handle()
+        .save_network(&record(1, &["#alpha"]))
+        .await
+        .expect("record saves");
+    let policy = i2pr_irc_store::ChannelActivityPolicy {
+        relay_detached: i2pr_irc_store::RelayDetached::Mentions,
+        reattach_on: i2pr_irc_store::ReattachOn::Mention,
+        detach_after_secs: Some(3600),
+    };
+    assert!(
+        store
+            .handle()
+            .set_channel_activity_policy(NetworkId(1), "#alpha", policy)
+            .await
+            .expect("policy commits")
+    );
+    assert!(
+        !store
+            .handle()
+            .set_channel_activity_policy(NetworkId(1), "#ghost", policy)
+            .await
+            .expect("unknown remains a no-op")
+    );
+    assert_eq!(
+        store.handle().load_networks().await.expect("networks load")[0].desired_channels[0]
+            .activity,
+        policy
+    );
+}
+
+#[tokio::test]
+async fn schema_eleven_migration_defaults_activity_controls_off() {
+    let dir = testing::temp_dir("activitymigration");
+    let path = dir.db("activitymigration.sqlite3");
+    let predecessor = testing::create_v11_database(&path);
+    predecessor.execute_batch("INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name) VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p', 1, 'bot', 'user', 'bouncer', 'lab'); INSERT INTO desired_channels (network_id, casemap_key, target, position, detached) VALUES (1, CAST('#room' AS BLOB), '#room', 0, 0);").expect("v11 rows seed");
+    drop(predecessor);
+    let record = store_at(&path)
+        .handle()
+        .load_networks()
+        .await
+        .expect("v11 migrates and loads")
+        .remove(0);
+    assert_eq!(
+        record.desired_channels[0].activity,
+        i2pr_irc_store::ChannelActivityPolicy::default()
+    );
+}
+
+#[tokio::test]
 async fn a_detach_matching_uses_the_rfc1459_fold() {
     let dir = testing::temp_dir("detachfold");
     let path = dir.db("detachfold.sqlite3");
@@ -3034,6 +3089,7 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         8 => drop(testing::create_v8_database(path)),
         9 => drop(testing::create_v9_database(path)),
         10 => drop(testing::create_v10_database(path)),
+        11 => drop(testing::create_v11_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }

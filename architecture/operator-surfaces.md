@@ -73,9 +73,9 @@ bouncer can read back what it wrote.
 
 ```
 #i2pr-bouncer-config
-version 2
+version 3
 network netid=1 name=lab host=…b32.i2p nick=bot username=user realname=bouncer auto_away=off keep_nick=off actions=1 action_phases=0,1,0
-channel target=#one position=0 detached=off
+channel target=#one position=0 detached=off relay_detached=none reattach_on=off detach_after_secs=off
 ```
 
 **The endpoint is exported here even though `BOUNCER NET` withholds it.** That is not an
@@ -91,6 +91,21 @@ that their secret was refused rather than being sent looking for a syntax proble
 
 **Unknown versions are refused, never guessed.** A format that guessed would import a Network
 with fields missing and the Operator would find out from a failed connection.
+
+Version 3 adds optional-per-version channel activity attributes to the versioned snapshot.
+Version 1 and 2 channel rows remain accepted with disabled activity defaults. New exports
+include `relay_detached`, `reattach_on`, and `detach_after_secs` so a policy round-trip does
+not silently reset them.
+
+## Detached channel activity controls
+
+`CHANNEL STATUS <netid> <channel>` includes the durable detached state and all three
+activity values. Set them together with
+`CHANNEL ACTIVITY <netid> <channel> relay=<none|mentions|all> reattach=<off|message|mention> detach_after=<off|1..86400>`.
+The complete policy is validated before the owner commits it, and an invalid or duplicate
+attribute is refused. A timed detach changes only local presentation; it never sends an
+upstream PART. Automatic reattach uses the owner’s observed channel state and shares the
+same presentation policy across attached sessions.
 
 ### Import boundary
 

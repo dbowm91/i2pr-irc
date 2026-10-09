@@ -58,6 +58,7 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
                 target: (*target).to_owned(),
                 position: index,
                 detached: false,
+                activity: i2pr_irc_store::ChannelActivityPolicy::default(),
             })
             .collect(),
         auto_away: false,

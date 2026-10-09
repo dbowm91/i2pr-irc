@@ -79,6 +79,11 @@ pub enum SupervisorCommand {
         detached: bool,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    ChannelActivityPolicy {
+        channel: String,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     /// Synchronize an already-committed history policy into generation-local ingest
     /// filtering before the controller acknowledges the policy change.
     BufferPrivacy {
@@ -168,6 +173,24 @@ impl SupervisorHandle {
             .try_send(SupervisorCommand::ChannelPolicy {
                 channel,
                 detached,
+                reply,
+            })
+            .map_err(|_| RuntimeError::QueueOverloaded)?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn set_channel_activity_policy(
+        &self,
+        network: NetworkId,
+        channel: String,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+    ) -> Result<(), RuntimeError> {
+        debug_assert_eq!(network, self.network);
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .try_send(SupervisorCommand::ChannelActivityPolicy {
+                channel,
+                activity,
                 reply,
             })
             .map_err(|_| RuntimeError::QueueOverloaded)?;

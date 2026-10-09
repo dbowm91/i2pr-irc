@@ -167,7 +167,57 @@ pub struct DesiredChannelRecord {
     pub position: usize,
     /// Hidden from ordinary downstream live state. Upstream membership is unaffected.
     pub detached: bool,
+    /// Activity and reattachment policy while this channel is detached.
+    pub activity: ChannelActivityPolicy,
 }
+
+/// What to relay to local sessions while a channel is detached.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RelayDetached {
+    /// Suppress channel-scoped traffic, preserving current behavior.
+    #[default]
+    None,
+    /// Relay only human-readable messages that mention the configured nick.
+    Mentions,
+    /// Relay all channel chat while keeping membership and state lines hidden.
+    All,
+}
+
+/// Whether inbound channel activity automatically restores visibility.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReattachOn {
+    /// Require an explicit Operator attach.
+    #[default]
+    Off,
+    /// Reattach on any eligible inbound message.
+    Message,
+    /// Reattach on a human-readable nick mention.
+    Mention,
+}
+
+/// Bounded per-channel activity policy; all defaults preserve existing behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelActivityPolicy {
+    pub relay_detached: RelayDetached,
+    pub reattach_on: ReattachOn,
+    /// Inactivity duration in seconds; `None` disables timed detach.
+    pub detach_after_secs: Option<u32>,
+}
+
+impl ChannelActivityPolicy {
+    pub const MAX_DETACH_AFTER_SECS: u32 = 86_400;
+
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self
+            .detach_after_secs
+            .is_some_and(|seconds| !(1..=Self::MAX_DETACH_AFTER_SECS).contains(&seconds))
+        {
+            return Err("detach-after duration");
+        }
+        Ok(())
+    }
+}
+
 impl DesiredChannelRecord {
     /// A record at an explicit durable position.
     pub fn at(target: &str, position: usize, detached: bool) -> Self {
@@ -175,6 +225,7 @@ impl DesiredChannelRecord {
             target: target.to_owned(),
             position,
             detached,
+            activity: ChannelActivityPolicy::default(),
         }
     }
 
@@ -197,6 +248,7 @@ impl DesiredChannelRecord {
             target: self.target.clone(),
             position: self.position,
             detached,
+            activity: self.activity,
         }
     }
 
@@ -214,6 +266,7 @@ impl DesiredChannelRecord {
         if self.position >= MAX_DESIRED_CHANNELS {
             return Err("desired channel position");
         }
+        self.activity.validate()?;
         Ok(())
     }
 }

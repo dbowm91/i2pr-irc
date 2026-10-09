@@ -1,6 +1,6 @@
 # Plan 056 — M011-B — Activity-Aware Detached Channels and Reattachment
 
-Status: ready
+Status: active
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md

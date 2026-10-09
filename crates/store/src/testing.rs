@@ -254,6 +254,21 @@ pub fn create_v10_database(path: &Path) -> Connection {
     connection
 }
 
+/// Creates a database at schema version 11, immediately before channel activity policy.
+pub fn create_v11_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v11())
+        .expect("schema 11 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 11)
+        .expect("user_version is writable");
+    connection
+}
+
 /// Seeds one Network, one Buffer, and three retained messages.
 fn seed_history_for_backfill(connection: &Connection) {
     connection

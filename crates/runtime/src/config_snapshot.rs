@@ -41,9 +41,11 @@ use i2pr_irc_core::{I2pEndpoint, NetworkId};
 use i2pr_irc_store::{DesiredChannelRecord, MAX_DISPLAY_NAME_BYTES, NetworkRecord, StoredSecret};
 
 /// The only snapshot version this build writes or accepts.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 /// Version 1 carried only a total action count; its actions use the migrated PostJoin phase.
 const LEGACY_SNAPSHOT_VERSION: u32 = 1;
+/// Version 2 introduced explicit action phase counts and defaults activity policy to off.
+const PREVIOUS_SNAPSHOT_VERSION: u32 = 2;
 
 /// The first line of every snapshot, and the marker a parser requires before anything else.
 ///
@@ -188,10 +190,13 @@ fn render_network(entry: &SnapshotNetwork) -> String {
     channels.sort_by_key(|channel| channel.position);
     for channel in channels {
         out.push_str(&format!(
-            "channel target={} position={} detached={}\n",
+            "channel target={} position={} detached={} relay_detached={} reattach_on={} detach_after_secs={}\n",
             channel.target,
             channel.position,
             on_off(channel.detached),
+            match channel.activity.relay_detached { i2pr_irc_store::RelayDetached::None => "none", i2pr_irc_store::RelayDetached::Mentions => "mentions", i2pr_irc_store::RelayDetached::All => "all" },
+            match channel.activity.reattach_on { i2pr_irc_store::ReattachOn::Off => "off", i2pr_irc_store::ReattachOn::Message => "message", i2pr_irc_store::ReattachOn::Mention => "mention" },
+            channel.activity.detach_after_secs.map(|seconds| seconds.to_string()).unwrap_or_else(|| "off".to_owned()),
         ));
     }
     out
@@ -227,7 +232,10 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         Some(line) => parse_version(line)?,
         None => return Err(ConfigError::UnsupportedVersion(0)),
     };
-    if version != SNAPSHOT_VERSION && version != LEGACY_SNAPSHOT_VERSION {
+    if version != SNAPSHOT_VERSION
+        && version != PREVIOUS_SNAPSHOT_VERSION
+        && version != LEGACY_SNAPSHOT_VERSION
+    {
         return Err(ConfigError::UnsupportedVersion(version));
     }
 
@@ -382,7 +390,7 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
     let action_phase_counts = match (version, action_phases) {
         (_, Some(counts)) => counts,
         (LEGACY_SNAPSHOT_VERSION, None) => [0, action_count, 0],
-        (SNAPSHOT_VERSION, None) => {
+        (PREVIOUS_SNAPSHOT_VERSION | SNAPSHOT_VERSION, None) => {
             return Err(ConfigError::MissingAttribute("action_phases"));
         }
         _ => return Err(ConfigError::UnsupportedVersion(version)),
@@ -413,6 +421,9 @@ fn parse_channel(fields: &[&str]) -> Result<DesiredChannelRecord, ConfigError> {
     let mut target = None;
     let mut position = None;
     let mut detached = None;
+    let mut relay_detached = i2pr_irc_store::RelayDetached::None;
+    let mut reattach_on = i2pr_irc_store::ReattachOn::Off;
+    let mut detach_after_secs = None;
     for field in fields {
         let (key, value) = field
             .split_once('=')
@@ -421,6 +432,29 @@ fn parse_channel(fields: &[&str]) -> Result<DesiredChannelRecord, ConfigError> {
             "target" => target = Some(value),
             "position" => position = Some(parse_bounded_u32("position", value)?),
             "detached" => detached = Some(parse_on_off(value)?),
+            "relay_detached" => {
+                relay_detached = match value {
+                    "none" => i2pr_irc_store::RelayDetached::None,
+                    "mentions" => i2pr_irc_store::RelayDetached::Mentions,
+                    "all" => i2pr_irc_store::RelayDetached::All,
+                    _ => return Err(ConfigError::InvalidValue("relay_detached")),
+                }
+            }
+            "reattach_on" => {
+                reattach_on = match value {
+                    "off" => i2pr_irc_store::ReattachOn::Off,
+                    "message" => i2pr_irc_store::ReattachOn::Message,
+                    "mention" => i2pr_irc_store::ReattachOn::Mention,
+                    _ => return Err(ConfigError::InvalidValue("reattach_on")),
+                }
+            }
+            "detach_after_secs" => {
+                detach_after_secs = if value == "off" {
+                    None
+                } else {
+                    Some(parse_bounded_u32("detach_after_secs", value)?)
+                }
+            }
             other => return Err(ConfigError::UnknownAttribute(other.to_owned())),
         }
     }
@@ -432,6 +466,11 @@ fn parse_channel(fields: &[&str]) -> Result<DesiredChannelRecord, ConfigError> {
         target: target.to_owned(),
         position: position.ok_or(ConfigError::MissingAttribute("position"))? as usize,
         detached: detached.ok_or(ConfigError::MissingAttribute("detached"))?,
+        activity: i2pr_irc_store::ChannelActivityPolicy {
+            relay_detached,
+            reattach_on,
+            detach_after_secs,
+        },
     })
 }
 
@@ -630,6 +669,7 @@ mod tests {
                         target: "#b".to_owned(),
                         position: 1,
                         detached: true,
+                        activity: i2pr_irc_store::ChannelActivityPolicy::default(),
                     }],
                     action_count: 2,
                     action_phase_counts: [1, 1, 0],
@@ -648,11 +688,13 @@ mod tests {
                             target: "#x".to_owned(),
                             position: 0,
                             detached: false,
+                            activity: i2pr_irc_store::ChannelActivityPolicy::default(),
                         },
                         DesiredChannelRecord {
                             target: "#y".to_owned(),
                             position: 1,
                             detached: false,
+                            activity: i2pr_irc_store::ChannelActivityPolicy::default(),
                         },
                     ],
                     action_count: 0,
@@ -812,6 +854,19 @@ mod tests {
             "{SNAPSHOT_MAGIC}\nversion {SNAPSHOT_VERSION}\nchannel target=#a position=0 detached=off\n"
         );
         assert_eq!(parse(&text), Err(ConfigError::OrphanChannel));
+    }
+
+    #[test]
+    fn version_two_channel_rows_keep_disabled_activity_defaults() {
+        let text = format!(
+            "{SNAPSHOT_MAGIC}\nversion 2\nnetwork netid=1 name=a host={} nick=n username=u realname=r auto_away=off keep_nick=off actions=0 action_phases=0,0,0\nchannel target=#a position=0 detached=off\n",
+            b32('a')
+        );
+        let parsed = parse(&text).expect("v2 snapshot remains importable");
+        assert_eq!(
+            parsed.networks[0].desired_channels[0].activity,
+            i2pr_irc_store::ChannelActivityPolicy::default()
+        );
     }
 
     #[test]

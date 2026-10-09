@@ -163,6 +163,7 @@ impl Runtime {
                     target: target.to_owned(),
                     position: index,
                     detached,
+                    activity: i2pr_irc_store::ChannelActivityPolicy::default(),
                 },
             )
             .collect();
@@ -983,6 +984,30 @@ async fn the_local_service_administers_presence_and_channel_policy() {
         .send("PRIVMSG BouncerServ :channel status 1 #room\r\n")
         .await;
     client.until("#room attached").await;
+    client
+        .send("PRIVMSG BouncerServ :channel activity 1 #room relay=mentions reattach=mention detach_after=off\r\n")
+        .await;
+    client.until("Updated channel activity policy").await;
+    client
+        .send("PRIVMSG BouncerServ :channel status 1 #room\r\n")
+        .await;
+    client
+        .until("relay=mentions reattach=mention detach_after=off")
+        .await;
+    let record = runtime
+        .control
+        .network_record(NetworkId(1))
+        .await
+        .expect("record reads")
+        .expect("network exists");
+    assert_eq!(
+        record.desired_channels[0].activity,
+        i2pr_irc_store::ChannelActivityPolicy {
+            relay_detached: i2pr_irc_store::RelayDetached::Mentions,
+            reattach_on: i2pr_irc_store::ReattachOn::Mention,
+            detach_after_secs: None,
+        }
+    );
     client
         .send("PRIVMSG BouncerServ :channel detach 1 #room\r\n")
         .await;

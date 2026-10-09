@@ -103,6 +103,12 @@ enum Request {
         detached: bool,
         reply: Reply<Result<bool, StoreError>>,
     },
+    SetChannelActivity {
+        network: NetworkId,
+        channel: String,
+        activity: ChannelActivityPolicy,
+        reply: Reply<Result<bool, StoreError>>,
+    },
     RemoveDesiredChannel {
         network: NetworkId,
         channel: String,
@@ -330,6 +336,21 @@ impl StoreHandle {
             network,
             channel: channel.to_owned(),
             detached,
+            reply,
+        })
+        .await
+    }
+    /// Replaces one desired channel's detached activity policy.
+    pub async fn set_channel_activity_policy(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        activity: ChannelActivityPolicy,
+    ) -> Result<bool, StoreError> {
+        self.submit(|reply| Request::SetChannelActivity {
+            network,
+            channel: channel.to_owned(),
+            activity,
             reply,
         })
         .await
@@ -782,6 +803,15 @@ fn execute(connection: &mut Connection, request: Request) {
         } => answer!(
             reply,
             ops::set_desired_channel_detached(connection, network, &channel, detached)
+        ),
+        Request::SetChannelActivity {
+            network,
+            channel,
+            activity,
+            reply,
+        } => answer!(
+            reply,
+            ops::set_channel_activity_policy(connection, network, &channel, activity)
         ),
         Request::RemoveDesiredChannel {
             network,

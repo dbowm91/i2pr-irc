@@ -97,6 +97,17 @@ impl ChannelPolicy for FaultyPolicy {
             .await
     }
 
+    async fn set_activity(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .set_channel_activity_policy(network, channel, activity)
+            .await
+    }
+
     async fn load(&self) -> Result<Vec<NetworkRecord>, StoreError> {
         self.inner.load_networks().await
     }
@@ -631,6 +642,12 @@ async fn one_client_detaching_a_channel_hides_it_for_every_attached_session() {
 async fn a_detached_channel_stays_joined_upstream_and_keeps_collecting_history() {
     let (mut harness, _) = Harness::start(&attached_channels(&["#room"])).await;
     let upstream = harness.bring_online().await;
+    harness
+        .store
+        .1
+        .create_client("phone")
+        .await
+        .expect("stable client lineage exists for playback cursor");
     let mut client = harness.attach(1, &[]).await;
     client.until("366 bot #room").await;
 
@@ -659,6 +676,37 @@ async fn a_detached_channel_stays_joined_upstream_and_keeps_collecting_history()
         "detached traffic is not live-fanned out: {live}"
     );
 
+    client
+        .send(&format!("PART #room :{ATTACH_SHORTHAND}\r\n"))
+        .await;
+    harness.wait_reattached(1).await;
+    let resumed = client.until("while detached").await;
+    assert!(
+        resumed.contains(":bot JOIN #room"),
+        "state projection precedes eligible backlog: {resumed}"
+    );
+    assert_eq!(
+        resumed.matches("while detached").count(),
+        1,
+        "the detached interval is replayed once through the stable client cursor"
+    );
+    let repeated_mark = client.mark();
+    client
+        .send(&format!("PART #room :{DETACH_SHORTHAND}\r\n"))
+        .await;
+    harness.wait_detached(2).await;
+    client.until("PART #room").await;
+    client
+        .send(&format!("PART #room :{ATTACH_SHORTHAND}\r\n"))
+        .await;
+    harness.wait_reattached(2).await;
+    client.drain(Duration::from_millis(300)).await;
+    let repeated = client.since(repeated_mark);
+    assert!(
+        !repeated.contains("while detached"),
+        "acknowledged backlog is not replayed twice: {repeated}"
+    );
+
     // ...but it is still recorded, which is the whole reason detaching is not leaving.
     let buffer = harness
         .store
@@ -673,6 +721,113 @@ async fn a_detached_channel_stays_joined_upstream_and_keeps_collecting_history()
         "all three lines are durable: hiding a channel downstream does not destroy it"
     );
 
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn inactivity_detach_is_bounded_local_policy_and_never_parts_upstream() {
+    let mut room = DesiredChannelRecord::at("#room", 0, false);
+    room.activity.detach_after_secs = Some(1);
+    let (mut harness, _) = Harness::start(&[room]).await;
+    let upstream = harness.bring_online().await;
+    harness.wait_detached(1).await;
+
+    // The owner's timer changed only the durable presentation policy. Proving that no
+    // PART was written also proves the bouncer retained upstream membership authority.
+    harness
+        .upstream(upstream)
+        .write_all(b"PING :activity-probe\r\n")
+        .await
+        .expect("probe writes");
+    let reply = read_until(harness.upstream(upstream), b"PONG :activity-probe\r\n").await;
+    assert!(
+        !reply.contains("PART #room"),
+        "timer must not part upstream: {:?}",
+        reply
+    );
+    assert!(
+        harness
+            .snapshot
+            .borrow()
+            .detached_channels
+            .iter()
+            .any(|channel| channel == "#room")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_detached_channel_auto_reattaches_on_one_human_readable_mention() {
+    let mut room = DesiredChannelRecord::at("#room", 0, false);
+    room.activity = i2pr_irc_store::ChannelActivityPolicy {
+        relay_detached: i2pr_irc_store::RelayDetached::Mentions,
+        reattach_on: i2pr_irc_store::ReattachOn::Mention,
+        detach_after_secs: None,
+    };
+    let (mut harness, _) = Harness::start(&[room]).await;
+    let upstream = harness.bring_online().await;
+    let mut client = harness.attach(1, &[]).await;
+    client.until("366 bot #room").await;
+    client
+        .send(&format!("PART #room :{DETACH_SHORTHAND}\r\n"))
+        .await;
+    harness.wait_detached(1).await;
+    client.until("PART #room").await;
+    harness
+        .upstream(upstream)
+        .write_all(b":alice!a@h PRIVMSG #room :hello bot!\r\nPING :reattach-probe\r\n")
+        .await
+        .expect("activity and probe write");
+    let upstream_reply = read_until(harness.upstream(upstream), b"PONG :reattach-probe\r\n").await;
+    assert!(
+        !upstream_reply.contains("JOIN #room") && !upstream_reply.contains("PART #room"),
+        "automatic reattach is local only: {upstream_reply}"
+    );
+    harness.wait_reattached(1).await;
+    let seen = client.until("hello bot!").await;
+    assert!(
+        seen.contains(":bouncer JOIN #room"),
+        "reattach projection precedes resumed chat: {seen}"
+    );
+    assert_eq!(
+        seen.matches("hello bot!").count(),
+        1,
+        "current activity arrives once after projection: {seen}"
+    );
+    assert!(
+        !harness
+            .snapshot
+            .borrow()
+            .detached_channels
+            .iter()
+            .any(|channel| channel == "#room")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_otr_fragment_cannot_trigger_automatic_mention_reattach() {
+    let mut room = DesiredChannelRecord::at("#room", 0, false);
+    room.activity.reattach_on = i2pr_irc_store::ReattachOn::Mention;
+    let (mut harness, _) = Harness::start(&[room]).await;
+    let upstream = harness.bring_online().await;
+    let mut client = harness.attach(1, &[]).await;
+    client.until("366 bot #room").await;
+    client
+        .send(&format!("PART #room :{DETACH_SHORTHAND}\r\n"))
+        .await;
+    harness.wait_detached(1).await;
+    client.until("PART #room").await;
+
+    push_chat(harness.upstream(upstream), "#room", "?OTR:bot!").await;
+    assert!(
+        harness
+            .snapshot
+            .borrow()
+            .detached_channels
+            .iter()
+            .any(|channel| channel == "#room")
+    );
     harness.shutdown().await;
 }
 

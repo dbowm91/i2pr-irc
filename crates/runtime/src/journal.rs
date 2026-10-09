@@ -607,9 +607,11 @@ impl HistoryJournal {
         cap: BacklogCap,
     ) -> Result<Vec<HistoryEvent>, RuntimeError> {
         cap.validate()?;
-        if self.current_retention_policy(buffer).await?.policy
-            == Some(HistoryPrivacyPolicy::Ephemeral)
-        {
+        let policy = self.current_retention_policy(buffer).await?;
+        if policy.policy == Some(HistoryPrivacyPolicy::NoHistory) {
+            return Ok(Vec::new());
+        }
+        if policy.policy == Some(HistoryPrivacyPolicy::Ephemeral) {
             let after = self.ephemeral_cursors.get(&(client, buffer)).copied();
             return Ok(limit_ephemeral_bytes(
                 self.ephemeral.after(buffer, after, cap.events),
@@ -1116,7 +1118,7 @@ fn search_fields(message: &Message) -> i2pr_irc_store::SearchFields {
 }
 
 /// OTR payloads remain opaque bytes and are never interpreted as searchable text.
-fn is_otr_message(message: &Message) -> bool {
+pub(crate) fn is_otr_message(message: &Message) -> bool {
     message
         .params
         .iter()

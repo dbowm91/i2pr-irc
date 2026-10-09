@@ -129,6 +129,17 @@ impl ChannelPolicy for FaultyPolicy {
             .await
     }
 
+    async fn set_activity(
+        &self,
+        network: NetworkId,
+        channel: &str,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .set_channel_activity_policy(network, channel, activity)
+            .await
+    }
+
     async fn load(&self) -> Result<Vec<NetworkRecord>, StoreError> {
         self.inner.load_networks().await
     }

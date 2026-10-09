@@ -152,7 +152,7 @@ fn load_desired_channels(
 ) -> Result<Vec<DesiredChannelRecord>, StoreError> {
     let mut statement = connection
         .prepare(
-            "SELECT target, position, detached FROM desired_channels
+            "SELECT target, position, detached, relay_detached, reattach_on, detach_after_secs FROM desired_channels
              WHERE network_id=?1 ORDER BY position, target",
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
@@ -162,12 +162,15 @@ fn load_desired_channels(
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let mut channels = Vec::new();
     for row in rows {
-        let (target, position, detached) =
+        let (target, position, detached, relay, reattach, detach_after) =
             row.map_err(|error| sql(error, CommitState::RolledBack))?;
         if channels.len() >= MAX_DESIRED_CHANNELS {
             return Err(StoreError::new(StoreErrorKind::Corrupt(
@@ -185,10 +188,39 @@ fn load_desired_channels(
         };
         let position = usize::try_from(position)
             .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("desired channel position")))?;
+        let relay_detached = match relay.as_str() {
+            "none" => crate::RelayDetached::None,
+            "mentions" => crate::RelayDetached::Mentions,
+            "all" => crate::RelayDetached::All,
+            _ => {
+                return Err(StoreError::new(StoreErrorKind::Corrupt(
+                    "relay-detached policy",
+                )));
+            }
+        };
+        let reattach_on = match reattach.as_str() {
+            "off" => crate::ReattachOn::Off,
+            "message" => crate::ReattachOn::Message,
+            "mention" => crate::ReattachOn::Mention,
+            _ => {
+                return Err(StoreError::new(StoreErrorKind::Corrupt(
+                    "reattach-on policy",
+                )));
+            }
+        };
+        let detach_after_secs = detach_after
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("detach-after duration")))?;
         let channel = DesiredChannelRecord {
             target,
             position,
             detached,
+            activity: crate::ChannelActivityPolicy {
+                relay_detached,
+                reattach_on,
+                detach_after_secs,
+            },
         };
         channel
             .validate()
@@ -280,14 +312,25 @@ pub(crate) fn save_network(
             BufferRecord::lookup_key(BufferKind::Channel, Casemapping::Rfc1459, &channel.target);
         transaction
             .execute(
-                "INSERT INTO desired_channels (network_id, casemap_key, target, position, detached)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO desired_channels (network_id, casemap_key, target, position, detached, relay_detached, reattach_on, detach_after_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     network,
                     key,
                     channel.target,
                     channel.position as i64,
                     i64::from(channel.detached),
+                    match channel.activity.relay_detached {
+                        crate::RelayDetached::None => "none",
+                        crate::RelayDetached::Mentions => "mentions",
+                        crate::RelayDetached::All => "all",
+                    },
+                    match channel.activity.reattach_on {
+                        crate::ReattachOn::Off => "off",
+                        crate::ReattachOn::Message => "message",
+                        crate::ReattachOn::Mention => "mention",
+                    },
+                    channel.activity.detach_after_secs.map(i64::from),
                 ],
             )
             .map_err(|error| sql(error, CommitState::RolledBack))?;
@@ -428,6 +471,27 @@ pub(crate) fn set_desired_channel_detached(
     transaction
         .commit()
         .map_err(|error| sql(error, CommitState::Unknown))?;
+    Ok(changed > 0)
+}
+
+pub(crate) fn set_channel_activity_policy(
+    connection: &mut Connection,
+    network: NetworkId,
+    channel: &str,
+    activity: ChannelActivityPolicy,
+) -> Result<bool, StoreError> {
+    activity
+        .validate()
+        .map_err(|reason| StoreError::new(StoreErrorKind::InvalidRequest(reason)))?;
+    validate_channel(channel)?;
+    let key = BufferRecord::lookup_key(BufferKind::Channel, Casemapping::Rfc1459, channel);
+    let changed = connection.execute(
+        "UPDATE desired_channels SET relay_detached=?3, reattach_on=?4, detach_after_secs=?5 WHERE network_id=?1 AND casemap_key=?2",
+        params![to_sql_id(network.0)?, key,
+            match activity.relay_detached { RelayDetached::None => "none", RelayDetached::Mentions => "mentions", RelayDetached::All => "all" },
+            match activity.reattach_on { ReattachOn::Off => "off", ReattachOn::Message => "message", ReattachOn::Mention => "mention" },
+            activity.detach_after_secs.map(i64::from)],
+    ).map_err(|error| sql(error, CommitState::RolledBack))?;
     Ok(changed > 0)
 }
 

@@ -180,6 +180,12 @@ pub enum ControlRequest {
         detached: bool,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    ChannelActivityPolicy {
+        network: NetworkId,
+        channel: String,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     /// Create one Network, with the identity allocated by the controller.
     CreateNext {
         candidate: NetworkRecord,
@@ -483,6 +489,22 @@ impl RuntimeControlHandle {
             network,
             channel,
             detached,
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn set_channel_activity_policy(
+        &self,
+        network: NetworkId,
+        channel: String,
+        activity: i2pr_irc_store::ChannelActivityPolicy,
+    ) -> Result<(), RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::ChannelActivityPolicy {
+            network,
+            channel,
+            activity,
             reply,
         })?;
         response.await.unwrap_or(Err(RuntimeError::Stopped))
@@ -1124,6 +1146,26 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 if outcome.is_ok() {
                     self.reread().await;
                     self.commit();
+                }
+                let _ = reply.send(outcome);
+            }
+            ControlRequest::ChannelActivityPolicy {
+                network,
+                channel,
+                activity,
+                reply,
+            } => {
+                let outcome = match self.live.get(&network) {
+                    Some(owner) => {
+                        owner
+                            .handle
+                            .set_channel_activity_policy(network, channel, activity)
+                            .await
+                    }
+                    None => Err(RuntimeError::InvalidConfig),
+                };
+                if outcome.is_ok() {
+                    self.reread().await;
                 }
                 let _ = reply.send(outcome);
             }

@@ -33,18 +33,21 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct DesiredChannelPolicy {
     pub target: String,
     pub detached: bool,
+    pub activity: i2pr_irc_store::ChannelActivityPolicy,
 }
 impl DesiredChannelPolicy {
     pub fn attached(target: impl Into<String>) -> Self {
         Self {
             target: target.into(),
             detached: false,
+            activity: i2pr_irc_store::ChannelActivityPolicy::default(),
         }
     }
     pub fn detached(target: impl Into<String>) -> Self {
         Self {
             target: target.into(),
             detached: true,
+            activity: i2pr_irc_store::ChannelActivityPolicy::default(),
         }
     }
 }
@@ -643,6 +646,9 @@ pub struct NetworkState {
     /// still joined and still in `self_channels`, so history, presence, and upstream
     /// membership are unaffected. Only what a local session is shown changes.
     detached: BTreeSet<Vec<u8>>,
+    /// Durable activity behavior by the negotiated channel casemapping.
+    channel_activity: BTreeMap<Vec<u8>, i2pr_irc_store::ChannelActivityPolicy>,
+    channel_activity_targets: Vec<(String, i2pr_irc_store::ChannelActivityPolicy)>,
     /// Channels whose membership was confirmed while detached and which must therefore
     /// be projected to attached sessions the moment they are reattached.
     ///
@@ -688,6 +694,19 @@ impl NetworkState {
                 .iter()
                 .filter(|entry| entry.detached)
                 .map(|entry| Casemapping::Rfc1459.fold(entry.target.as_bytes()))
+                .collect(),
+            channel_activity: desired
+                .iter()
+                .map(|entry| {
+                    (
+                        Casemapping::Rfc1459.fold(entry.target.as_bytes()),
+                        entry.activity,
+                    )
+                })
+                .collect(),
+            channel_activity_targets: desired
+                .iter()
+                .map(|entry| (entry.target.clone(), entry.activity))
                 .collect(),
             pending_reveal: BTreeSet::new(),
             join_attempts: BTreeMap::new(),
@@ -804,6 +823,38 @@ impl NetworkState {
     pub fn is_detached(&self, channel: &str) -> bool {
         self.detached
             .contains(&self.casemapping.fold(channel.as_bytes()))
+    }
+    pub fn channel_activity_policy(&self, channel: &str) -> i2pr_irc_store::ChannelActivityPolicy {
+        self.channel_activity
+            .get(&self.casemapping.fold(channel.as_bytes()))
+            .copied()
+            .unwrap_or_default()
+    }
+    pub fn set_channel_activity_policy(
+        &mut self,
+        channel: &str,
+        policy: i2pr_irc_store::ChannelActivityPolicy,
+    ) {
+        let folded = self.casemapping.fold(channel.as_bytes());
+        self.channel_activity.insert(folded, policy);
+        let mapping = self.casemapping;
+        if let Some((_, current)) = self
+            .channel_activity_targets
+            .iter_mut()
+            .find(|(target, _)| mapping.fold(target.as_bytes()) == mapping.fold(channel.as_bytes()))
+        {
+            *current = policy;
+        }
+    }
+    pub fn channel_activity_targets(&self) -> &[(String, i2pr_irc_store::ChannelActivityPolicy)] {
+        &self.channel_activity_targets
+    }
+    pub fn activity_target_name(&self, channel: &str) -> Option<&str> {
+        let folded = self.casemapping.fold(channel.as_bytes());
+        self.channel_activity_targets
+            .iter()
+            .find(|(target, _)| self.casemapping.fold(target.as_bytes()) == folded)
+            .map(|(target, _)| target.as_str())
     }
     /// True when `channel`'s membership was confirmed while it was detached.
     pub fn is_reveal_pending(&self, channel: &str) -> bool {
@@ -1272,7 +1323,7 @@ impl NetworkState {
 
     fn apply_isupport_token(&mut self, token: &str) {
         if let Some(value) = token.strip_prefix("CASEMAPPING=") {
-            self.casemapping = match value {
+            let mapping = match value {
                 "ascii" => Casemapping::Ascii,
                 // Both spellings are accepted: `rfc1459-strict` is the Modern IRC
                 // Client Protocol value and `strict-rfc1459` is the older
@@ -1283,6 +1334,27 @@ impl NetworkState {
                 "rfc1459-strict" | "strict-rfc1459" => Casemapping::StrictRfc1459,
                 _ => Casemapping::Rfc1459,
             };
+            if mapping != self.casemapping {
+                let detached: Vec<String> = self
+                    .channel_activity_targets
+                    .iter()
+                    .filter(|(target, _)| {
+                        self.detached
+                            .contains(&self.casemapping.fold(target.as_bytes()))
+                    })
+                    .map(|(target, _)| target.clone())
+                    .collect();
+                self.casemapping = mapping;
+                self.detached = detached
+                    .iter()
+                    .map(|target| mapping.fold(target.as_bytes()))
+                    .collect();
+                self.channel_activity = self
+                    .channel_activity_targets
+                    .iter()
+                    .map(|(target, policy)| (mapping.fold(target.as_bytes()), *policy))
+                    .collect();
+            }
         } else if let Some(value) = token.strip_prefix("CHANTYPES=")
             // A malformed value leaves the retained mapping authoritative.
             && let Some(chantypes) = ChanTypes::parse(value)
@@ -1732,6 +1804,30 @@ mod tests {
         state.apply_line(&line(b":srv 005 bot CASEMAPPING=rfc7613\r\n"));
         assert!(state.same_nick("bot~", "bot^"));
         assert!(state.same_nick("bot[", "bot{"));
+    }
+
+    #[test]
+    fn detached_channel_activity_indexes_follow_negotiated_casemapping() {
+        let desired = [DesiredChannelPolicy {
+            target: "#Room[".to_owned(),
+            detached: true,
+            activity: i2pr_irc_store::ChannelActivityPolicy {
+                relay_detached: i2pr_irc_store::RelayDetached::All,
+                ..Default::default()
+            },
+        }];
+        let mut state = NetworkState::new("bot", &desired);
+        state.apply_line(&line(b":srv 005 bot CASEMAPPING=ascii\r\n"));
+        assert!(state.is_detached("#Room["));
+        assert!(!state.is_detached("#Room{"));
+        assert_eq!(
+            state.channel_activity_policy("#Room[").relay_detached,
+            i2pr_irc_store::RelayDetached::All
+        );
+        assert_eq!(
+            state.channel_activity_policy("#Room{"),
+            i2pr_irc_store::ChannelActivityPolicy::default()
+        );
     }
 
     #[test]
