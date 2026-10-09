@@ -28,6 +28,7 @@ Canonical direction:
 |---|---|---|---|---|
 | Bouncer core | post-M009 complete, no active plan | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | M001-M009 remain historical product closures; Corrective 049 closed the post-M009 SAM framing defect and the registry/README/roadmap reconciliation. |
 | Standalone daemon/local access | M010 in progress; 050-053 closed; 054 active with live-service evidence blocker | plans/subsystems/standalone-daemon-roadmap.md | M010-E / Plan 054 | M010 closure requires controlled live i2pd-to-IRC product-path evidence; no R002 dependency. |
+| IRC privacy, resilience and authentication | M011-M013 planned; 055 ready, 056-066 dependency-gated | plans/subsystems/irc-privacy-resilience-roadmap.md | M011-A / Plan 055 | Research 011 + ADR-0008/0009 registered; core work does not depend on managed-app R002. Optional TLS/EXTERNAL Plan 065 research-blocked; no clearnet override. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -35,10 +36,30 @@ Canonical direction:
 | Plan | Status | Class | Roadmap | Handoff |
 |---|---|---|---|---|
 | Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
+| IRC M011-A / Plan 055 — Per-Buffer Retention and No-History | ready | privacy invariant + capability | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/055-m011a-buffer-privacy-retention.md |
 
 Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
 
 Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemon listener is enabled by the provisioned credentials and key; Plan 054 is active and gated on live product-path qualification.
+
+## Registered IRC feature handoffs (not yet implemented)
+
+| Milestone | Plan | Status | Handoff |
+|---|---|---|---|
+| M011-A | 055 — per-buffer privacy, bounded ephemeral/no-history | ready | plans/implementation/irc-enhancements/055-m011a-buffer-privacy-retention.md |
+| M011-B | 056 — activity-based detached policy | proposed after 055 | plans/implementation/irc-enhancements/056-m011b-detach-reattach-policy.md |
+| M011-C | 057 — local watch/highlight notifications | proposed after 056 | plans/implementation/irc-enhancements/057-m011c-local-watch-notifications.md |
+| M011-D | 058 — integrated privacy closure | proposed after 057 | plans/implementation/irc-enhancements/058-m011d-privacy-integration-closure.md |
+| M012-A | 059 — IRC command pacing and upstream outage gaps | proposed after M011 | plans/implementation/irc-enhancements/059-m012a-command-pacing-and-gap-evidence.md |
+| M012-B | 060 — optional upstream CHATHISTORY recovery | proposed; live server support research-gated | plans/implementation/irc-enhancements/060-m012b-upstream-chathistory-recovery.md |
+| M012-C | 061 — verified same-network I2P endpoint failover | proposed; equivalence research-gated | plans/implementation/irc-enhancements/061-m012c-verified-endpoint-failover.md |
+| M012-D | 062 — integrated resilience closure | proposed after 059-061 | plans/implementation/irc-enhancements/062-m012d-resilience-integration-closure.md |
+| M013-A | 063 — IRC2P/ILITA auth profiles, no TLS default | proposed after M012 | plans/implementation/irc-enhancements/063-m013a-authentication-profiles.md |
+| M013-B | 064 — CHGHOST/playback/redaction review | proposed after 063 | plans/implementation/irc-enhancements/064-m013b-ircv3-feature-review.md |
+| M013-C | 065 — optional inner TLS + SASL EXTERNAL | research-blocked until preflight | plans/implementation/irc-enhancements/065-m013c-i2p-tls-sasl-external.md |
+| M013-D | 066 — compatibility and authentication closure | proposed after 063-065 disposition | plans/implementation/irc-enhancements/066-m013d-compatibility-closure.md |
+
+Only Plan 055 is newly ready. Plan 054 is independently active and remains blocked on external controlled live IRC evidence. No implementation of Plans 055-066 is claimed by registration. The default profiles are plain IRC over typed I2P streams: IRC2P typically NickServ without SASL; ILITA operator-configured required SASL PLAIN. Current deployed mechanisms must be verified by authorized live CAP evidence. Optional EXTERNAL needs explicit authenticated TLS-over-I2P and client certificate; no clearnet connector or user override is authorized.
 
 ## Recently closed implementation plans
 
@@ -109,7 +130,7 @@ Later product lines intentionally remain unplanned:
 - installer/service/package publication and distribution hardening;
 - OS keyring/HSM or other advanced store-key provisioning;
 - optional further real-client OTR interoperability through the production listener;
-- per-buffer no-history/privacy-retention policy;
+- later refinement of M011 per-buffer history and privacy controls after registered Plans 055-058;
 - built-in IRC client cryptographic endpoint support, including any OTRv4 evaluation;
 - Router R002 — i2pr managed-app adapter, blocked on stable public app stream/listener/lifecycle contracts;
 - Router R003 — optional scoped Proposal 170/control integration, research-blocked until a concrete product need exists.
@@ -127,6 +148,8 @@ Broad SAM portability matrices are not an open milestone in this repository; the
 | plans/adrs/ADR-0005-explicit-i2p-provider-scope-release.md | accepted | I2pStreamProvider gains explicit idempotent NetworkId scope release so long-lived router sessions survive IRC reconnects but are torn down on durable Network deletion/process shutdown. |
 | plans/adrs/ADR-0006-encryption-layering-store-key-and-otr-endpoint.md | accepted | Durable privacy uses optional whole-database SQLCipher with an injected process-level key; OTR remains endpoint-to-endpoint client crypto and the bouncer carries ciphertext opaquely without keys/session state. |
 | plans/adrs/ADR-0007-local-authentication-and-standalone-process-boundary.md | accepted | The standalone daemon is an explicit local-only socket authority; Operator auth precedes trusted ClientId/admission; CAP/PASS/SASL registration state passes once; process/key ownership is independent of core/router state. |
+| plans/adrs/ADR-0008-per-buffer-privacy-and-local-alert-policy.md | accepted for planning | Per-buffer privacy/retention and local-only bounded notifications; no persistence of no-history payloads. |
+| plans/adrs/ADR-0009-i2p-irc-transport-authentication-profiles.md | accepted for planning | Plain IRC-over-I2P by default; explicit IRC2P NickServ and ILITA SASL PLAIN profiles; optional I2P-only TLS/EXTERNAL; no clearnet override. |
 
 ## Research authority
 
@@ -140,6 +163,7 @@ Current foundation research:
 - plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
 - plans/research/009-m008-m009-privacy-encryption-and-otr.md
 - plans/research/010-m010-standalone-daemon-local-access-and-bootstrap.md
+- plans/research/011-irc-privacy-resilience-authentication.md
 
 Important retained conclusions:
 
@@ -165,3 +189,8 @@ Important retained conclusions:
 Corrective 049 is closed; see `plans/closure/bouncer-core/049-status.md`. It fixed a real SAM client framing defect (a reply terminator split across TCP reads was dropped, stalling the phase to its deadline) and reconciled the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
 
 M010 is registered as a standalone-productization workstream after Research 010 and accepted ADR-0007. Plans 050-053 are closed; Plan 054 is the **sole active** handoff and awaits controlled live i2pd-to-IRC product-path qualification. M001-M009, C049 and R001 remain closed. R002 remains independently blocked on upstream i2pr managed-app contracts.
+
+
+## Post-M010 IRC enhancement handoff
+
+Research 011, ADR-0008, ADR-0009, and Plans 055-066 are committed on work/plans-055-066-irc-privacy-resilience. Plan 055 is first ready. No code implementation or milestone closure is claimed. Preserve original I2P-only network boundary and the independently active M010-E/054 status.
