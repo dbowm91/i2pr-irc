@@ -1,6 +1,6 @@
 # Plan 060 — M012-B — Optional Upstream CHATHISTORY Catch-Up
 
-Status: ready; live server support remains unqualified
+Status: closed — production implementation deferred by the upstream specification's explicit warning against production use; reconsider only after a stable specification version
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -16,7 +16,10 @@ Retrieve missed upstream messages only when the active IRCd advertises compatibl
 ## Readiness and dependencies
 Plan 059 is closed. The official CHATHISTORY and BATCH specification preflight is recorded in Research 011, and fresh source review confirms the owner, capability, BATCH, tag, Store-history, and privacy-policy interfaces needed for this conditional feature. Initial implementation can use an exact-wire test server and will activate only on direct upstream `draft/chathistory` negotiation. The separate M010 live product-path blocker does not gate core implementation; live compatibility claims still require an authorized supported server.
 
-The CHATHISTORY draft warns against production use. This plan implements only the exact draft CAP name when directly offered and ACKed, with bounded failure behavior. It does not claim IRC2P/ILITA deployment support and must not request the unprefixed capability absent a final spec.
+The CHATHISTORY draft warns against production use. No production request or replay implementation is authorized while that warning remains. Any successor plan must use the finalized capability name and negotiated reference types, with bounded failure behavior. No IRC2P/ILITA deployment support is established.
+
+## Disposition
+Research is complete, but the production capability is deferred. The current official specification explicitly warns implementers not to use the draft in production. Direct CAP negotiation and fake-server conformance fixtures cannot remove that standards-level warning or establish safe interoperability with supported IRC2P/ILITA deployments. Shipping automatic catch-up would therefore violate the plan's production posture. No upstream capability is requested, no history is synthesized, and existing local CHATHISTORY remains unchanged. Reopen this work as a numbered successor only after the specification is finalized or the upstream standards warning is withdrawn and a reviewed protocol contract is available.
 
 ## Existing code/evidence and required invariant
 The current local CHATHISTORY server adapter answers downstream from bouncer Store; it does not imply upstream IRCd supports replay. IRC2P/ILITA capabilities must not be presumed.

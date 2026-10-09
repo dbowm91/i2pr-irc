@@ -1,6 +1,6 @@
 # Plan 061 — M012-C — Verified I2P Server Endpoint Failover
 
-Status: proposed; equivalence gate
+Status: ready; operator-declared trust equivalence is required and does not establish federation fact
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -14,8 +14,7 @@ Closure evidence location: plans/closure/irc-enhancements/061-status.md
 Support operator-approved alternate I2P endpoints for one federated IRC network without automatic cross-network trust/identity changes.
 
 ## Readiness and dependencies
-Plan 060 closed; existing NetworkId-scoped SAM session semantics preserved.
-Only Plan 055 is currently marked ready. Promoting this plan to ready requires proof its named predecessor is closed and a fresh source/dependency check. Separate M010 live product-path blocker does not falsely mark these core-only designs closed.
+Plan 060 is formally closed with production catch-up deferred because the official draft warns against production use. Fresh source review confirms `NetworkRecord` currently has one typed `I2pEndpoint`, one `NetworkOwner` reconnects through the `NetworkId`-scoped `I2pStreamProvider`, and the Store already validates configuration transactionally. Core failover can proceed only with explicit per-Network operator attestation that endpoints are trust-equivalent and credential scope is valid; the application cannot infer federation from `.i2p` names. No deployed IRC2P/ILITA equivalence is asserted. Separate M010 live product-path blocker does not falsely mark this core design closed.
 
 ## Existing code/evidence and required invariant
 Current durable Network has a single validated I2P endpoint; one NetworkOwner owns reconnect generations. Matching .i2p suffix does not prove equivalent network or NickServ account.
