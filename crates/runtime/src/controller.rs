@@ -1014,6 +1014,7 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             self.catalog.reconnect().clone(),
             owner_snapshot,
         )
+        .map(|owner| owner.with_command_pacer(self.catalog.command_pacer().clone()))
         // A session bound to this Network is still the local Operator's own connection,
         // so the owner answers its administrative requests through the same controller
         // that owns every live owner. The owner holds a bounded sender and gains no

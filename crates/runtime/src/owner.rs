@@ -757,6 +757,11 @@ pub struct NetworkSnapshot {
     pub history_skipped: u64,
     /// Lines dropped because the ingestion queue was full.
     pub history_dropped: u64,
+    /// Last completed upstream observation gap, measured with a monotonic clock.
+    pub last_connection_gap_ms: Option<u64>,
+    pub last_connection_gap_disposition: Option<&'static str>,
+    pub connection_gaps_recorded: u64,
+    pub connection_gap_ledger_failures: u64,
     /// Local watch matches emitted or dropped because a bounded client queue refused them.
     pub watch_hits: u64,
     pub watch_dropped: u64,
@@ -944,6 +949,7 @@ pub struct NetworkOwner<P> {
     /// Held by handle, never owned: one Network's retry timing must not be able to
     /// affect another's, and every attempt in this process shares one budget.
     reconnect: ReconnectScheduler,
+    command_pacer: crate::command_pacing::CommandPacer,
     /// Process-wide resource accounting.
     ///
     /// Held by handle for the same reason as the scheduler: an owner that owned it could
@@ -1014,6 +1020,12 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         self
     }
 
+    /// Uses the catalog's process-wide FIFO gate for generation recovery traffic.
+    pub fn with_command_pacer(mut self, pacer: crate::command_pacing::CommandPacer) -> Self {
+        self.command_pacer = pacer;
+        self
+    }
+
     /// [`NetworkOwner::with_snapshot_channel`] with the durable channel policy supplied
     /// by the caller.
     ///
@@ -1050,6 +1062,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             control: None,
             snapshot,
             reconnect,
+            command_pacer: crate::command_pacing::CommandPacer::default(),
             resources,
         })
     }
@@ -1198,6 +1211,56 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         mut commands: mpsc::Receiver<SupervisorCommand>,
         mut stop: watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
+        // Background Store projections stay bounded and are canceled with this owner.
+        // A storage delay must not hold reconnect/liveness progress, nor leave detached
+        // bookkeeping tasks behind if the controller tears down the Network.
+        let mut background_tasks = tokio::task::JoinSet::new();
+        // An owner reconstructed after restart cannot carry its monotonic start instant.
+        // Close any stale open row as interrupted and keep its duration unknown.
+        let startup_snapshot = self.snapshot.clone();
+        let startup_store = self.store.clone();
+        let startup_network = self.network;
+        match self
+            .store
+            .enqueue_interrupt_open_connection_gaps(startup_network)
+        {
+            Ok(interrupted) => {
+                background_tasks.spawn(async move {
+                    if !matches!(interrupted.await, Ok(Ok(_))) {
+                        startup_snapshot.send_modify(|state| {
+                            state.connection_gap_ledger_failures =
+                                state.connection_gap_ledger_failures.saturating_add(1);
+                        });
+                    }
+                    match startup_store.load_connection_gaps(startup_network).await {
+                        Ok(gaps) => startup_snapshot.send_modify(|state| {
+                            state.connection_gaps_recorded = gaps.len() as u64;
+                            if let Some(last) = gaps.last() {
+                                state.last_connection_gap_ms = last.duration_ms;
+                                state.last_connection_gap_disposition =
+                                    Some(match last.disposition {
+                                        i2pr_irc_store::ConnectionGapDisposition::Open => "open",
+                                        i2pr_irc_store::ConnectionGapDisposition::Reconnected => {
+                                            "reconnected"
+                                        }
+                                        i2pr_irc_store::ConnectionGapDisposition::Interrupted => {
+                                            "interrupted"
+                                        }
+                                    });
+                            }
+                        }),
+                        Err(_) => startup_snapshot.send_modify(|state| {
+                            state.connection_gap_ledger_failures =
+                                state.connection_gap_ledger_failures.saturating_add(1);
+                        }),
+                    }
+                });
+            }
+            Err(_) => self.snapshot.send_modify(|state| {
+                state.connection_gap_ledger_failures =
+                    state.connection_gap_ledger_failures.saturating_add(1);
+            }),
+        };
         let mut backoff = crate::Backoff {
             attempt: 0,
             base: Duration::from_secs(1),
@@ -1205,6 +1268,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             jitter_percent: 20,
         };
         let mut generation = 0u64;
+        let mut active_gap: Option<(tokio::sync::oneshot::Sender<u64>, Instant)> = None;
+        let gap_writer_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Attachments that arrived before the owner loop started. They are bounded by
         // the control queue and are re-issued into the generation when it comes up.
         let mut pending_attach: Vec<(SessionId, ClientId, Box<dyn ByteStream>)> = Vec::new();
@@ -1265,6 +1330,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &mut commands,
                             &mut stop,
                             &mut pending_attach,
+                            &mut active_gap,
                         )
                         .await;
                     if online_started.elapsed() >= Duration::from_secs(300) {
@@ -1293,6 +1359,57 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // queues and the ingest queue all died with it. The owner task itself did
             // not, so only the generation-scoped gauges fall to zero here.
             self.publish_resting_gauges();
+            if !matches!(
+                &outcome,
+                Err(RuntimeError::Stopped | RuntimeError::Registration)
+            ) && active_gap.is_none()
+                && gap_writer_active
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                let (reconnected_tx, reconnected_rx) = tokio::sync::oneshot::channel();
+                active_gap = Some((reconnected_tx, Instant::now()));
+                let gap_store = self.store.clone();
+                let gap_snapshot = self.snapshot.clone();
+                let gap_network = self.network;
+                let gap_writer_active = gap_writer_active.clone();
+                background_tasks.spawn(async move {
+                    match gap_store.begin_connection_gap(gap_network).await {
+                        Ok(sequence) => {
+                            gap_snapshot.send_modify(|state| {
+                                state.connection_gaps_recorded =
+                                    state.connection_gaps_recorded.saturating_add(1).min(64);
+                                state.last_connection_gap_disposition = Some("open");
+                            });
+                            if let Ok(duration_ms) = reconnected_rx.await {
+                                match gap_store
+                                    .finish_connection_gap(gap_network, sequence, duration_ms)
+                                    .await
+                                {
+                                    Ok(true) => gap_snapshot.send_modify(|state| {
+                                        state.last_connection_gap_ms = Some(duration_ms);
+                                        state.last_connection_gap_disposition = Some("reconnected");
+                                    }),
+                                    _ => gap_snapshot.send_modify(|state| {
+                                        state.connection_gap_ledger_failures =
+                                            state.connection_gap_ledger_failures.saturating_add(1);
+                                    }),
+                                }
+                            }
+                        }
+                        Err(_) => gap_snapshot.send_modify(|state| {
+                            state.connection_gap_ledger_failures =
+                                state.connection_gap_ledger_failures.saturating_add(1);
+                        }),
+                    }
+                    gap_writer_active.store(false, std::sync::atomic::Ordering::Release);
+                });
+            }
             // A registration rejection means the credentials or configuration were
             // refused. Retrying the identical request cannot succeed, and each attempt
             // would spend a permit the whole process shares, so the Network is marked
@@ -1332,6 +1449,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         commands: &mut mpsc::Receiver<SupervisorCommand>,
         stop: &mut watch::Receiver<bool>,
         pending_attach: &mut Vec<(SessionId, ClientId, Box<dyn ByteStream>)>,
+        active_gap: &mut Option<(tokio::sync::oneshot::Sender<u64>, Instant)>,
     ) -> Result<(), RuntimeError> {
         let (mut ur, mut uw) = tokio::io::split(upstream);
         // Desired intent is durable and restored here; observed state is always fresh.
@@ -1624,6 +1742,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             let actions = self.registration_actions().await;
             for action in actions.actions_in_phase(crate::action::ActionPhase::PreJoin) {
                 if let Some(frame) = action.frame(&state.nick) {
+                    self.command_pacer.wait().await;
                     send(&mut uw, &frame).await?;
                 }
             }
@@ -1642,6 +1761,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 .map(|entry| entry.target.clone())
             {
                 state.begin_desired_join(&channel);
+                self.command_pacer.wait().await;
                 send(&mut uw, &format!("JOIN {channel}\r\n")).await?;
             }
             // PostJoin actions preserve the historical Plan 027 position after the JOINs.
@@ -1658,6 +1778,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             // exactly what replaying an ambiguous user message must never do.
             for action in actions.actions_in_phase(crate::action::ActionPhase::PostJoin) {
                 if let Some(frame) = action.frame(&state.nick) {
+                    self.command_pacer.wait().await;
                     send(&mut uw, &frame).await?;
                 }
             }
@@ -1665,6 +1786,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                 for action in actions.actions_in_phase(crate::action::ActionPhase::FallbackRecovery)
                 {
                     if let Some(frame) = action.frame(&state.nick) {
+                        self.command_pacer.wait().await;
                         send(&mut uw, &frame).await?;
                     }
                 }
@@ -1675,6 +1797,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
             _ = stopped(stop) => return Err(RuntimeError::Stopped),
             result = tokio::time::timeout(REGISTRATION_TIMEOUT, registration) =>
                 result.unwrap_or(Err(RuntimeError::Timeout))?,
+        }
+        if let Some((reconnected, started)) = active_gap.take() {
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let _ = reconnected.send(duration_ms);
         }
         // The generation is online on its own: no local client is required.
         self.snapshot.send_modify(|snapshot| {

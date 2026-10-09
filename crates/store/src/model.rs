@@ -137,6 +137,22 @@ pub struct WatchRule {
     pub term: String,
 }
 
+/// Bounded durable account of one upstream observation gap. Sequence is a per-Network
+/// monotonic ordering anchor; timestamps and destinations are deliberately absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionGap {
+    pub sequence: u64,
+    pub duration_ms: Option<u64>,
+    pub disposition: ConnectionGapDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionGapDisposition {
+    Open,
+    Reconnected,
+    Interrupted,
+}
+
 impl std::fmt::Debug for WatchRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WatchRule")

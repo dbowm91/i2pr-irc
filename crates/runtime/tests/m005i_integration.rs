@@ -874,6 +874,16 @@ async fn an_upstream_that_hangs_up_is_replaced_far_inside_the_keepalive_interval
     let peer = runtime.bring_online(1, &["#room"]).await;
     let client = register(&runtime, NetworkId(1), SessionId(1), "").await;
     assert!(client.seen.contains("001 bot"), "the generation was live");
+    let prior_generation = runtime
+        .control
+        .diagnostics(Some(NetworkId(1)))
+        .await
+        .expect("initial diagnostics")
+        .networks
+        .into_iter()
+        .find(|entry| entry.network == NetworkId(1))
+        .expect("network diagnostics")
+        .generation;
 
     let started = std::time::Instant::now();
     runtime.drop_generation(peer).await;
@@ -885,6 +895,54 @@ async fn an_upstream_that_hangs_up_is_replaced_far_inside_the_keepalive_interval
     let elapsed = started.elapsed();
     runtime.upstreams.push(replacement);
     runtime.upstream_ends.push(Some(controller));
+
+    // Complete a deliberately small CAP exchange so registration success closes the
+    // monotonic outage interval in the durable ledger.
+    let replacement = runtime.upstreams.last_mut().expect("replacement stored");
+    replacement
+        .write_all(b":srv CAP * LS :message-tags\r\n")
+        .await
+        .expect("replacement offers CAP");
+    let requested = read_line(replacement).await;
+    assert!(requested.contains("CAP REQ"), "{requested}");
+    replacement
+        .write_all(b":srv CAP * ACK :message-tags\r\n")
+        .await
+        .expect("replacement acknowledges CAP");
+    assert!(read_line(replacement).await.contains("CAP END"));
+    replacement
+        .write_all(b":srv 001 bot :welcome\r\n")
+        .await
+        .expect("replacement welcomes");
+    tokio::time::timeout(CEILING, async {
+        loop {
+            let diagnostics = runtime
+                .control
+                .diagnostics(Some(NetworkId(1)))
+                .await
+                .expect("replacement diagnostics");
+            if diagnostics.networks[0].generation != prior_generation
+                && diagnostics.networks[0].last_connection_gap_disposition == Some("reconnected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement generation published");
+    let gaps = runtime
+        .store
+        .handle()
+        .load_connection_gaps(NetworkId(1))
+        .await
+        .expect("durable gap ledger");
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(
+        gaps[0].disposition,
+        i2pr_irc_store::ConnectionGapDisposition::Reconnected
+    );
+    assert!(gaps[0].duration_ms.is_some());
 
     assert!(
         elapsed < LIVENESS_INTERVAL,

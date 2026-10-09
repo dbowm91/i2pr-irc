@@ -767,7 +767,7 @@ async fn reconnect_churn_leaves_no_residue() {
 
     let fleet = Fleet::start(
         NETWORKS,
-        store_handle,
+        store_handle.clone(),
         scheduler.clone(),
         resources.clone(),
         provider.clone(),
@@ -814,5 +814,8 @@ async fn reconnect_churn_leaves_no_residue() {
     );
 
     fleet.shutdown().await;
+    // Gap-ledger writes are auxiliary bounded Store requests. Drain them before the
+    // resource-baseline assertion, which deliberately includes Store queue depth.
+    store_handle.flush().await.expect("gap requests drain");
     settle_within(&resources, &baseline).await;
 }

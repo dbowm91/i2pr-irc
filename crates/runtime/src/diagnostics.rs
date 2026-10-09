@@ -117,6 +117,10 @@ pub struct NetworkDiagnostics {
     /// The only one of the three that means data was lost. Reported next to its
     /// siblings so "zero recorded" can be distinguished from "everything was dropped".
     pub history_dropped: u64,
+    pub last_connection_gap_ms: Option<u64>,
+    pub last_connection_gap_disposition: Option<&'static str>,
+    pub connection_gaps_recorded: u64,
+    pub connection_gap_ledger_failures: u64,
     pub watch_hits: u64,
     pub watch_dropped: u64,
     pub upstream_rejected: u64,
@@ -253,6 +257,10 @@ pub fn project_network(
         history_recorded: snapshot.history_recorded,
         history_skipped: snapshot.history_skipped,
         history_dropped: snapshot.history_dropped,
+        last_connection_gap_ms: snapshot.last_connection_gap_ms,
+        last_connection_gap_disposition: snapshot.last_connection_gap_disposition,
+        connection_gaps_recorded: snapshot.connection_gaps_recorded,
+        connection_gap_ledger_failures: snapshot.connection_gap_ledger_failures,
         watch_hits: snapshot.watch_hits,
         watch_dropped: snapshot.watch_dropped,
         upstream_rejected: snapshot.upstream_rejected,
@@ -423,10 +431,8 @@ pub fn render_process(report: &ProcessDiagnostics) -> Vec<DiagnosticLine> {
 
 /// Renders one Network as exactly [`NETWORK_DIAGNOSTIC_LINES`] lines.
 ///
-/// Split in two because the whole of one Network does not fit one line, and split along the
-/// seam that separates "what state is this in" from "what is in it": an Operator scanning
-/// an incident reads the state line of every Network and descends to the detail line only
-/// when the state line told them something was wrong.
+/// State, counters, and lists each have a separate bounded line. Gap evidence leads the
+/// lists line so it remains visible when long channel samples force that line to truncate.
 pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
     let netid = crate::bouncer_networks::render_netid(report.network);
     vec![
@@ -504,7 +510,13 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
         tagged(
             "lists",
             &format!(
-                "acknowledged={} sample={} detached_sample={} reasons={}",
+                "gap_retained={} gap_disposition={} gap_duration_ms={} gap_ledger_failures={} acknowledged={} sample={} detached_sample={} reasons={}",
+                report.connection_gaps_recorded,
+                report.last_connection_gap_disposition.unwrap_or("none"),
+                report
+                    .last_connection_gap_ms
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                report.connection_gap_ledger_failures,
                 fingerprint_or_none(&report.upstream_capabilities),
                 join_or_none(&report.channels_sample),
                 join_or_none(&report.detached_sample),
@@ -696,6 +708,10 @@ mod tests {
                 history_recorded: 0,
                 history_skipped: 0,
                 history_dropped: 0,
+                last_connection_gap_ms: None,
+                last_connection_gap_disposition: None,
+                connection_gaps_recorded: 0,
+                connection_gap_ledger_failures: 0,
                 watch_hits: 0,
                 watch_dropped: 0,
                 upstream_rejected: 0,

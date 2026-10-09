@@ -19,6 +19,7 @@ pub mod bouncerserv;
 pub mod capability;
 pub mod catalog;
 pub mod chathistory;
+pub mod command_pacing;
 pub mod config_snapshot;
 pub mod control_session;
 pub mod controller;

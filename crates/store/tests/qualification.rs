@@ -6,19 +6,75 @@
 //! never depends on the same API that is under test.
 use i2pr_irc_core::{BufferId, I2pEndpoint, WallTime};
 use i2pr_irc_store::{
-    BufferKind, BufferRetentionPolicy, EventDirection, HistoryAround, HistoryEventId,
-    HistoryPrivacyPolicy, MAX_DISPLAY_NAME_BYTES, MAX_HISTORY_QUERY_EVENTS, MAX_SEARCH_BUFFERS,
-    MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS, MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent,
-    RegistrationActionKind, RegistrationActionPhase, RetentionRequest, SCHEMA_VERSION,
-    STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm, Store, StoreErrorKind,
-    StoreHandle, StoreHealth, StorePath, StoredRegistrationAction, StoredSecret, WatchMatchKind,
-    WatchRule, attached_channels, fallback_display_name,
+    BufferKind, BufferRetentionPolicy, ConnectionGapDisposition, EventDirection, HistoryAround,
+    HistoryEventId, HistoryPrivacyPolicy, MAX_DISPLAY_NAME_BYTES, MAX_HISTORY_QUERY_EVENTS,
+    MAX_SEARCH_BUFFERS, MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS, MsgidLookup, NetworkId,
+    NetworkRecord, NewHistoryEvent, RegistrationActionKind, RegistrationActionPhase,
+    RetentionRequest, SCHEMA_VERSION, STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm,
+    Store, StoreErrorKind, StoreHandle, StoreHealth, StorePath, StoredRegistrationAction,
+    StoredSecret, WatchMatchKind, WatchRule, attached_channels, fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
 use i2pr_irc_wire::IrcTimestamp;
 
 fn store_at(path: &std::path::Path) -> Store {
     Store::open(&StorePath::File(path.to_path_buf())).expect("store opens")
+}
+
+#[tokio::test]
+async fn connection_gap_ledger_is_ordered_bounded_and_uses_monotonic_durations() {
+    let store = Store::open(&StorePath::Memory).expect("store opens");
+    let handle = store.handle();
+    let network = NetworkId(1);
+    handle
+        .save_network(&record(1, &[]))
+        .await
+        .expect("network saves");
+    let sequence = handle
+        .begin_connection_gap(network)
+        .await
+        .expect("gap begins");
+    assert_eq!(sequence, 1);
+    assert!(
+        handle
+            .finish_connection_gap(network, sequence, 1234)
+            .await
+            .expect("gap closes")
+    );
+    assert!(
+        !handle
+            .finish_connection_gap(network, sequence, 2345)
+            .await
+            .expect("closed gap is immutable")
+    );
+    for _ in 0..65 {
+        handle
+            .begin_connection_gap(network)
+            .await
+            .expect("bounded gap begins");
+    }
+    let rows = store
+        .handle()
+        .load_connection_gaps(network)
+        .await
+        .expect("gap rows");
+    assert_eq!(rows.len(), 64);
+    assert_eq!(rows.last().expect("latest row").sequence, 66);
+    assert_eq!(
+        rows.last().expect("latest row").disposition,
+        ConnectionGapDisposition::Open
+    );
+    handle
+        .interrupt_open_connection_gaps(network)
+        .await
+        .expect("restarted owner closes unknown gap");
+    let interrupted = handle
+        .load_connection_gaps(network)
+        .await
+        .expect("interrupted gap rows");
+    assert!(interrupted.iter().all(|gap| {
+        gap.disposition == ConnectionGapDisposition::Interrupted && gap.duration_ms.is_none()
+    }));
 }
 
 fn record(network: u64, channels: &[&str]) -> NetworkRecord {
@@ -3140,6 +3196,7 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         10 => drop(testing::create_v10_database(path)),
         11 => drop(testing::create_v11_database(path)),
         12 => drop(testing::create_v12_database(path)),
+        13 => drop(testing::create_v13_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }

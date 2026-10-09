@@ -1,4 +1,4 @@
-//! Schema versions 1 through 13 and their transactional migration harness.
+//! Schema versions 1 through 14 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -23,8 +23,8 @@ use rusqlite::Connection;
 /// a fail-closed marker while stricter persistent ceilings prune existing history;
 /// version 11 records whether each event has a derived FTS row; version 12 adds bounded
 /// detached-channel activity policies, disabled for existing rows by default; version 13
-/// adds literal local watch rules, with no rules on upgrade.
-pub const SCHEMA_VERSION: i64 = 13;
+/// adds literal local watch rules; version 14 adds bounded connection-gap dispositions.
+pub const SCHEMA_VERSION: i64 = 14;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -446,6 +446,22 @@ pub(crate) fn schema_v13() -> String {
     format!("{}{}", schema_v12(), WATCH_RULES_V13)
 }
 
+pub(crate) fn schema_v14() -> String {
+    format!("{}{}", schema_v13(), CONNECTION_GAPS_V14)
+}
+
+const CONNECTION_GAPS_V14: &str = r#"
+CREATE TABLE connection_gaps (
+    network_id      INTEGER NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    sequence        INTEGER NOT NULL CHECK (sequence > 0),
+    duration_ms     INTEGER CHECK (duration_ms >= 0),
+    disposition     TEXT NOT NULL CHECK (disposition IN ('open','reconnected','interrupted')),
+    CHECK ((disposition = 'reconnected' AND duration_ms IS NOT NULL) OR
+           (disposition IN ('open','interrupted') AND duration_ms IS NULL)),
+    PRIMARY KEY (network_id, sequence)
+) STRICT;
+"#;
+
 const WATCH_RULES_V13: &str = r#"
 CREATE TABLE watch_rules (
     network_id      INTEGER NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
@@ -662,7 +678,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v13())
+                .execute_batch(&schema_v14())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -744,6 +760,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "registration_actions",
     "buffer_privacy",
     "watch_rules",
+    "connection_gaps",
 ];
 
 /// Indexes this build promises, beyond the presence of their table.
@@ -861,6 +878,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             10 => migrate_10_to_11(transaction)?,
             11 => migrate_11_to_12(transaction)?,
             12 => migrate_12_to_13(transaction)?,
+            13 => migrate_13_to_14(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -894,6 +912,14 @@ fn migrate_11_to_12(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
 
 fn migrate_12_to_13(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(WATCH_RULES_V13)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_13_to_14(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(CONNECTION_GAPS_V14)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;

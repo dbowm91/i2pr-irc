@@ -1115,6 +1115,107 @@ pub(crate) fn replace_watch_rules(
     tx.commit().map_err(|e| sql(e, CommitState::Unknown))
 }
 
+pub(crate) fn begin_connection_gap(
+    connection: &mut Connection,
+    network: NetworkId,
+) -> Result<u64, StoreError> {
+    let tx = connection
+        .transaction()
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let network_id = to_sql_id(network.0)?;
+    // A prior open record can only survive process/owner loss. Its duration is unknown;
+    // mark it interrupted rather than guessing across a clock or process boundary.
+    tx.execute("UPDATE connection_gaps SET disposition='interrupted' WHERE network_id=?1 AND disposition='open'", [network_id])
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let previous: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM connection_gaps WHERE network_id=?1",
+            [network_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let sequence = previous
+        .checked_add(1)
+        .ok_or_else(|| StoreError::new(StoreErrorKind::LimitExceeded("gap sequence")))?;
+    tx.execute("INSERT INTO connection_gaps(network_id,sequence,duration_ms,disposition) VALUES(?1,?2,NULL,'open')", params![network_id, sequence])
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    tx.execute(
+        "DELETE FROM connection_gaps WHERE network_id=?1 AND sequence <= ?2",
+        params![network_id, sequence.saturating_sub(64)],
+    )
+    .map_err(|e| sql(e, CommitState::RolledBack))?;
+    tx.commit().map_err(|e| sql(e, CommitState::Unknown))?;
+    u64::try_from(sequence).map_err(|_| StoreError::new(StoreErrorKind::Corrupt("gap sequence")))
+}
+
+pub(crate) fn finish_connection_gap(
+    connection: &mut Connection,
+    network: NetworkId,
+    sequence: u64,
+    duration_ms: u64,
+) -> Result<bool, StoreError> {
+    let sequence = i64::try_from(sequence)
+        .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("gap sequence")))?;
+    let duration_ms = i64::try_from(duration_ms)
+        .map_err(|_| StoreError::new(StoreErrorKind::LimitExceeded("gap duration")))?;
+    let changed = connection.execute(
+        "UPDATE connection_gaps SET duration_ms=?1,disposition='reconnected' WHERE network_id=?2 AND sequence=?3 AND disposition='open'",
+        params![duration_ms, to_sql_id(network.0)?, sequence],
+    ).map_err(|e| sql(e, CommitState::Unknown))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn load_connection_gaps(
+    connection: &Connection,
+    network: NetworkId,
+) -> Result<Vec<ConnectionGap>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT sequence,duration_ms,disposition FROM connection_gaps WHERE network_id=?1 ORDER BY sequence DESC LIMIT 64"
+    ).map_err(|e| sql(e, CommitState::RolledBack))?;
+    let rows = statement
+        .query_map([to_sql_id(network.0)?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        let (sequence, duration, disposition) = row.map_err(|e| sql(e, CommitState::RolledBack))?;
+        gaps.push(ConnectionGap {
+            sequence: from_sql_id(sequence)?,
+            duration_ms: duration
+                .map(|value| {
+                    u64::try_from(value)
+                        .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("gap duration")))
+                })
+                .transpose()?,
+            disposition: match disposition.as_str() {
+                "open" => ConnectionGapDisposition::Open,
+                "reconnected" => ConnectionGapDisposition::Reconnected,
+                "interrupted" => ConnectionGapDisposition::Interrupted,
+                _ => return Err(StoreError::new(StoreErrorKind::Corrupt("gap disposition"))),
+            },
+        });
+    }
+    gaps.reverse();
+    Ok(gaps)
+}
+
+pub(crate) fn interrupt_open_connection_gaps(
+    connection: &Connection,
+    network: NetworkId,
+) -> Result<usize, StoreError> {
+    connection
+        .execute(
+            "UPDATE connection_gaps SET disposition='interrupted' WHERE network_id=?1 AND disposition='open'",
+            [to_sql_id(network.0)?],
+        )
+        .map_err(|e| sql(e, CommitState::Unknown))
+}
+
 fn direction_code(kind: BufferKind) -> i64 {
     match kind {
         BufferKind::Channel => 0,

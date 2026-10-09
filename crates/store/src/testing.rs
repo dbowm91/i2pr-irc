@@ -25,11 +25,12 @@ use std::{
 /// The table *set* has been identical across every schema version so far; only the
 /// representation of `history_events.server_time` and `networks.display_name` changed,
 /// and only `desired_channels` gained a column.
-pub const EXPECTED_TABLES: [&str; 12] = [
+pub const EXPECTED_TABLES: [&str; 13] = [
     "buffer_privacy",
     "buffers",
     "client_cursors",
     "clients",
+    "connection_gaps",
     "desired_channels",
     "history_events",
     // The FTS5 search side index. Its shadow tables are SQLite's own storage and are
@@ -281,6 +282,21 @@ pub fn create_v12_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 12)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 13, immediately before connection-gap records.
+pub fn create_v13_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v13())
+        .expect("schema 13 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 13)
         .expect("user_version is writable");
     connection
 }

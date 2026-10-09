@@ -27,11 +27,11 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 8
+## Schema version 14
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
-`SCHEMA_VERSION` is 8. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every database written since M002 migrates forward in place rather than being refused.
+`SCHEMA_VERSION` is 14. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every supported older database migrates forward in place rather than being refused.
 
 | Table | Purpose |
 |---|---|
@@ -45,6 +45,7 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 | `read_markers` | per-`BufferId` operator read state |
 | `registration_actions` | ordered phased registration-action list, one row per Network position |
 | `history_search` | FTS5 **side index** over searchable history; `history_events` remains the source of truth |
+| `connection_gaps` | latest bounded sequence of observation-gap dispositions and monotonic durations |
 
 `history_search` is a virtual table, so its `…_data`, `…_idx`, `…_docsize`, `…_content`
 and `…_config` shadow tables are excluded from the promised set: they are SQLite's own
@@ -268,6 +269,14 @@ A version newer than `SCHEMA_VERSION` is refused at startup. A version between `
 `PRAGMA` settings at open: `foreign_keys=ON`, `journal_mode=WAL`, `synchronous=FULL`, and a bounded `busy_timeout` of 5s so lock contention fails explicitly instead of parking a thread. Relaxing `synchronous` needs measured evidence and a separate reviewed decision.
 
 Corrupt durable rows are rejected with the same domain validation applied to fresh input. The store never synthesizes a plausible default, because silently repairing an identity is worse than refusing to start.
+
+### Version 14 connection gaps
+
+Version 14 adds `connection_gaps`: at most 64 rows per Network, ordered by an increasing
+sequence. Rows contain only an optional monotonic elapsed duration and one of `open`,
+`reconnected`, or `interrupted`. The Store keeps no wall-clock claim, endpoint, or message
+payload. A later gap converts any prior open row to `interrupted`, whose duration remains
+unknown. Network deletion cascades the records with the rest of that Network's data.
 
 ## Desired versus observed state
 

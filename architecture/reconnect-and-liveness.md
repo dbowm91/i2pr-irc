@@ -14,6 +14,21 @@ Backoff bounds how often *one* Network retries. It does nothing about the case t
 actually hurts on a router restart, where every Network fails together and retries together.
 A process-wide `ReconnectScheduler` gates that separately — see `reconnect-budget.md`.
 
+After registration, restoration of phased setup actions and desired JOINs uses a shared
+FIFO command pacer at ten commands per second across the process. This makes a large
+channel restore gradual and gives another Network already waiting for a recovery slot a
+turn. PING/PONG and online control traffic bypass this recovery gate. The gate carries no
+user chat; normal and control queues remain generation-fenced, and user PRIVMSG/NOTICE is
+never replayed after a failed connection.
+
+Each failed observation period has a bounded durable sequence record in the encrypted
+Store. Its duration is measured from monotonic process time and is finalized only after
+the next registration succeeds. No endpoint, wall-clock guess, or payload is stored. An
+open record left by process/owner loss is marked `interrupted` with unknown duration when
+the next gap starts, rather than estimating time across a restart. The Store retains the
+latest 64 rows per Network; failures to write the ledger have their own diagnostic count
+and do not increment history-ingestion-loss counters.
+
 ## Reclaim is a generation clock, and registration can end the generation
 
 Registration handles `433`/`436` and a qualified `437` inside the registration loop, so a nickname collision is answered in the same window as the refusal rather than by waiting out the 180-second registration ceiling. `432` remains a permanent configuration/registration refusal. Exhausting the bounded fallback sequence ends that generation and schedules a 15-minute minimum retry with deterministic positive jitter; the owner releases its connect permit before waiting and reacquires through the process-wide scheduler after the cooldown. Nick occupation does not permanently mark the Network terminal. See [presence and preferred-nick policy](presence-and-nick.md).

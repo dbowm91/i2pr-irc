@@ -78,6 +78,24 @@ pub const STORE_BUSY_TIMEOUT_MS: u32 = 5_000;
 /// One typed store operation. The variant set is closed: a caller cannot submit SQL
 /// text or a closure, so network input can never reach the database engine directly.
 enum Request {
+    BeginConnectionGap {
+        network: NetworkId,
+        reply: Reply<Result<u64, StoreError>>,
+    },
+    FinishConnectionGap {
+        network: NetworkId,
+        sequence: u64,
+        duration_ms: u64,
+        reply: Reply<Result<bool, StoreError>>,
+    },
+    LoadConnectionGaps {
+        network: NetworkId,
+        reply: Reply<Result<Vec<ConnectionGap>, StoreError>>,
+    },
+    InterruptOpenConnectionGaps {
+        network: NetworkId,
+        reply: Reply<Result<usize, StoreError>>,
+    },
     LoadNetworks(Reply<Result<Vec<NetworkRecord>, StoreError>>),
     SaveNetwork {
         record: Box<NetworkRecord>,
@@ -250,6 +268,22 @@ pub struct StoreHandle {
 }
 
 impl StoreHandle {
+    /// Queues the owner-startup gap disposition without waiting for the worker. The
+    /// returned response can be observed in the background while network startup proceeds.
+    pub fn enqueue_interrupt_open_connection_gaps(
+        &self,
+        network: NetworkId,
+    ) -> Result<oneshot::Receiver<Result<usize, StoreError>>, StoreError> {
+        if self.shared.closing.load(Ordering::Acquire) {
+            return Err(StoreError::new(StoreErrorKind::Stopped));
+        }
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .try_send(Request::InterruptOpenConnectionGaps { network, reply })
+            .map_err(|_| StoreError::new(StoreErrorKind::QueueOverloaded))?;
+        Ok(response)
+    }
+
     /// Submits one typed request across the bounded ingress queue.
     ///
     /// Returns immediately when the queue is full rather than awaiting capacity, so a
@@ -280,6 +314,41 @@ impl StoreHandle {
 
     pub async fn load_networks(&self) -> Result<Vec<NetworkRecord>, StoreError> {
         self.submit(Request::LoadNetworks).await
+    }
+    /// Starts one durable observation-gap record. Only ordering and outcome are stored.
+    pub async fn begin_connection_gap(&self, network: NetworkId) -> Result<u64, StoreError> {
+        self.submit(|reply| Request::BeginConnectionGap { network, reply })
+            .await
+    }
+    /// Closes a gap using a monotonic elapsed duration from the owning process.
+    pub async fn finish_connection_gap(
+        &self,
+        network: NetworkId,
+        sequence: u64,
+        duration_ms: u64,
+    ) -> Result<bool, StoreError> {
+        self.submit(|reply| Request::FinishConnectionGap {
+            network,
+            sequence,
+            duration_ms,
+            reply,
+        })
+        .await
+    }
+    pub async fn load_connection_gaps(
+        &self,
+        network: NetworkId,
+    ) -> Result<Vec<ConnectionGap>, StoreError> {
+        self.submit(|reply| Request::LoadConnectionGaps { network, reply })
+            .await
+    }
+    /// Marks records left open by a prior owner/process lifetime as interrupted.
+    pub async fn interrupt_open_connection_gaps(
+        &self,
+        network: NetworkId,
+    ) -> Result<usize, StoreError> {
+        self.submit(|reply| Request::InterruptOpenConnectionGaps { network, reply })
+            .await
     }
     pub async fn save_network(&self, record: &NetworkRecord) -> Result<SavedNetwork, StoreError> {
         self.submit(|reply| Request::SaveNetwork {
@@ -810,6 +879,27 @@ macro_rules! answer {
 /// Runs one request against the owned connection.
 fn execute(connection: &mut Connection, request: Request) {
     match request {
+        Request::BeginConnectionGap { network, reply } => {
+            answer!(reply, ops::begin_connection_gap(connection, network))
+        }
+        Request::FinishConnectionGap {
+            network,
+            sequence,
+            duration_ms,
+            reply,
+        } => answer!(
+            reply,
+            ops::finish_connection_gap(connection, network, sequence, duration_ms)
+        ),
+        Request::LoadConnectionGaps { network, reply } => {
+            answer!(reply, ops::load_connection_gaps(connection, network))
+        }
+        Request::InterruptOpenConnectionGaps { network, reply } => {
+            answer!(
+                reply,
+                ops::interrupt_open_connection_gaps(connection, network)
+            )
+        }
         Request::LoadNetworks(reply) => answer!(reply, ops::load_networks(connection)),
         Request::SaveNetwork { record, reply } => {
             answer!(reply, ops::save_network(connection, &record))

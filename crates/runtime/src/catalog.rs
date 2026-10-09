@@ -277,6 +277,8 @@ pub struct NetworkCatalog {
     /// supervised Networks and the router: each one's backoff is deliberately
     /// independent, so without a shared gate a shared outage becomes a connect stampede.
     reconnect: ReconnectScheduler,
+    /// Shared FIFO gate for post-registration recovery traffic.
+    command_pacer: crate::command_pacing::CommandPacer,
     /// Process-wide bounded resource accounting.
     ///
     /// Also process-wide by necessity: proving that a many-Network campaign settled back
@@ -303,6 +305,7 @@ impl NetworkCatalog {
             statuses,
             sessions: SessionIdAllocator::new(),
             reconnect,
+            command_pacer: crate::command_pacing::CommandPacer::default(),
             resources,
         }
     }
@@ -310,6 +313,10 @@ impl NetworkCatalog {
     /// The process-wide connect budget every supervised Network is gated by.
     pub fn reconnect(&self) -> &ReconnectScheduler {
         &self.reconnect
+    }
+
+    pub fn command_pacer(&self) -> &crate::command_pacing::CommandPacer {
+        &self.command_pacer
     }
 
     /// Ingress depth of the store worker, read live.

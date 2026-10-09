@@ -1,6 +1,6 @@
 # Plan 059 — M012-A — IRC Command Pacing and Connection-Gap Evidence
 
-Status: ready
+Status: closing
 Date: 2026-10-09
 Class: invariant + capability
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -40,7 +40,7 @@ Mass restore of >50 channels, Eggchaos latency stalls, simultaneous Networks, pr
 Run focused tests, `sh scripts/verify.sh full`, and `rustup run 1.88.0 sh scripts/verify.sh full` where installed; document environment blockers instead of claiming green. Cover deterministic partial I/O, router stall/restart and low-resource SBC budgets. Real-world server capability claims require permitted/sanitized live IRC transcripts; a fake test server cannot prove IRC2P/ILITA deployments.
 
 ## Acceptance criteria
-No burst beyond documented limits; liveness unaffected; each uncertain outage recorded without manufacturing history.
+Recovery setup is limited to ten commands per second process-wide with FIFO turn-taking across Networks; liveness/control bypass the recovery gate. Outage records use a bounded sequence and monotonic elapsed duration, are separate from Store/history loss counters, and unknown intervals across process restart remain explicitly interrupted. The production rate is a fixed safe default; no operator knob was added without a registered configuration contract.
 
 ## Stop conditions and closure record
 Stop and register a numbered corrective on unbounded behavior, material anonymity/credential leak, unauthorized connector, false IRCv3 advertisement, incorrect history integrity, or incompatible migrations. Produce `plans/closure/irc-enhancements/059-status.md` with exact implementation and closure SHAs, test names, commands actually executed, requirement-to-evidence matrix, security and restart analysis, upstream capability qualifications, open findings and registry/roadmap disposition. Do not claim closure until evidence is committed.
