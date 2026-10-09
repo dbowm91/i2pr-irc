@@ -1,6 +1,6 @@
 # Plan 057 — M011-C — ZNC-Style Local Watch and Highlight Rules
 
-Status: active
+Status: closed
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md

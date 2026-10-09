@@ -1,6 +1,6 @@
 # Plan 058 — M011-D — Integrated Privacy Policy Qualification and M011 Closure
 
-Status: proposed
+Status: ready
 Date: 2026-10-09
 Class: qualification + closure
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -15,7 +15,7 @@ Verify the complete privacy/visibility/watch system against adversarial traffic,
 
 ## Readiness and dependencies
 Plans 055–057 closed with evidence; M010 integration only needed for the specific product-path claims being made.
-Only Plan 055 is currently marked ready. Promoting this plan to ready requires proof its named predecessor is closed and a fresh source/dependency check. Separate M010 live product-path blocker does not falsely mark these core-only designs closed.
+Plans 055-057 are closed with committed evidence at their named closure records. Fresh source review confirms the Store/privacy policy, detached activity, owner-observed watch handling, per-ClientId cursors, and bounded fake-upstream integration surfaces needed for this cross-feature qualification are present. M010 live product-path evidence is independent and does not block core-only testing or closure.
 
 ## Existing code/evidence and required invariant
 Independent subsystem passing tests do not prove cross-subsystem closure, as M005-I found with reconnect scheduler/snapshot defects.
