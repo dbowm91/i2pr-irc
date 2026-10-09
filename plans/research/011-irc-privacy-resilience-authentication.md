@@ -27,6 +27,14 @@ Which ZNC/soju/IRCv3 mechanisms add operator value under I2P anonymity constrain
 - IRCv3 message redaction: https://ircv3.net/specs/extensions/message-redaction — draft, display-level not forensic erasure.
 - I2P IRC guide: https://i2p.net/en/docs/applications/irc/ — IRC2P/ILITA destination examples, default non-TLS I2P transport. These examples do NOT independently prove current live SASL capabilities or their server-service equivalence.
 
+### Plan 060 CHATHISTORY preflight (2026-10-09)
+
+Reviewed the current official [IRCv3 CHATHISTORY specification](https://ircv3.net/specs/extensions/chathistory.html) and [BATCH specification](https://ircv3.net/specs/extensions/batch). CHATHISTORY remains work in progress and explicitly warns against production use, so this repository may only attempt the exact `draft/chathistory` name when the active IRCd offers and ACKs it; it must never infer support from a network profile or downstream client capability. Full support depends on upstream `batch`, `server-time`, and `message-tags`; `MSGREFTYPES` governs whether `msgid=` or `timestamp=` anchors are accepted. A successful history response uses a `chathistory` batch with a canonical target, each content line carries the `batch` tag, and the batch must close. The batch reference is opaque and case-sensitive. `draft/event-playback` is a separate optional feature and is not needed for message-only catch-up.
+
+The spec permits variable response counts and implementation-defined ordering; timestamps can skew across servers. Recovery therefore needs bounded pages, a stable previously retained `msgid` anchor when available, local HistoryEventId order, and explicit unresolved-gap status when references or messages are unavailable. Channel membership/authorization and direct-message account identity remain server policy; a numeric or empty reply is not proof that the history was complete. A compliant server should refuse inaccessible history with standard errors such as `INVALID_TARGET` or `MESSAGE_ERROR`. Local no-history and ephemeral policies remain stronger than any upstream replay offer.
+
+This review is enough to implement a conditional protocol adapter behind direct upstream capability negotiation and exact-wire fixtures. It does not establish that IRC2P or ILITA currently advertises/authorizes CHATHISTORY; no live transcript was collected, and no deployed-network support claim is made.
+
 ## Compatibility profiles and confidence
 
 **IRC2P:** intended default is plain IRC carried via I2P, CAP absent/partial tolerated, SASL not required, and optional credentialed NickServ identification/reclaim via the existing constrained phased service actions. This is operator-specified interoperability intent; validate with authorized server responses, do not assert every federated node behaves identically. No TLS or SASL fallback automatically activated.

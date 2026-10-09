@@ -1,5 +1,5 @@
 # IRC Privacy, Resilience and Compatibility Roadmap
-Status: M011 closed; M012–M013 remain registered planning tracks; Plans 055-058 are closed and Plan 059 is ready.
+Status: M011 closed; M012 in progress; Plans 055-059 are closed and Plan 060 is ready.
 Research: plans/research/011-irc-privacy-resilience-authentication.md
 ADRs: ADR-0008 and ADR-0009; all prior accepted ADRs remain binding.
 Baseline: work/plans-050-054-m010-standalone (M010-E Plan 054 active).
@@ -15,8 +15,8 @@ M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 act
   -> M011-B / 056 detached activity policy [closed]
   -> M011-C / 057 local watch and notification [closed]
   -> M011-D / 058 integration/closure [closed]
-  -> M012-A / 059 IRC pacing and upstream gap records [ready]
-  -> M012-B / 060 conditional upstream history reconciliation [proposed after 059; server-capability research-gated]
+  -> M012-A / 059 IRC pacing and upstream gap records [closed]
+  -> M012-B / 060 conditional upstream history reconciliation [ready after specification preflight; live support remains unqualified]
   -> M012-C / 061 verified same-network I2P endpoint failover [proposed after 060]
   -> M012-D / 062 resilience closure [proposed after 061]
   -> M013-A / 063 named network auth profiles [proposed after 062]
@@ -27,7 +27,7 @@ M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 act
 ## Milestone exits
 M011: privacy mode controls every durable/in-memory ingestion and query path, including FTS/OTR/detached, with migration, resource and multi-client tests; notifications remain local, bounded and off by default.
 
-M012: no connection storm, no JOIN/service command burst beyond bounds, truthful gap visibility, optional server-supported upstream catch-up that never fabricates history or replays chat, and failover only across operator-declared/verified trust-equivalent I2P servers.
+M012: no connection storm, no JOIN/service command burst beyond bounds, truthful gap visibility, optional server-supported upstream catch-up that never fabricates history or replays chat, and failover only across operator-declared/verified trust-equivalent I2P servers. Plan 059 closes pacing and gap evidence. Plans 060 and 061 may remain conditional/deferred if server capability or network-equivalence evidence is unavailable.
 
 M013: IRC2P NickServ/no-SASL and ILITA explicitly configured SASL PLAIN profiles work without TLS and fail closed on incompatible authentication; IRCv3 capability claims are truthful; optional TLS-over-I2P/EXTERNAL proves certificate identity handling within I2P or is recorded as deferred, never falsely shipped. There is no clearnet override.
 

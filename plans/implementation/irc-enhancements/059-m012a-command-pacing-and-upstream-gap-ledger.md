@@ -1,6 +1,6 @@
 # Plan 059 — M012-A — IRC Command Pacing and Connection-Gap Evidence
 
-Status: closing
+Status: closed
 Date: 2026-10-09
 Class: invariant + capability
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md

@@ -1,6 +1,6 @@
 # Plan 060 — M012-B — Optional Upstream CHATHISTORY Catch-Up
 
-Status: proposed; feature research-gated
+Status: ready; live server support remains unqualified
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -14,8 +14,9 @@ Closure evidence location: plans/closure/irc-enhancements/060-status.md
 Retrieve missed upstream messages only when the active IRCd advertises compatible CHATHISTORY and the Network has a verifiable history anchor.
 
 ## Readiness and dependencies
-Plan 059 closed; initial implementation can use exact-wire test server, live compatibility claims require authorized supported server.
-Only Plan 055 is currently marked ready. Promoting this plan to ready requires proof its named predecessor is closed and a fresh source/dependency check. Separate M010 live product-path blocker does not falsely mark these core-only designs closed.
+Plan 059 is closed. The official CHATHISTORY and BATCH specification preflight is recorded in Research 011, and fresh source review confirms the owner, capability, BATCH, tag, Store-history, and privacy-policy interfaces needed for this conditional feature. Initial implementation can use an exact-wire test server and will activate only on direct upstream `draft/chathistory` negotiation. The separate M010 live product-path blocker does not gate core implementation; live compatibility claims still require an authorized supported server.
+
+The CHATHISTORY draft warns against production use. This plan implements only the exact draft CAP name when directly offered and ACKed, with bounded failure behavior. It does not claim IRC2P/ILITA deployment support and must not request the unprefixed capability absent a final spec.
 
 ## Existing code/evidence and required invariant
 The current local CHATHISTORY server adapter answers downstream from bouncer Store; it does not imply upstream IRCd supports replay. IRC2P/ILITA capabilities must not be presumed.
