@@ -2,7 +2,7 @@
 
 Status: closing
 Implementation commit: `2ebf576` — `feat(runtime): implement detached channel activity policy`
-Closure commit: pending
+Closure commit: `3b0decb` — `docs(plans): close IRC activity policy plan 056`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
