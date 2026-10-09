@@ -1,6 +1,6 @@
 # Plan 058 — M011-D — Integrated Privacy Policy Qualification and M011 Closure
 
-Status: active
+Status: closed
 Date: 2026-10-09
 Class: qualification + closure
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md

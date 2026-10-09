@@ -1,6 +1,6 @@
 # Plan 059 — M012-A — IRC Command Pacing and Connection-Gap Evidence
 
-Status: proposed
+Status: ready
 Date: 2026-10-09
 Class: invariant + capability
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -15,7 +15,7 @@ Prevent bursty post-registration JOIN/service commands and expose truthful perio
 
 ## Readiness and dependencies
 M011 closed; R001 provider already exists; no R002 requirement.
-Only Plan 055 is currently marked ready. Promoting this plan to ready requires proof its named predecessor is closed and a fresh source/dependency check. Separate M010 live product-path blocker does not falsely mark these core-only designs closed.
+Plan 058 is closed with committed M011 evidence. Fresh source review confirms a single generation-owned NetworkOwner, typed/bounded upstream command queues, ordered bounded registration actions, generation fencing, the process-wide reconnect scheduler, and sanitized owner diagnostics are available. The shared post-registration pacing policy and durable connection-gap ledger remain this plan's implementation scope. M010 live product-path evidence and i2pr R002 are independent and do not block core-only work.
 
 ## Existing code/evidence and required invariant
 Existing `ReconnectScheduler` gates connection establishment but `architecture/reconnect-and-liveness.md` does not provide one shared post-registration command pacing policy.
