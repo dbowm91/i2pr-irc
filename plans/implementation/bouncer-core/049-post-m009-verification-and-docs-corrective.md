@@ -1,6 +1,8 @@
 # Bouncer Core Corrective 049 — Post-M009 Verification and Documentation Reconciliation
 
-Status: ready for handoff
+Status: closed
+
+Closure record: plans/closure/bouncer-core/049-status.md
 
 Repository baseline:
 
