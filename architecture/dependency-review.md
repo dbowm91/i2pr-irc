@@ -1,6 +1,6 @@
 # Dependency review
 
-Rust 1.88 / edition 2024 is the workspace floor. Production dependencies are Tokio (async runtime, synchronization and byte I/O), async-trait (provider object contract), thiserror (typed errors), base64 (SASL PLAIN wire encoding), zeroize (credential and store-key cleanup), and rusqlite (the M003 storage boundary). Wire has no dependencies. `rusqlite 0.40.2` uses `default-features = false` with `bundled-sqlcipher-vendored-openssl`: `libsqlite3-sys 0.38.2` bundles SQLCipher 4.14.0 Community Edition (SQLite 3.51.3, FTS5 enabled) and compiles OpenSSL 3.6.3 from source. This keeps runtime behavior independent of host SQLite/OpenSSL installations, at the cost of a larger native build and binary. SQLCipher CE is BSD-3-Clause; OpenSSL 3 is Apache-2.0; rusqlite/libsqlite3-sys are MIT. The normal dependency tree adds `openssl-sys 0.9.117`; vendored OpenSSL build dependencies remain build-time only and the build does not fetch source at runtime. `cargo tree --workspace` is reviewed, and `scripts/check-network-boundary.py` checks the `core`, `wire`, `store`, `runtime`, and `testkit` normal/build/dev dependency trees with positive controls. The store is included because it introduces a third-party native dependency, and its positive control proves the store's source and manifest scope independently.
+Rust 1.88 / edition 2024 is the workspace floor. Production dependencies are Tokio (async runtime, synchronization and byte I/O), async-trait (provider object contract), thiserror (typed errors), base64 (SASL PLAIN wire encoding), zeroize (credential and store-key cleanup), SHA-256 and constant-time digest comparison for generated local tokens, and rusqlite (the M003 storage boundary). Wire has no dependencies. `rusqlite 0.40.2` uses `default-features = false` with `bundled-sqlcipher-vendored-openssl`: `libsqlite3-sys 0.38.2` bundles SQLCipher 4.14.0 Community Edition (SQLite 3.51.3, FTS5 enabled) and compiles OpenSSL 3.6.3 from source. This keeps runtime behavior independent of host SQLite/OpenSSL installations, at the cost of a larger native build and binary. SQLCipher CE is BSD-3-Clause; OpenSSL 3 is Apache-2.0; rusqlite/libsqlite3-sys are MIT. The normal dependency tree adds `openssl-sys 0.9.117`; vendored OpenSSL build dependencies remain build-time only and the build does not fetch source at runtime. `cargo tree --workspace` is reviewed, and `scripts/check-network-boundary.py` checks the daemon, `core`, `wire`, `store`, `runtime`, and `testkit` normal/build/dev dependency trees with positive controls. The daemon's local socket exception is confined to typed numeric loopback bind/accept; the store is included because it introduces a third-party native dependency, and its positive control proves the store's source and manifest scope independently.
 
 
 ## R001-B: the SAM adapter crate
@@ -13,10 +13,10 @@ Both were reviewed before being added.
 Plan 050 adds `fs2` 0.4 for nonblocking advisory exclusive state-directory ownership. Its
 MSRV is below Rust 1.88 and it uses the platform's file-lock API without an unsafe
 first-party boundary. The lock is held by an open file descriptor for the complete
-Store/Runtime lifetime; stale file contents are never treated as ownership. The daemon
-uses Tokio's existing `net` feature only in the already-authorized SAM crate; daemon
-signal handling adds only Tokio's `signal` feature. No listener or generic socket
-authority is introduced by this milestone.
+Store/Runtime lifetime; stale file contents are never treated as ownership. Tokio `net`
+is used by the SAM crate and by the daemon's loopback listener; daemon signal handling
+uses Tokio's `signal` feature. The source guard confines daemon socket authority to
+numeric loopback bind/accept.
 
 ### `tokio` `net` feature
 
@@ -54,6 +54,16 @@ something protocol tests have to route around.
 
 The licence and MSRV were read from the vendored source before the dependency was added:
 `~/.cargo/registry/src/*/getrandom-0.3.4/Cargo.toml` and its `LICENSE-APACHE`.
+
+### Standalone credential verification and private paths
+
+Plan 053 adds `sha2` for a verifier digest of the 256-bit generated local bearer token,
+`subtle` for constant-time digest comparison, and Unix-only `nix`'s safe effective-UID
+wrapper for ownership checks. The digest does not derive identity or the independent
+SQLCipher key. Verifier and key files use mode 0600 under a mode 0700 state directory.
+Secure initialization and daemon startup reject non-Unix platforms until an ACL
+implementation is qualified. `sha2` and `subtle` add no network or native build authority;
+`nix` is target-scoped to Unix with only its `user` feature enabled.
 
 ### What this crate does not add
 
