@@ -1,5 +1,5 @@
 # IRC Privacy, Resilience and Compatibility Roadmap
-Status: M011–M013 registered planning track; Plan 055 is the first ready handoff.
+Status: M011–M013 registered planning track; Plan 055 is active, with successor plans dependency-gated.
 Research: plans/research/011-irc-privacy-resilience-authentication.md
 ADRs: ADR-0008 and ADR-0009; all prior accepted ADRs remain binding.
 Baseline: work/plans-050-054-m010-standalone (M010-E Plan 054 active).
@@ -11,7 +11,7 @@ M010 standalone qualification and R002 managed-app interfaces remain independent
 
 ## Dependency graph
 M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 active)
-  -> M011-A / 055 buffer privacy + migrations [ready]
+  -> M011-A / 055 buffer privacy + migrations [active]
   -> M011-B / 056 detached activity policy [proposed after 055]
   -> M011-C / 057 local watch and notification [proposed after 056]
   -> M011-D / 058 integration/closure [proposed after 057]

@@ -46,7 +46,7 @@ Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemo
 
 | Milestone | Plan | Status | Handoff |
 |---|---|---|---|
-| M011-A | 055 — per-buffer privacy, bounded ephemeral/no-history | ready | plans/implementation/irc-enhancements/055-m011a-buffer-retention-modes-and-schema.md |
+| M011-A | 055 — per-buffer privacy, bounded ephemeral/no-history | active | plans/implementation/irc-enhancements/055-m011a-buffer-retention-modes-and-schema.md |
 | M011-B | 056 — activity-based detached policy | proposed after 055 | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
 | M011-C | 057 — local watch/highlight notifications | proposed after 056 | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
 | M011-D | 058 — integrated privacy closure | proposed after 057 | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
@@ -193,4 +193,4 @@ M010 is registered as a standalone-productization workstream after Research 010 
 
 ## Post-M010 IRC enhancement handoff
 
-Research 011, ADR-0008, ADR-0009, and Plans 055-066 are committed on work/plans-055-066-irc-privacy-resilience. Plan 055 is first ready. No code implementation or milestone closure is claimed. Preserve original I2P-only network boundary and the independently active M010-E/054 status.
+Research 011, ADR-0008, ADR-0009, and Plans 055-066 are committed on work/plans-055-066-irc-privacy-resilience. Plan 055 has an active partial implementation in `88cc10f`; ephemeral runtime retention and runtime/operator controls remain open, so no closure or successor readiness is claimed. Preserve original I2P-only network boundary and the independently active M010-E/054 status.
