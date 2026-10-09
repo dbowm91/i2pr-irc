@@ -1,6 +1,6 @@
 # Standalone Daemon and Local Access Roadmap
 
-Status: M010 in progress; M010-A/Plan 050 through M010-C/Plan 052 closed; M010-D/Plan 053 active; Plan 054 dependency-gated
+Status: M010 in progress; M010-A/Plan 050 through M010-D/Plan 053 closed; M010-E/Plan 054 active with controlled live-service evidence blocker
 Canonical direction: plans/000-long-term-specification.md; plans/002-long-term-roadmap.md; plans/003-planning-process.md
 Research: plans/research/010-m010-standalone-daemon-local-access-and-bootstrap.md
 Decision authority: plans/adrs/ADR-0007-local-authentication-and-standalone-process-boundary.md, ADR-0001, ADR-0003, ADR-0006
@@ -51,10 +51,10 @@ Plan 051 / M010-B [closed] auth-aware local acceptance + guard
 Plan 052 / M010-C [closed] IRC registration checkpoint + stable profiles
              |
              v
-Plan 053 / M010-D [proposed; waits on 052] secure initialization, key/credential UX
+Plan 053 / M010-D [closed] secure initialization, key/credential UX
              |
              v
-Plan 054 / M010-E [proposed; waits on 053] production integration and closure
+Plan 054 / M010-E [active; controlled live IRC endpoint unavailable] production integration and closure
 
 Acceptance of ADR-0007 and Research 010 satisfies the design gate. Subsequent plans become ready only after the preceding plan's closure, with concrete failure evidence reconciled. No future plan is allowed to claim active concurrently merely because it is documented.
 
@@ -89,8 +89,8 @@ If tests show incorrect auth state transfer or permission ambiguity, do not mark
 | M010-A | closed | plans/implementation/standalone/050-m010a-daemon-runtime-bootstrap.md | plans/closure/standalone/050-status.md |
 | M010-B | closed | plans/implementation/standalone/051-m010b-local-listener-and-authentication.md | plans/closure/standalone/051-status.md |
 | M010-C | closed | plans/implementation/standalone/052-m010c-registration-handoff-client-profiles.md | plans/closure/standalone/052-status.md |
-| M010-D | active | plans/implementation/standalone/053-m010d-secure-init-and-key-provisioning.md | plans/closure/standalone/053-status.md |
-| M010-E | proposed; depends on 053 closure | plans/implementation/standalone/054-m010e-product-integration-and-closure.md | plans/closure/standalone/054-status.md |
+| M010-D | closed | plans/implementation/standalone/053-m010d-secure-init-and-key-provisioning.md | plans/closure/standalone/053-status.md |
+| M010-E | active; operational evidence blocker | plans/implementation/standalone/054-m010e-product-integration-and-closure.md | plans/closure/standalone/054-status.md |
 
 ## 10. Completion definition
 

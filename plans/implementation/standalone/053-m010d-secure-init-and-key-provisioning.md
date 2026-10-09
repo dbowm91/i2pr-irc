@@ -1,6 +1,6 @@
 # Standalone M010-D / Plan 053 — Secure Initialization and Key Provisioning
 
-Status: active — Plan 052 closed; Plan 054 remains sequentially gated
+Status: closed — see `plans/closure/standalone/053-status.md`; Plan 054 promoted to active with a live-service evidence blocker
 Repository baseline for planning: f325e7d5e495e36b1fc7b168c30e4b725756d22c
 Primary class: security capability + operational polish
 Authority: plans/subsystems/standalone-daemon-roadmap.md; ADR-0006; ADR-0007; Research 010

@@ -90,7 +90,7 @@ Production SAM 3.1-compatible stream provider, long-lived session ownership, I2P
 
 The core is closed through M009 and the portable SAM product path through R001. M010 adds the first executable and authenticated local IRC listener without altering I2P-only upstream transport. This is a separately tracked standalone-daemon subsystem (Research 010, ADR-0007, Plans 050-054).
 
-Sequence: M010-A process/bootstrap and exclusive state owner; M010-B bounded listener/authentication; M010-C exact CAP/PASS/SASL registration handoff and stable ClientId; M010-D secure local credential/SQLCipher key provisioning; M010-E production integration and evidence-based closure. Only 050 is initially ready; later plans are dependency-gated.
+Sequence: M010-A process/bootstrap and exclusive state owner; M010-B bounded listener/authentication; M010-C exact CAP/PASS/SASL registration handoff and stable ClientId; M010-D secure local credential/SQLCipher key provisioning; M010-E production integration and evidence-based closure. Plans 050-053 are closed. Plan 054 is active, with M010 closure gated on a controlled live i2pd-to-IRC product-path qualification.
 
 A standalone product must work independently of i2pr managed-app contracts and Proposal 170. Installer/service packaging remains a later release line. Broad SAM portability matrices remain in the dedicated SAM library project.
 

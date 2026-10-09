@@ -1,7 +1,7 @@
 # Standalone M010-C / Plan 052 Closure
 
 Status: closed
-Implementation commit: `b196781cd8467b5df144d18f34678f2fdc8a5418`
+Implementation commits: `b196781cd8467b5df144d18f34678f2fdc8a5418`, `42c3338a8228bf38448897872d50b8a02ee48b0f`
 Predecessor closures: `plans/closure/standalone/050-status.md`, `plans/closure/standalone/051-status.md`
 
 ## Requirement-to-evidence
@@ -15,6 +15,7 @@ Predecessor closures: `plans/closure/standalone/050-status.md`, `plans/closure/s
 | Resolve default Network before durable profile creation; no guessed Network | `admit_authenticated` verifies configured `NetworkId` through `RuntimeControlHandle::network_record`; absent ID errors before `create_client`, regression test proves no profile side effect | Pass |
 | Preserve unbound control mode and supported negotiated capabilities | Unbound admission produces the canonical bouncer welcome; runtime validates transferred capability state and seeds the canonical reader | Pass |
 | Bound/cancel admission tasks and avoid detached writers | Listener's bounded handoff channel and semaphore; admission task ceiling; cancellation drains/aborts admitted tasks; `AbortOnDrop` and writer Drop abort child tasks | Pass |
+| Drain a final stale-identity numeric before closing a refused attachment | `PreparedSession::refuse` and `ClientWiring::respond_and_close`; regression exercised by runtime test `a_detached_client_can_reattach_and_is_told_the_truth_again` | Pass; corrective follow-up `42c3338` |
 | I2P-only upstream boundary | Updated source guard scans daemon production source, allows only exact loopback bind/accept authority, and rejects unauthorized socket authority in positive controls | Pass |
 
 ## Commands executed

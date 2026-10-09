@@ -1,6 +1,6 @@
 # Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure
 
-Status: proposed — dependency-gated on Plan 053 closure
+Status: active — Plan 053 closed; final live i2pd-to-controlled-IRC product-path qualification is operationally blocked
 Repository baseline for planning: f325e7d5e495e36b1fc7b168c30e4b725756d22c
 Primary class: qualification + milestone closure
 Authority: plans/subsystems/standalone-daemon-roadmap.md; ADR-0007; Research 010; M008/M009 and R001 closure records
@@ -51,3 +51,7 @@ A normal local IRC client can authenticate, use a live I2P IRC Network through t
 ## 9. Closure output
 
 Create plans/closure/standalone/054-status.md with implementation commit lineage (050-054), requirement-to-evidence matrix, exact command and external test outputs, platform/MSRV outcomes, anonymity/security review, unresolved limitations, and downstream roadmap disposition. Only then change registry M010 to closed. The next packaging/service milestone and R002 integration remain distinct.
+
+## Current execution blocker
+
+Plan 053 is closed and this plan is the active handoff. The environment has an i2pd 2.61.0 executable but no running router and no authorized controlled IRC service/destination. Deterministic verification and prior R001 transport evidence do not satisfy §4's production product-path requirement. Do not claim M010 closure until a local independent i2pd router and controlled IRC service on I2P are available and the §5 scenarios are run. Resume this plan with that operational evidence; do not substitute public endpoints or a fake router for the final live path.

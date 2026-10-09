@@ -27,18 +27,18 @@ Canonical direction:
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
 | Bouncer core | post-M009 complete, no active plan | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | M001-M009 remain historical product closures; Corrective 049 closed the post-M009 SAM framing defect and the registry/README/roadmap reconciliation. |
-| Standalone daemon/local access | M010 in progress; 050-052 closed; 053 active | plans/subsystems/standalone-daemon-roadmap.md | M010-D / Plan 053 | Research 010 and ADR-0007 accepted. Plan 054 remains sequentially dependency-gated; no R002 dependency. |
+| Standalone daemon/local access | M010 in progress; 050-053 closed; 054 active with live-service evidence blocker | plans/subsystems/standalone-daemon-roadmap.md | M010-E / Plan 054 | M010 closure requires controlled live i2pd-to-IRC product-path evidence; no R002 dependency. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
 | Plan | Status | Class | Roadmap | Handoff |
 |---|---|---|---|---|
-| Standalone M010-D / Plan 053 — Secure Initialization and Key Provisioning | active | security capability + operational polish | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/053-m010d-secure-init-and-key-provisioning.md |
+| Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
 
-Plan 054 is dependency-gated; promote it only after evidence-based closure of Plan 053. See standalone roadmap.
+Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
 
-Plans 050-052 are closed with evidence at `plans/closure/standalone/`. The daemon remains explicitly non-listening until secure credentials and key provisioning are integrated; Plan 053 is active.
+Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemon listener is enabled by the provisioned credentials and key; Plan 054 is active and gated on live product-path qualification.
 
 ## Recently closed implementation plans
 
@@ -102,7 +102,7 @@ Plans 050-052 are closed with evidence at `plans/closure/standalone/`. The daemo
 
 M008 and M009 are closed. No Bouncer Core implementation plan is currently active or dependency-ready.
 
-M010 standalone daemon/local listener/bootstrap and basic secure key provisioning are registered (Plans 050-054). Plans 050-052 are closed, Plan 053 is active, and Plan 054 awaits its closure. Full release packaging, service installers, keyring/HSM integration and optional real-client OTR qualification beyond recorded available evidence remain later decisions.
+M010 standalone daemon/local listener/bootstrap and basic secure key provisioning are registered (Plans 050-054). Plans 050-053 are closed; Plan 054 remains active pending its controlled live product-path evidence. Full release packaging, service installers, keyring/HSM integration and optional real-client OTR qualification beyond recorded available evidence remain later decisions.
 
 Later product lines intentionally remain unplanned:
 
@@ -164,4 +164,4 @@ Important retained conclusions:
 
 Corrective 049 is closed; see `plans/closure/bouncer-core/049-status.md`. It fixed a real SAM client framing defect (a reply terminator split across TCP reads was dropped, stalling the phase to its deadline) and reconciled the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
 
-M010 is registered as a new standalone-productization workstream after Research 010 and accepted ADR-0007. Plans 050-052 are closed; Plan 053 is the **sole active** implementation handoff on branch work/plans-050-054-m010-standalone; Plan 054 remains proposed and sequentially gated. M001-M009, C049 and R001 remain closed. R002 remains independently blocked on upstream i2pr managed-app contracts.
+M010 is registered as a standalone-productization workstream after Research 010 and accepted ADR-0007. Plans 050-053 are closed; Plan 054 is the **sole active** handoff and awaits controlled live i2pd-to-IRC product-path qualification. M001-M009, C049 and R001 remain closed. R002 remains independently blocked on upstream i2pr managed-app contracts.
