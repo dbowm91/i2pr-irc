@@ -728,6 +728,7 @@ async fn a_detached_channel_stays_joined_upstream_and_keeps_collecting_history()
 async fn local_watch_emits_redacted_bounded_hit_metadata_and_skips_otr() {
     let (mut harness, _) = Harness::start(&attached_channels(&["#room"])).await;
     let upstream = harness.bring_online().await;
+    let delayed_path = harness.provider.take_controller().await;
     let buffer = harness
         .store
         .1
@@ -761,11 +762,38 @@ async fn local_watch_emits_redacted_bounded_hit_metadata_and_skips_otr() {
         .expect("owner replies")
         .expect("owner loads committed rules");
     let mut client = harness.attach(1, &[]).await;
+    let mut second = harness.attach(2, &[]).await;
     client.until("366 bot #room").await;
+    second.until("366 bot #room").await;
+    client
+        .send(&format!("PART #room :{DETACH_SHORTHAND}\r\n"))
+        .await;
+    harness.wait_detached(1).await;
+    client.until("PART #room").await;
+    second.until("PART #room").await;
+    let upstream_policy = drain(harness.upstream(upstream), Duration::from_millis(100)).await;
+    assert!(
+        !upstream_policy.contains("JOIN #room") && !upstream_policy.contains("PART #room"),
+        "local visibility changes do not issue upstream membership commands: {upstream_policy}"
+    );
 
     let mark = client.mark();
-    push_chat(harness.upstream(upstream), "#room", "urgent private body").await;
+    let second_mark = second.mark();
+    let started = tokio::time::Instant::now();
+    delayed_path.release_after(
+        0,
+        Duration::from_millis(150),
+        b":alice!a@h PRIVMSG #room :urgent private body\r\nPING :slow-watch-probe\r\n".to_vec(),
+    );
+    let _ = read_until(harness.upstream(upstream), b"PONG :slow-watch-probe\r\n").await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(140),
+        "the watch event traversed a deliberately delayed fake I2P path"
+    );
     let notice = client.until("WATCH HIT").await;
+    let second_notice = second.until("WATCH HIT").await;
+    let first_hit = client.since(mark);
+    let second_hit = second.since(second_mark);
     let notice_line = notice
         .lines()
         .find(|line| line.contains("WATCH HIT"))
@@ -782,6 +810,39 @@ async fn local_watch_emits_redacted_bounded_hit_metadata_and_skips_otr() {
     assert!(
         !client.since(mark).contains("WATCH HIT seq=0"),
         "sequence ids are nonzero"
+    );
+    assert!(
+        !second_hit.contains("urgent private body")
+            && !second_hit.contains("#room")
+            && second_hit.contains("WATCH HIT seq=")
+            && second_hit.contains("rule=1"),
+        "each attached client receives only redacted local metadata: {second_notice}"
+    );
+    assert!(
+        !first_hit.contains("urgent private body") && !first_hit.contains("#room"),
+        "the detached buffer's watch does not disclose payload or target: {notice}"
+    );
+    assert!(
+        !first_hit.contains("urgent private body") && !second_hit.contains("urgent private body"),
+        "detachment suppresses message fanout while local watch metadata remains available"
+    );
+    let durable = harness
+        .store
+        .1
+        .query_history(&i2pr_irc_store::HistoryQuery {
+            buffer: buffer.buffer,
+            bound: i2pr_irc_store::HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("detached message is durably retained under persistent policy");
+    assert!(
+        durable
+            .iter()
+            .any(|event| { event.payload == b":alice!a@h PRIVMSG #room :urgent private body" })
     );
 
     let before_otr = client.mark();

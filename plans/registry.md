@@ -66,6 +66,8 @@ Plans 055-057 are closed with evidence at their named closure records; Plan 058 
 | Plan | Status | Class | Source roadmap | Closure |
 |---|---|---|---|---|
 | IRC M011-A / Plan 055 — Per-Buffer Retention and No-History | closed | privacy invariant + capability | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/055-status.md |
+| IRC M011-B / Plan 056 — Detached Channel Activity Policy | closed | bounded presentation policy + privacy | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/056-status.md |
+| IRC M011-C / Plan 057 — Local Watch and Highlight Notifications | closed | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/057-status.md |
 | Bouncer Core Corrective 049 — Post-M009 Verification and Documentation Reconciliation | closed | verification reliability + planning/documentation reconciliation | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/049-status.md |
 | Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure | closed | privacy qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/048-status.md |
 | Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | closed | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/042-status.md |
@@ -194,4 +196,4 @@ M010 is registered as a standalone-productization workstream after Research 010 
 
 ## Post-M010 IRC enhancement handoff
 
-Research 011, ADR-0008, ADR-0009, and Plans 055-066 are committed on work/plans-055-066-irc-privacy-resilience. Plan 055 has an active partial implementation in `88cc10f`; ephemeral runtime retention and runtime/operator controls remain open, so no closure or successor readiness is claimed. Preserve original I2P-only network boundary and the independently active M010-E/054 status.
+Research 011, ADR-0008, ADR-0009, and Plans 055-066 are committed on work/plans-055-066-irc-privacy-resilience. Plans 055-057 are closed with evidence in `plans/closure/irc-enhancements/`; Plan 058 is active for integrated privacy qualification and M011 closure. Plan 054 remains independently active pending controlled live IRC-over-i2pd product-path evidence. Preserve the original I2P-only network boundary.

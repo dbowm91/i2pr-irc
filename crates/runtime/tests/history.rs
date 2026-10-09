@@ -284,6 +284,179 @@ async fn ephemeral_history_is_bounded_memory_only_and_lost_on_journal_restart() 
 }
 
 #[tokio::test]
+async fn m011_three_buffer_privacy_matrix_survives_store_queries_without_crossing_profiles() {
+    let (_store, handle) = store();
+    let mut journal = journal_for(&handle, VirtualWallClock::default(), &[]).await;
+    let persistent = journal
+        .resolve_buffer(BufferKind::Channel, "#persistent")
+        .await
+        .expect("persistent buffer resolves");
+    let ephemeral = journal
+        .resolve_buffer(BufferKind::Query, "Alice")
+        .await
+        .expect("ephemeral buffer resolves");
+    let no_history = journal
+        .resolve_buffer(BufferKind::Channel, "#private")
+        .await
+        .expect("no-history buffer resolves");
+
+    journal
+        .set_retention_policy(
+            ephemeral,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::Ephemeral),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ephemeral policy commits");
+    journal
+        .set_retention_policy(
+            no_history,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::NoHistory),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("no-history policy commits");
+    handle
+        .create_client("phone")
+        .await
+        .expect("first stable client creates");
+    handle
+        .create_client("desktop")
+        .await
+        .expect("second stable client creates");
+
+    let durable = journal
+        .ingest(
+            persistent,
+            &message(":alice!u@h PRIVMSG #persistent :shared needle\r\n"),
+        )
+        .await
+        .expect("persistent message ingests");
+    assert!(matches!(durable, IngestOutcome::Recorded { .. }));
+    assert_eq!(
+        journal
+            .ingest(
+                ephemeral,
+                &message(":alice!u@h PRIVMSG Alice :ephemeral needle\r\n"),
+            )
+            .await
+            .expect("ephemeral message ingests"),
+        IngestOutcome::Ephemeral
+    );
+    assert_eq!(
+        journal
+            .ingest(
+                no_history,
+                &message(":alice!u@h PRIVMSG #private :nohistory needle\r\n"),
+            )
+            .await
+            .expect("no-history message is intentionally discarded"),
+        IngestOutcome::Skipped
+    );
+
+    let query = SearchQuery {
+        network: NetworkId(1),
+        buffers: vec![persistent, ephemeral, no_history],
+        sender: None,
+        after: None,
+        before: None,
+        terms: vec![SearchTerm::parse("needle").expect("term parses")],
+        limit: 10,
+    };
+    let combined = journal.store_search(&query).await.expect("bounded search");
+    assert_eq!(combined.len(), 2, "no-history text never enters search");
+    assert!(combined.iter().any(|hit| hit.buffer == persistent));
+    assert!(combined.iter().any(|hit| hit.buffer == ephemeral));
+    let durable_hits = handle.search(&query).await.expect("durable FTS search");
+    assert_eq!(durable_hits.len(), 1, "only persistent text reaches FTS");
+    assert_eq!(durable_hits[0].buffer, persistent);
+
+    let persistent_rows = handle
+        .query_history(&i2pr_irc_store::HistoryQuery {
+            buffer: persistent,
+            bound: i2pr_irc_store::HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("persistent rows query");
+    let ephemeral_rows = handle
+        .query_history(&i2pr_irc_store::HistoryQuery {
+            buffer: ephemeral,
+            bound: i2pr_irc_store::HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("ephemeral durable rows query");
+    let private_rows = handle
+        .query_history(&i2pr_irc_store::HistoryQuery {
+            buffer: no_history,
+            bound: i2pr_irc_store::HistoryQueryBound {
+                after: None,
+                before: None,
+                limit: 10,
+            },
+        })
+        .await
+        .expect("no-history durable rows query");
+    assert_eq!(persistent_rows.len(), 1);
+    assert!(ephemeral_rows.is_empty());
+    assert!(private_rows.is_empty());
+
+    let ephemeral_event = journal
+        .backlog_range(ephemeral, None, None, 10)
+        .await
+        .expect("ephemeral backlog reads")[0]
+        .event;
+    journal
+        .advance_cursor(ClientId(1), ephemeral, ephemeral_event)
+        .await
+        .expect("first client's cursor advances");
+    assert_eq!(
+        journal
+            .cursor(ClientId(1), ephemeral)
+            .await
+            .expect("first cursor reads"),
+        Some(ephemeral_event)
+    );
+    assert_eq!(
+        journal
+            .cursor(ClientId(2), ephemeral)
+            .await
+            .expect("second cursor reads independently"),
+        None
+    );
+
+    let restarted = journal_for(&handle, VirtualWallClock::default(), &[]).await;
+    assert!(
+        restarted
+            .backlog(ClientId(1), ephemeral, BacklogCap::DEFAULT)
+            .await
+            .expect("ephemeral restart backlog reads")
+            .is_empty(),
+        "ephemeral content and its cursor are process-local"
+    );
+    assert_eq!(
+        restarted
+            .backlog(ClientId(1), persistent, BacklogCap::DEFAULT)
+            .await
+            .expect("persistent restart backlog reads")
+            .len(),
+        1,
+        "persistent content survives restart"
+    );
+}
+
+#[tokio::test]
 async fn persistent_otr_payload_is_retained_opaque_without_fts_derivation() {
     let (_store, handle) = store();
     let mut journal = journal_for(&handle, VirtualWallClock::default(), &[]).await;
