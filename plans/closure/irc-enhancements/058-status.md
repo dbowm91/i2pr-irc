@@ -2,7 +2,7 @@
 
 Status: closed
 Implementation commit: `2bfdd13` — `test(runtime): integrate M011 privacy qualification`
-Closure commit: pending
+Closure commit: `0e430a2` — `docs(plans): close M011 privacy qualification 058`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
