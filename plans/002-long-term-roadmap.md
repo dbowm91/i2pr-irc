@@ -94,6 +94,27 @@ Sequence: M010-A process/bootstrap and exclusive state owner; M010-B bounded lis
 
 A standalone product must work independently of i2pr managed-app contracts and Proposal 170. Installer/service packaging remains a later release line. Broad SAM portability matrices remain in the dedicated SAM library project.
 
+## Independent IRC features after the M010 library baseline — M011/M012/M013 (registered, unimplemented)
+
+Research 011 and accepted-for-planning ADR-0008/0009 are the new authority for optional IRC capability extensions. This work can build on the M001-M009 and R001 library baseline without claiming M010 Plan 054's separate live product-path gate has been satisfied or depending on R002 app-runtime contracts.
+
+M011 — privacy and local intelligence (Plans 055–058):
+- Per-buffer persistent/ephemeral/no-history storage policy, with migration, bounded purge and FTS/read-marker consistency, not falsely claiming deletion from backups/WAL.
+- Soju-inspired bounded relay-detached/reattach-on/detach-after and ZNC-inspired local-only watch/mention notifications. No arbitrary scripting or external push/HTTP.
+
+M012 — I2P IRC connectivity resilience (Plans 059–062):
+- Generation-scoped JOIN/service-command pacing beyond the already implemented global reconnect budget; truthful upstream-outage gap evidence distinct from local Store drops.
+- Conditional upstream CHATHISTORY retrieval only where actual IRCd offers it; bounded dedup and no speculative user-chat replay. Unavailable server capability is a documented feature deferral, not a reason to downgrade the normal IRC session.
+- Verified operator-approved I2P endpoints in one IRC trust domain for optional failover. No implicit network/account equivalence or reuse of credentials across unrelated endpoints.
+
+M013 — ordinary IRC2P/ILITA profiles, IRCv3 decisions and optional inner TLS (Plans 063–066):
+- Normal operation remains plain IRC encapsulated in an I2P stream, without TLS. IRC2P-style NickServ identification is available without mandatory SASL. ILITA-style required SASL PLAIN is available when explicitly configured and acknowledged; verify currently deployed mechanisms with authorized live evidence before claiming them.
+- Revisit CHGHOST, event playback and message redaction on current specs; adopt only fully mediated semantics and preserve accurate per-client CAP negotiation.
+- TLS-over-I2P and certificate-backed SASL EXTERNAL are explicit opt-in and research-gated. TLS server identity verification and client-cert scope must be proved; no raw IRC transmission of certificate material, plaintext downgrade or unrestricted credential sharing.
+- A potential future clearnet-directed client-cert exception cannot be implemented by a configuration flag in this product: ADR-0001 structurally forbids clearnet egress. It would require a separate explicit canonical product change, new scoped connector and security approval. No override is authorized by M013.
+
+Dependency order: 055 first ready, 056-066 sequentially proposed/gated. Planned work does not imply implemented functionality. Scope-specific closure records and registry updates are required.
+
 ## Phase 7 — i2pr managed-app integration
 
 Begins only after stable written i2pr contracts exist for app-scoped I2P streams, naming as needed, local accepted-stream delivery/listener capability, and required lifecycle/health behavior.
