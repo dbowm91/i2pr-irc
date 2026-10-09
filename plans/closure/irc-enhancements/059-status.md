@@ -2,7 +2,7 @@
 
 Status: closed
 Implementation commit: `16b08e0` — `feat(runtime): pace recovery and record upstream gaps`
-Closure commit: recorded in the follow-up closure-SHA commit
+Closure commit: `8f69467` — `docs(plans): close M012-A plan 059`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
