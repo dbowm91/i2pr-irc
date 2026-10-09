@@ -35,6 +35,12 @@ The spec permits variable response counts and implementation-defined ordering; t
 
 This review is enough to implement a conditional protocol adapter behind direct upstream capability negotiation and exact-wire fixtures. It does not establish that IRC2P or ILITA currently advertises/authorizes CHATHISTORY; no live transcript was collected, and no deployed-network support claim is made.
 
+### Plan 061 endpoint-equivalence preflight (2026-10-09)
+
+The current official I2P IRC guide describes IRC2P as a federation and lists `irc.postman.i2p`, `irc.echelon.i2p`, and `irc.dg.i2p`; it separately lists ILITA endpoints including `irc.ilita.i2p`, `irc.r4sas.i2p`, `irc.acetone.i2p`, and `rusirc.ilita.i2p`. This supports a network-level distinction and a documented IRC2P federation, but does not prove current server membership, operational health, shared NickServ account scope, TLS identity policy, or equivalent CHATHISTORY semantics. It provides no basis for crossing from IRC2P to ILITA. Source: [official I2P IRC over I2P guide](https://i2p.net/en/docs/applications/irc/).
+
+Accordingly, any endpoint group must be supplied and attested by the Operator for a single durable `NetworkId`; the implementation must not infer equivalence from `.i2p` names or the published server list. Endpoints remain typed `I2pEndpoint` values routed only through the existing `I2pStreamProvider`. Credential authorization must be explicit for the whole group, and a configured group is not a claim that the repository independently verified federation. No live IRC transcript or endpoint probe was performed.
+
 ## Compatibility profiles and confidence
 
 **IRC2P:** intended default is plain IRC carried via I2P, CAP absent/partial tolerated, SASL not required, and optional credentialed NickServ identification/reclaim via the existing constrained phased service actions. This is operator-specified interoperability intent; validate with authorized server responses, do not assert every federated node behaves identically. No TLS or SASL fallback automatically activated.

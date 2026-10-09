@@ -1,5 +1,5 @@
 # IRC Privacy, Resilience and Compatibility Roadmap
-Status: M011 closed; M012 in progress; Plans 055-060 are closed (060 production feature deferred) and Plan 061 is ready.
+Status: M011 closed; M012 in progress; Plans 055-060 are closed (060 production feature deferred) and Plan 061 is active.
 Research: plans/research/011-irc-privacy-resilience-authentication.md
 ADRs: ADR-0008 and ADR-0009; all prior accepted ADRs remain binding.
 Baseline: work/plans-050-054-m010-standalone (M010-E Plan 054 active).
@@ -17,7 +17,7 @@ M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 act
   -> M011-D / 058 integration/closure [closed]
   -> M012-A / 059 IRC pacing and upstream gap records [closed]
   -> M012-B / 060 conditional upstream history reconciliation [closed; production implementation deferred by draft warning]
-  -> M012-C / 061 verified same-network I2P endpoint failover [ready; operator attestation required]
+  -> M012-C / 061 verified same-network I2P endpoint failover [active; operator attestation required]
   -> M012-D / 062 resilience closure [proposed after 061]
   -> M013-A / 063 named network auth profiles [proposed after 062]
   -> M013-B / 064 IRCv3 member/redaction/event-playback decision and bounded implementation [proposed after 063; unsafe pieces deferred]
