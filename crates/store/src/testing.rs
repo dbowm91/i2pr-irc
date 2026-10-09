@@ -25,7 +25,8 @@ use std::{
 /// The table *set* has been identical across every schema version so far; only the
 /// representation of `history_events.server_time` and `networks.display_name` changed,
 /// and only `desired_channels` gained a column.
-pub const EXPECTED_TABLES: [&str; 10] = [
+pub const EXPECTED_TABLES: [&str; 11] = [
+    "buffer_privacy",
     "buffers",
     "client_cursors",
     "clients",
@@ -204,6 +205,21 @@ pub fn create_v7_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 7)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 8, immediately before buffer privacy policy.
+pub fn create_v8_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v8())
+        .expect("schema 8 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 8)
         .expect("user_version is writable");
     connection
 }

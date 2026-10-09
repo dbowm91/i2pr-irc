@@ -179,6 +179,21 @@ Version 8 adds a constrained `phase` column to `registration_actions`. The value
 keeps unknown phase values out of storage, and the existing `(network_id, position)` key
 continues to preserve list order. The migration from version 7 is additive and transactional.
 
+### What version 9 adds, and its current limits
+
+Version 9 adds `buffer_privacy`, keyed by stable `BufferId`, for explicit persistent,
+ephemeral, or no-history overrides and bounded persistent age/event/byte ceilings. No
+row means the legacy-compatible persistent default. Stricter modes set `purge_pending`
+before deleting up to 4096 event and FTS rows in one transaction; history queries and
+appends refuse the buffer while deletion is pending. Store startup resumes deletion in
+bounded transactions, and the transition removes per-buffer cursor and marker references.
+This is logical deletion and does not claim physical erasure from WAL files, backups,
+or snapshots.
+
+The current implementation does not yet provide the process-local ephemeral ring or
+enforce the optional persistent age/event/byte ceilings. Those controls remain open in
+M011-A; do not describe ephemeral history as available to clients.
+
 ### Migrating version 6
 
 The v6 → v7 step is a single `CREATE TABLE`, inside the same migration transaction as every

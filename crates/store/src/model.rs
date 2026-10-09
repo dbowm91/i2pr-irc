@@ -30,6 +30,12 @@ pub const MAX_HISTORY_PAYLOAD_BYTES: usize = 4096;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512 * 1024;
 /// Maximum events removed by one retention operation.
 pub const MAX_RETENTION_DELETE: usize = 4096;
+/// Maximum event age permitted for a per-buffer persistent history override.
+pub const MAX_BUFFER_RETENTION_AGE_SECS: u64 = 31_536_000;
+/// Maximum retained events permitted for a per-buffer persistent history override.
+pub const MAX_BUFFER_RETENTION_EVENTS: u32 = 1_000_000;
+/// Maximum retained payload bytes permitted for a per-buffer persistent history override.
+pub const MAX_BUFFER_RETENTION_BYTES: u64 = 1_073_741_824;
 
 /// Ceiling on one retained upstream `msgid`.
 pub const MAX_HISTORY_MSGID_BYTES: usize = 64;
@@ -83,6 +89,51 @@ impl Drop for StoredSecret {
 pub enum BufferKind {
     Channel,
     Query,
+}
+
+/// Whether a buffer's events may outlive the current process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryPrivacyPolicy {
+    /// Keep history in the encrypted or plaintext Store according to its configured mode.
+    Persistent,
+    /// Keep a bounded process-local ring; the contents are lost on restart.
+    Ephemeral,
+    /// Keep no message content or searchable derivation.
+    NoHistory,
+}
+
+/// Per-buffer durable override. `None` inherits the profile default (persistent).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferRetentionPolicy {
+    pub policy: Option<HistoryPrivacyPolicy>,
+    pub max_age_secs: Option<u64>,
+    pub max_events: Option<u32>,
+    pub max_payload_bytes: Option<u64>,
+}
+
+impl BufferRetentionPolicy {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .max_age_secs
+            .is_some_and(|v| v == 0 || v > MAX_BUFFER_RETENTION_AGE_SECS)
+            || self
+                .max_events
+                .is_some_and(|v| v == 0 || v > MAX_BUFFER_RETENTION_EVENTS)
+            || self
+                .max_payload_bytes
+                .is_some_and(|v| v == 0 || v > MAX_BUFFER_RETENTION_BYTES)
+        {
+            return Err("buffer retention ceiling");
+        }
+        if self.policy != Some(HistoryPrivacyPolicy::Persistent)
+            && (self.max_age_secs.is_some()
+                || self.max_events.is_some()
+                || self.max_payload_bytes.is_some())
+        {
+            return Err("retention ceilings require persistent policy");
+        }
+        Ok(())
+    }
 }
 
 /// Direction/audience of a retained history event.

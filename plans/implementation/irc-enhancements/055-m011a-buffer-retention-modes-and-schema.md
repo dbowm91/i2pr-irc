@@ -1,6 +1,6 @@
 # Plan 055 — M011-A — Per-Buffer Retention, Ephemeral Storage, and No-History Policy
 
-Status: ready
+Status: active
 Date: 2026-10-09
 Class: invariant + capability
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -19,6 +19,9 @@ Only Plan 055 is currently marked ready. Promoting this plan to ready requires p
 
 ## Existing code/evidence and required invariant
 Current Store retains chat in SQLite+FTS5; history journal uses per-ClientId cursors; detached buffers are ingested; opaque OTR messages can be retained as ciphertext. No per-buffer retention exists.
+
+## Implementation progress (2026-10-09)
+The v9 schema, typed policy record, bounded policy validation, transactional stricter-mode purge marker, restart-resumed 4096-row purge batches, and durable append/query/FTS gates are implemented. The no-history durable-event and FTS negative test passes. This plan remains active: the process-local ephemeral ring and runtime/operator policy controls are not yet implemented, and the optional persistent age/count/byte limits are stored and validated but not yet applied by the retention worker. No closure is claimed.
 Maintain one NetworkOwner per Network, bounded memory/queues/timers, SessionId/ClientId separation, stable upstream CAP request independent of attached downstream clients, generation-fenced reconnect, no replay of non-idempotent chat, and typed I2P-only upstream authority. Preserve downstream local Operator authentication and SQLCipher/OTR separation.
 
 ## Production scope and ordered work packages

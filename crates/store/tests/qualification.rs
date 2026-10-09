@@ -6,12 +6,13 @@
 //! never depends on the same API that is under test.
 use i2pr_irc_core::{BufferId, I2pEndpoint, WallTime};
 use i2pr_irc_store::{
-    BufferKind, EventDirection, HistoryAround, HistoryEventId, MAX_DISPLAY_NAME_BYTES,
-    MAX_HISTORY_QUERY_EVENTS, MAX_SEARCH_BUFFERS, MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS,
-    MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent, RegistrationActionKind,
-    RegistrationActionPhase, RetentionRequest, SCHEMA_VERSION, STORE_QUEUE_CAPACITY, SearchFields,
-    SearchQuery, SearchTerm, Store, StoreErrorKind, StoreHandle, StoreHealth, StorePath,
-    StoredRegistrationAction, StoredSecret, attached_channels, fallback_display_name,
+    BufferKind, BufferRetentionPolicy, EventDirection, HistoryAround, HistoryEventId,
+    HistoryPrivacyPolicy, MAX_DISPLAY_NAME_BYTES, MAX_HISTORY_QUERY_EVENTS, MAX_SEARCH_BUFFERS,
+    MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS, MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent,
+    RegistrationActionKind, RegistrationActionPhase, RetentionRequest, SCHEMA_VERSION,
+    STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm, Store, StoreErrorKind,
+    StoreHandle, StoreHealth, StorePath, StoredRegistrationAction, StoredSecret, attached_channels,
+    fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
 use i2pr_irc_wire::IrcTimestamp;
@@ -179,6 +180,69 @@ fn strict_tables_reject_a_wrong_storage_class() {
             .contains("cannot store TEXT value in INTEGER column"),
         "expected a STRICT storage-class rejection, got: {error}"
     );
+}
+
+#[tokio::test]
+async fn no_history_policy_prevents_durable_event_and_search_index_writes() {
+    let dir = testing::temp_dir("no-history-policy");
+    let path = dir.db("policy.sqlite3");
+    let store = store_at(&path);
+    let handle = store.handle();
+    handle
+        .save_network(&record(1, &[]))
+        .await
+        .expect("network saves");
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#private")
+        .await
+        .expect("buffer resolves")
+        .buffer;
+    handle
+        .set_buffer_retention(
+            buffer,
+            BufferRetentionPolicy {
+                policy: Some(HistoryPrivacyPolicy::NoHistory),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("policy commits");
+    assert_eq!(
+        handle
+            .get_buffer_retention(buffer)
+            .await
+            .expect("policy reads")
+            .policy,
+        Some(HistoryPrivacyPolicy::NoHistory)
+    );
+    let result = handle
+        .append_history(&[NewHistoryEvent {
+            network: NetworkId(1),
+            buffer,
+            received_at: WallTime(1),
+            server_time: None,
+            msgid: None,
+            direction: EventDirection::Inbound,
+            event_class: "PRIVMSG".into(),
+            payload: b":a!b@c PRIVMSG #private :secret-term".to_vec(),
+            search: Some(SearchFields {
+                sender: "a".into(),
+                target: "#private".into(),
+                body: "secret-term".into(),
+            }),
+        }])
+        .await
+        .expect("policy suppresses append");
+    assert_eq!(result.accepted, 0);
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_events"),
+        0
+    );
+    assert_eq!(
+        testing::count(&path, "SELECT count(*) FROM history_search"),
+        0
+    );
+    store.shutdown().expect("store shuts down");
 }
 
 // ------------------------------------------------------- schema 1 -> 2 migration
@@ -2589,8 +2653,10 @@ async fn schema_seven_actions_migrate_to_post_join() {
     // database whose action rows have no phase column, rather than merely changing its
     // header while leaving a v8 table behind.
     let old = testing::raw(&path);
-    old.execute_batch("ALTER TABLE registration_actions DROP COLUMN phase;")
-        .expect("the v7 table has no phase column");
+    old.execute_batch(
+        "ALTER TABLE registration_actions DROP COLUMN phase; DROP TABLE buffer_privacy;",
+    )
+    .expect("the v7 table has no phase column");
     old.pragma_update(None, "user_version", 7_i64)
         .expect("the fixture declares schema 7");
     drop(old);
@@ -2798,6 +2864,7 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         5 => drop(testing::create_v5_database(path)),
         6 => drop(testing::create_v6_database(path)),
         7 => drop(testing::create_v7_database(path)),
+        8 => drop(testing::create_v8_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }

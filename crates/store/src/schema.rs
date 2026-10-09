@@ -1,4 +1,4 @@
-//! Schema versions 1 through 8 and their transactional migration harness.
+//! Schema versions 1 through 9 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -20,7 +20,7 @@ use rusqlite::Connection;
 /// [`HISTORY_REFERENCE_INDEXES_V6`], and [`migrate_5_to_6`]. Version 7 adds the bounded
 /// registration-action table; version 8 adds action phases and migrates prior rows to
 /// `post-join`.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -410,6 +410,22 @@ pub(crate) fn schema_v8() -> String {
     format!("{}{}", schema_v7(), REGISTRATION_ACTIONS_V8)
 }
 
+const BUFFER_PRIVACY_V9: &str = r#"
+CREATE TABLE buffer_privacy (
+    buffer_id INTEGER PRIMARY KEY REFERENCES buffers(buffer_id) ON DELETE CASCADE,
+    policy TEXT NOT NULL CHECK (policy IN ('persistent','ephemeral','no-history')),
+    max_age_secs INTEGER CHECK (max_age_secs IS NULL OR max_age_secs BETWEEN 1 AND 31536000),
+    max_events INTEGER CHECK (max_events IS NULL OR max_events BETWEEN 1 AND 1000000),
+    max_bytes INTEGER CHECK (max_bytes IS NULL OR max_bytes BETWEEN 1 AND 1073741824),
+    purge_pending INTEGER NOT NULL DEFAULT 0 CHECK (purge_pending IN (0,1)),
+    CHECK (policy = 'persistent' OR (max_age_secs IS NULL AND max_events IS NULL AND max_bytes IS NULL))
+) STRICT;
+"#;
+
+pub(crate) fn schema_v9() -> String {
+    format!("{}{}", schema_v8(), BUFFER_PRIVACY_V9)
+}
+
 /// Fills in the derived state migration 6 added, for a schema 6 fixture.
 ///
 /// A genuine v6 database has its `effective_time` populated and its FTS side index built,
@@ -598,7 +614,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v8())
+                .execute_batch(&schema_v9())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -678,6 +694,7 @@ const REQUIRED_TABLES: &[&str] = &[
     // payloads that may be service credentials, so its absence must be an open failure
     // rather than a per-request one.
     "registration_actions",
+    "buffer_privacy",
 ];
 
 /// Indexes this build promises, beyond the presence of their table.
@@ -779,6 +796,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             5 => migrate_5_to_6(transaction)?,
             6 => migrate_6_to_7(transaction)?,
             7 => migrate_7_to_8(transaction)?,
+            8 => migrate_8_to_9(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -1025,6 +1043,14 @@ ALTER TABLE registration_actions
 
 fn migrate_7_to_8(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(REGISTRATION_ACTIONS_V8)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_8_to_9(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(BUFFER_PRIVACY_V9)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;

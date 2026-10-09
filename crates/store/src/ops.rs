@@ -577,6 +577,131 @@ pub(crate) fn resolve_buffer(
     })
 }
 
+pub(crate) fn get_buffer_retention(
+    connection: &Connection,
+    buffer: BufferId,
+) -> Result<BufferRetentionPolicy, StoreError> {
+    let row = connection.query_row("SELECT policy,max_age_secs,max_events,max_bytes FROM buffer_privacy WHERE buffer_id=?1", [to_sql_id(buffer.0)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<i64>>(3)?))).optional().map_err(|e| sql(e, CommitState::RolledBack))?;
+    match row {
+        None => Ok(BufferRetentionPolicy::default()),
+        Some((name, age, events, bytes)) => {
+            let policy = match name.as_str() {
+                "persistent" => HistoryPrivacyPolicy::Persistent,
+                "ephemeral" => HistoryPrivacyPolicy::Ephemeral,
+                "no-history" => HistoryPrivacyPolicy::NoHistory,
+                _ => {
+                    return Err(StoreError::new(StoreErrorKind::Corrupt(
+                        "buffer privacy policy",
+                    )));
+                }
+            };
+            Ok(BufferRetentionPolicy {
+                policy: Some(policy),
+                max_age_secs: age.and_then(|v| u64::try_from(v).ok()),
+                max_events: events.and_then(|v| u32::try_from(v).ok()),
+                max_payload_bytes: bytes.and_then(|v| u64::try_from(v).ok()),
+            })
+        }
+    }
+}
+
+/// Resumes privacy purges committed before a crash. Each transaction removes at most
+/// 4096 event/index pairs, and the pending bit keeps every query and append closed.
+pub(crate) fn resume_pending_purges(connection: &mut Connection) -> Result<(), StoreError> {
+    loop {
+        let buffers: Vec<i64> = {
+            let mut q = connection.prepare("SELECT buffer_id FROM buffer_privacy WHERE purge_pending=1 ORDER BY buffer_id LIMIT 32").map_err(|e| sql(e, CommitState::RolledBack))?;
+            q.query_map([], |r| r.get(0))
+                .map_err(|e| sql(e, CommitState::RolledBack))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| sql(e, CommitState::RolledBack))?
+        };
+        if buffers.is_empty() {
+            return Ok(());
+        }
+        for buffer in buffers {
+            let tx = connection
+                .transaction()
+                .map_err(|e| sql(e, CommitState::RolledBack))?;
+            tx.execute("DELETE FROM history_search WHERE rowid IN (SELECT event_id FROM history_events WHERE buffer_id=?1 ORDER BY event_id LIMIT 4096)", [buffer]).map_err(|e| sql(e, CommitState::RolledBack))?;
+            tx.execute("DELETE FROM history_events WHERE event_id IN (SELECT event_id FROM history_events WHERE buffer_id=?1 ORDER BY event_id LIMIT 4096)", [buffer]).map_err(|e| sql(e, CommitState::RolledBack))?;
+            let left: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM history_events WHERE buffer_id=?1",
+                    [buffer],
+                    |r| r.get(0),
+                )
+                .map_err(|e| sql(e, CommitState::RolledBack))?;
+            if left == 0 {
+                tx.execute(
+                    "UPDATE buffer_privacy SET purge_pending=0 WHERE buffer_id=?1",
+                    [buffer],
+                )
+                .map_err(|e| sql(e, CommitState::RolledBack))?;
+            }
+            tx.commit().map_err(|e| sql(e, CommitState::Unknown))?;
+        }
+    }
+}
+
+pub(crate) fn set_buffer_retention(
+    connection: &mut Connection,
+    buffer: BufferId,
+    policy: BufferRetentionPolicy,
+) -> Result<(), StoreError> {
+    policy
+        .validate()
+        .map_err(|r| StoreError::new(StoreErrorKind::InvalidRequest(r)))?;
+    let tx = connection
+        .transaction()
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let name = match policy.policy {
+        Some(HistoryPrivacyPolicy::Persistent) => "persistent",
+        Some(HistoryPrivacyPolicy::Ephemeral) => "ephemeral",
+        Some(HistoryPrivacyPolicy::NoHistory) => "no-history",
+        None => {
+            tx.execute(
+                "DELETE FROM buffer_privacy WHERE buffer_id=?1",
+                [to_sql_id(buffer.0)?],
+            )
+            .map_err(|e| sql(e, CommitState::RolledBack))?;
+            tx.commit().map_err(|e| sql(e, CommitState::Unknown))?;
+            return Ok(());
+        }
+    };
+    tx.execute("INSERT INTO buffer_privacy(buffer_id,policy,max_age_secs,max_events,max_bytes,purge_pending) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(buffer_id) DO UPDATE SET policy=excluded.policy,max_age_secs=excluded.max_age_secs,max_events=excluded.max_events,max_bytes=excluded.max_bytes,purge_pending=excluded.purge_pending", params![to_sql_id(buffer.0)?,name,policy.max_age_secs.map(|v| v as i64),policy.max_events.map(i64::from),policy.max_payload_bytes.map(|v| v as i64), i64::from(name != "persistent")]).map_err(|e| sql(e, CommitState::RolledBack))?;
+    if name != "persistent" {
+        tx.execute("DELETE FROM history_search WHERE rowid IN (SELECT event_id FROM history_events WHERE buffer_id=?1 ORDER BY event_id LIMIT 4096)", [to_sql_id(buffer.0)?]).map_err(|e| sql(e, CommitState::RolledBack))?;
+        tx.execute("DELETE FROM history_events WHERE event_id IN (SELECT event_id FROM history_events WHERE buffer_id=?1 ORDER BY event_id LIMIT 4096)", [to_sql_id(buffer.0)?]).map_err(|e| sql(e, CommitState::RolledBack))?;
+        tx.execute(
+            "DELETE FROM client_cursors WHERE buffer_id=?1",
+            [to_sql_id(buffer.0)?],
+        )
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+        tx.execute(
+            "DELETE FROM read_markers WHERE buffer_id=?1",
+            [to_sql_id(buffer.0)?],
+        )
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+        let left: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM history_events WHERE buffer_id=?1",
+                [to_sql_id(buffer.0)?],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql(e, CommitState::RolledBack))?;
+        if left == 0 {
+            tx.execute(
+                "UPDATE buffer_privacy SET purge_pending=0 WHERE buffer_id=?1",
+                [to_sql_id(buffer.0)?],
+            )
+            .map_err(|e| sql(e, CommitState::RolledBack))?;
+        }
+    }
+    tx.commit().map_err(|e| sql(e, CommitState::Unknown))?;
+    Ok(())
+}
+
 fn direction_code(kind: BufferKind) -> i64 {
     match kind {
         BufferKind::Channel => 0,
@@ -623,6 +748,17 @@ pub(crate) fn append_history(
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let mut result = HistoryAppendResult::default();
     for event in events {
+        let policy: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT policy,purge_pending FROM buffer_privacy WHERE buffer_id=?1",
+                [to_sql_id(event.buffer.0)?],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| sql(error, CommitState::RolledBack))?;
+        if policy.is_some_and(|(mode, pending)| mode != "persistent" || pending != 0) {
+            continue;
+        }
         transaction
             .execute(
                 "INSERT INTO history_events
@@ -716,6 +852,7 @@ pub(crate) fn recent_targets(
                  SELECT MAX(e.event_id) FROM history_events e WHERE e.buffer_id = b.buffer_id
              )
              WHERE b.network_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=b.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0))
                AND h.effective_time >= ?2
                AND h.effective_time <= ?3
              ORDER BY h.event_id DESC
@@ -784,7 +921,7 @@ pub(crate) fn query_history(
     };
     let statement_text = format!(
         "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
-         FROM history_events WHERE buffer_id=?1{clause} ORDER BY event_id LIMIT ?{placeholders}"
+         FROM history_events WHERE buffer_id=?1 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0)){clause} ORDER BY event_id LIMIT ?{placeholders}"
     );
     let mut statement = connection
         .prepare(&statement_text)
@@ -921,7 +1058,7 @@ pub(crate) fn history_around(
     let before = history_window(
         connection,
         "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
-         FROM history_events WHERE buffer_id=?1 AND event_id < ?2 ORDER BY event_id DESC LIMIT ?3",
+         FROM history_events WHERE buffer_id=?1 AND event_id < ?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0)) ORDER BY event_id DESC LIMIT ?3",
         buffer,
         anchor,
         request.before,
@@ -932,7 +1069,7 @@ pub(crate) fn history_around(
     events.extend(history_window(
         connection,
         "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
-         FROM history_events WHERE buffer_id=?1 AND event_id > ?2 ORDER BY event_id ASC LIMIT ?3",
+         FROM history_events WHERE buffer_id=?1 AND event_id > ?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0)) ORDER BY event_id ASC LIMIT ?3",
         buffer,
         anchor,
         request.after,
@@ -964,7 +1101,7 @@ fn history_window_by_anchor(
     let mut statement = connection
         .prepare(
             "SELECT event_id, network_id, buffer_id, received_at, server_time, msgid, direction, event_class, payload \
-             FROM history_events WHERE buffer_id=?1 AND event_id = ?2",
+             FROM history_events WHERE buffer_id=?1 AND event_id = ?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0))",
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let mut rows = statement
@@ -1357,7 +1494,7 @@ pub(crate) fn resolve_msgid(
     let mut statement = connection
         .prepare(
             "SELECT event_id FROM history_events
-             WHERE network_id=?1 AND msgid=?2 ORDER BY event_id LIMIT ?3",
+             WHERE network_id=?1 AND msgid=?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0)) ORDER BY event_id LIMIT ?3",
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
     let ceiling = to_sql_id(crate::model::MAX_MSGID_AMBIGUOUS as u64)?;
@@ -1411,7 +1548,7 @@ pub(crate) fn nearest_event(
     let before: Option<i64> = connection
         .query_row(
             "SELECT event_id FROM history_events
-             WHERE buffer_id=?1 AND effective_time <= ?2
+             WHERE buffer_id=?1 AND effective_time <= ?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0))
              ORDER BY effective_time DESC, event_id DESC LIMIT 1",
             params![buffer, reference_time],
             |row| row.get(0),
@@ -1420,7 +1557,7 @@ pub(crate) fn nearest_event(
     let after: Option<i64> = connection
         .query_row(
             "SELECT event_id FROM history_events
-             WHERE buffer_id=?1 AND effective_time > ?2
+             WHERE buffer_id=?1 AND effective_time > ?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=history_events.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0))
              ORDER BY effective_time ASC, event_id ASC LIMIT 1",
             params![buffer, reference_time],
             |row| row.get(0),
@@ -1475,7 +1612,7 @@ pub(crate) fn search(
             "SELECT h.event_id, h.buffer_id, s.sender, s.target, s.body
              FROM history_search s
              JOIN history_events h ON h.event_id = s.rowid
-             WHERE history_search MATCH ?1 AND h.network_id = ?2",
+             WHERE history_search MATCH ?1 AND h.network_id = ?2 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=h.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0))",
         );
         let mut values: Vec<Box<dyn rusqlite::ToSql>> =
             vec![Box::new(expression), Box::new(network)];
@@ -1543,7 +1680,7 @@ pub(crate) fn search(
         "SELECT h.event_id, h.buffer_id, COALESCE(s.sender,''), COALESCE(s.target,''), COALESCE(s.body,'')
          FROM history_events h
          LEFT JOIN history_search s ON s.rowid = h.event_id
-         WHERE h.network_id = ?1",
+         WHERE h.network_id = ?1 AND NOT EXISTS (SELECT 1 FROM buffer_privacy p WHERE p.buffer_id=h.buffer_id AND (p.policy!='persistent' OR p.purge_pending!=0))",
     );
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(network)];
     if !query.buffers.is_empty() {

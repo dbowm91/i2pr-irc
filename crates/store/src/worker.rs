@@ -129,6 +129,15 @@ enum Request {
         target: String,
         reply: Reply<Result<BufferRecord, StoreError>>,
     },
+    SetBufferRetention {
+        buffer: BufferId,
+        policy: BufferRetentionPolicy,
+        reply: Reply<Result<(), StoreError>>,
+    },
+    GetBufferRetention {
+        buffer: BufferId,
+        reply: Reply<Result<BufferRetentionPolicy, StoreError>>,
+    },
     AppendHistory {
         events: Vec<NewHistoryEvent>,
         reply: Reply<Result<HistoryAppendResult, StoreError>>,
@@ -357,6 +366,25 @@ impl StoreHandle {
             reply,
         })
         .await
+    }
+    pub async fn set_buffer_retention(
+        &self,
+        buffer: BufferId,
+        policy: BufferRetentionPolicy,
+    ) -> Result<(), StoreError> {
+        self.submit(|reply| Request::SetBufferRetention {
+            buffer,
+            policy,
+            reply,
+        })
+        .await
+    }
+    pub async fn get_buffer_retention(
+        &self,
+        buffer: BufferId,
+    ) -> Result<BufferRetentionPolicy, StoreError> {
+        self.submit(|reply| Request::GetBufferRetention { buffer, reply })
+            .await
     }
     pub async fn append_history(
         &self,
@@ -588,6 +616,7 @@ impl Store {
             apply_encryption_key(&connection, key)?;
         }
         schema::open_and_migrate(&connection, busy_timeout_ms)?;
+        ops::resume_pending_purges(&mut connection)?;
         let shared = Arc::new(Shared {
             health: Mutex::new(StoreHealth::Ready),
             closing: AtomicBool::new(false),
@@ -773,6 +802,14 @@ fn execute(connection: &mut Connection, request: Request) {
             reply,
             ops::resolve_buffer(connection, network, kind, &target)
         ),
+        Request::SetBufferRetention {
+            buffer,
+            policy,
+            reply,
+        } => answer!(reply, ops::set_buffer_retention(connection, buffer, policy)),
+        Request::GetBufferRetention { buffer, reply } => {
+            answer!(reply, ops::get_buffer_retention(connection, buffer))
+        }
         Request::AppendHistory { events, reply } => {
             answer!(reply, ops::append_history(connection, &events))
         }
