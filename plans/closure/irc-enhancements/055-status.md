@@ -2,7 +2,7 @@
 
 Status: closed
 Implementation commit: `eada883` — `feat(runtime): implement per-buffer history privacy`
-Closure commit: recorded in the follow-up closure-evidence commit; the exact commit is added to this record immediately after creation.
+Closure commit: `a604e51` — `docs(plans): close IRC privacy retention plan 055`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
