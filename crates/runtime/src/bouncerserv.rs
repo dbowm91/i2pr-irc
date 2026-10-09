@@ -53,27 +53,55 @@ pub enum ServCommand {
     /// List every Network and its live state.
     NetworkList,
     /// Report one Network.
-    NetworkStatus { network: NetworkId },
+    NetworkStatus {
+        network: NetworkId,
+    },
     /// Create a Network. Identity fields the Operator did not supply are filled with
     /// fixed defaults derived from the Network's own display name.
-    NetworkCreate { fields: NetworkFields },
+    NetworkCreate {
+        fields: NetworkFields,
+    },
     /// Apply a partial update to one Network.
     NetworkUpdate {
         network: NetworkId,
         fields: NetworkFields,
     },
     /// Forget one Network.
-    NetworkDelete { network: NetworkId },
+    NetworkDelete {
+        network: NetworkId,
+    },
     /// Report one channel's presentation policy on one Network.
-    ChannelStatus { network: NetworkId, channel: String },
+    ChannelStatus {
+        network: NetworkId,
+        channel: String,
+    },
     /// Stop presenting one channel the bouncer still holds.
-    ChannelDetach { network: NetworkId, channel: String },
+    ChannelDetach {
+        network: NetworkId,
+        channel: String,
+    },
     /// Resume presenting one detached channel.
-    ChannelAttach { network: NetworkId, channel: String },
+    ChannelAttach {
+        network: NetworkId,
+        channel: String,
+    },
     ChannelActivitySet {
         network: NetworkId,
         channel: String,
         policy: i2pr_irc_store::ChannelActivityPolicy,
+    },
+    WatchList {
+        network: NetworkId,
+    },
+    WatchAdd {
+        rule: i2pr_irc_store::WatchRule,
+    },
+    WatchDelete {
+        network: NetworkId,
+        id: u32,
+    },
+    WatchClear {
+        network: NetworkId,
     },
     /// Read one buffer's history privacy mode.
     HistoryStatus {
@@ -89,17 +117,29 @@ pub enum ServCommand {
         policy: Option<i2pr_irc_store::HistoryPrivacyPolicy>,
     },
     /// Report one Network's presence policy.
-    PresenceStatus { network: NetworkId },
+    PresenceStatus {
+        network: NetworkId,
+    },
     /// Change one Network's auto-away policy.
-    PresenceSet { network: NetworkId, auto_away: bool },
+    PresenceSet {
+        network: NetworkId,
+        auto_away: bool,
+    },
     /// Report one Network's keep-nick policy.
-    NickStatus { network: NetworkId },
+    NickStatus {
+        network: NetworkId,
+    },
     /// Change one Network's keep-nick policy.
-    NickSet { network: NetworkId, keep_nick: bool },
+    NickSet {
+        network: NetworkId,
+        keep_nick: bool,
+    },
     /// Report whether a Network has a credential, and under which name.
     ///
     /// The value is never in this type, so it cannot be rendered by accident.
-    SaslStatus { network: NetworkId },
+    SaslStatus {
+        network: NetworkId,
+    },
     /// Set a Network's credential.
     SaslSet {
         network: NetworkId,
@@ -113,17 +153,23 @@ pub enum ServCommand {
         password: crate::Secret,
     },
     /// Forget a Network's credential.
-    SaslReset { network: NetworkId },
+    SaslReset {
+        network: NetworkId,
+    },
     /// Report the bounded process-wide diagnostics, with every live Network.
     Diag,
     /// Report one Network's bounded diagnostics.
-    DiagNetwork { network: NetworkId },
+    DiagNetwork {
+        network: NetworkId,
+    },
     /// Write the whole non-secret configuration out as a versioned snapshot.
     ConfigExport,
     /// Validate a snapshot and report what applying it would do, without applying it.
     ConfigPlan,
     /// Report how many registration actions a Network stores, and nothing about them.
-    ActionStatus { network: NetworkId },
+    ActionStatus {
+        network: NetworkId,
+    },
     /// Replace one Network's whole registration-action list.
     ///
     /// Carries the validated set rather than the raw attributes: by the time a command
@@ -163,6 +209,14 @@ impl std::fmt::Debug for ServCommand {
                 channel,
                 policy,
             } => return write!(f, "ChannelActivitySet({network:?}, {channel}, {policy:?})"),
+            Self::WatchList { network } => return write!(f, "WatchList({network:?})"),
+            Self::WatchAdd { rule } => {
+                return write!(f, "WatchAdd({:?}, {})", rule.network, rule.id);
+            }
+            Self::WatchDelete { network, id } => {
+                return write!(f, "WatchDelete({network:?}, {id})");
+            }
+            Self::WatchClear { network } => return write!(f, "WatchClear({network:?})"),
             Self::HistoryStatus {
                 network,
                 kind,
@@ -227,6 +281,7 @@ pub const HELP_TEXT: &str = concat!(
     " | channel detach <netid> <channel>",
     " | channel attach <netid> <channel>",
     " | channel activity <netid> <channel> relay=<none|mentions|all> reattach=<off|message|mention> detach_after=<off|1..86400>",
+    " | watch list <netid> | watch add <netid> <channel|query> <target|*> <keyword|sender> <term> | watch delete <netid> <id> | watch clear <netid>",
     " | history status <netid> <channel|query> <target>",
     " | history set <netid> <channel|query> <target> <persistent|ephemeral|no-history|inherit>",
     " | presence status <netid>",
@@ -379,6 +434,57 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                     channel: channel(3)?,
                 }),
                 other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+            }
+        }
+        "WATCH" => {
+            let network = netid(2)?;
+            match word(1).to_ascii_uppercase().as_str() {
+                "LIST" if words.len() == 3 => Ok(ServCommand::WatchList { network }),
+                "CLEAR" if words.len() == 3 => Ok(ServCommand::WatchClear { network }),
+                "DELETE" if words.len() == 4 => Ok(ServCommand::WatchDelete {
+                    network,
+                    id: word(3)
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|id| *id > 0 && *id <= i2pr_irc_store::MAX_WATCH_RULES as u32)
+                        .ok_or(BouncerError::ValueOutOfRange)?,
+                }),
+                "ADD" if words.len() == 7 => {
+                    let kind = match word(3) {
+                        "channel" => i2pr_irc_store::BufferKind::Channel,
+                        "query" => i2pr_irc_store::BufferKind::Query,
+                        _ => return Err(BouncerError::ValueOutOfRange),
+                    };
+                    let target = if word(4) == "*" {
+                        None
+                    } else {
+                        let target = word(4);
+                        if target.is_empty()
+                            || target.len() > i2pr_irc_store::MAX_TARGET_BYTES
+                            || !target.bytes().all(|b| b.is_ascii_graphic())
+                        {
+                            return Err(BouncerError::ValueOutOfRange);
+                        }
+                        Some(target.to_owned())
+                    };
+                    let matcher = match word(5) {
+                        "keyword" => i2pr_irc_store::WatchMatchKind::Keyword,
+                        "sender" => i2pr_irc_store::WatchMatchKind::Sender,
+                        _ => return Err(BouncerError::ValueOutOfRange),
+                    };
+                    let rule = i2pr_irc_store::WatchRule {
+                        id: 1,
+                        network,
+                        buffer: None,
+                        kind,
+                        target,
+                        matcher,
+                        term: word(6).to_owned(),
+                    };
+                    rule.validate().map_err(|_| BouncerError::ValueOutOfRange)?;
+                    Ok(ServCommand::WatchAdd { rule })
+                }
+                _ => Err(BouncerError::Usage),
             }
         }
         "HISTORY" => {
@@ -685,6 +791,11 @@ mod tests {
             "channel attach 1 #room",
             "channel activity 1 #room relay=mentions reattach=mention detach_after=3600",
             "channel activity 1 #room detach_after=off reattach=off relay=none",
+            "watch list 1",
+            "watch add 1 channel #room keyword urgent",
+            "watch add 1 query * sender alice",
+            "watch delete 1 1",
+            "watch clear 1",
             "history status 1 channel #room",
             "history set 1 channel #room no-history",
             "history set 1 query alice ephemeral",
@@ -716,6 +827,25 @@ mod tests {
             "channel activity 1 #room relay=all reattach=off detach_after=86401",
             "channel activity 1 #room relay=all relay=none reattach=off",
             "channel activity 1 #room relay=all reattach=off detach_after=off extra=1",
+        ] {
+            assert!(parse(line).is_err(), "{line:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn watch_rules_are_literal_bounded_and_typed() {
+        let ServCommand::WatchAdd { rule } =
+            parse("watch add 3 channel #room keyword urgent").unwrap()
+        else {
+            panic!("watch add parses to typed rule")
+        };
+        assert_eq!(rule.network, NetworkId(3));
+        assert_eq!(rule.matcher, i2pr_irc_store::WatchMatchKind::Keyword);
+        for line in [
+            "watch add 1 channel #room regex .*",
+            "watch add 1 channel #room keyword \r",
+            "watch delete 1 0",
+            "watch add 1 channel #room keyword thistermiswaytoolong........................................................................................................................................",
         ] {
             assert!(parse(line).is_err(), "{line:?} must be refused");
         }

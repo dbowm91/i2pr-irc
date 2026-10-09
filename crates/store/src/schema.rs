@@ -1,4 +1,4 @@
-//! Schema versions 1 through 12 and their transactional migration harness.
+//! Schema versions 1 through 13 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -22,8 +22,9 @@ use rusqlite::Connection;
 /// `post-join`; version 9 adds per-buffer history privacy and retention; version 10 adds
 /// a fail-closed marker while stricter persistent ceilings prune existing history;
 /// version 11 records whether each event has a derived FTS row; version 12 adds bounded
-/// detached-channel activity policies, disabled for existing rows by default.
-pub const SCHEMA_VERSION: i64 = 12;
+/// detached-channel activity policies, disabled for existing rows by default; version 13
+/// adds literal local watch rules, with no rules on upgrade.
+pub const SCHEMA_VERSION: i64 = 13;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -441,6 +442,24 @@ pub(crate) fn schema_v12() -> String {
     format!("{}{}", schema_v11(), CHANNEL_ACTIVITY_V12)
 }
 
+pub(crate) fn schema_v13() -> String {
+    format!("{}{}", schema_v12(), WATCH_RULES_V13)
+}
+
+const WATCH_RULES_V13: &str = r#"
+CREATE TABLE watch_rules (
+    network_id      INTEGER NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    rule_id         INTEGER NOT NULL CHECK (rule_id BETWEEN 1 AND 128),
+    kind            INTEGER NOT NULL CHECK (kind IN (1,2)),
+    buffer_id       INTEGER REFERENCES buffers(buffer_id) ON DELETE CASCADE,
+    target          TEXT,
+    matcher         TEXT NOT NULL CHECK (matcher IN ('keyword','sender')),
+    term            TEXT NOT NULL CHECK (length(CAST(term AS BLOB)) BETWEEN 1 AND 128),
+    CHECK ((buffer_id IS NULL AND target IS NULL) OR (buffer_id IS NOT NULL AND target IS NOT NULL)),
+    PRIMARY KEY (network_id, rule_id)
+) STRICT;
+"#;
+
 const BUFFER_RETENTION_V10: &str = r#"
 ALTER TABLE buffer_privacy ADD COLUMN retention_pending INTEGER NOT NULL DEFAULT 0 CHECK (retention_pending IN (0,1));
 "#;
@@ -643,7 +662,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v12())
+                .execute_batch(&schema_v13())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -724,6 +743,7 @@ const REQUIRED_TABLES: &[&str] = &[
     // rather than a per-request one.
     "registration_actions",
     "buffer_privacy",
+    "watch_rules",
 ];
 
 /// Indexes this build promises, beyond the presence of their table.
@@ -840,6 +860,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             9 => migrate_9_to_10(transaction)?,
             10 => migrate_10_to_11(transaction)?,
             11 => migrate_11_to_12(transaction)?,
+            12 => migrate_12_to_13(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -865,6 +886,14 @@ fn migrate_10_to_11(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
 
 fn migrate_11_to_12(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(CHANNEL_ACTIVITY_V12)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_12_to_13(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(WATCH_RULES_V13)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;

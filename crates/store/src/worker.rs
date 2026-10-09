@@ -140,6 +140,15 @@ enum Request {
         policy: BufferRetentionPolicy,
         reply: Reply<Result<(), StoreError>>,
     },
+    LoadWatchRules {
+        network: NetworkId,
+        reply: Reply<Result<Vec<WatchRule>, StoreError>>,
+    },
+    ReplaceWatchRules {
+        network: NetworkId,
+        rules: Vec<WatchRule>,
+        reply: Reply<Result<(), StoreError>>,
+    },
     GetBufferRetention {
         buffer: BufferId,
         reply: Reply<Result<BufferRetentionPolicy, StoreError>>,
@@ -406,6 +415,27 @@ impl StoreHandle {
     ) -> Result<BufferRetentionPolicy, StoreError> {
         self.submit(|reply| Request::GetBufferRetention { buffer, reply })
             .await
+    }
+    pub async fn load_watch_rules(&self, network: NetworkId) -> Result<Vec<WatchRule>, StoreError> {
+        self.submit(|reply| Request::LoadWatchRules { network, reply })
+            .await
+    }
+    pub async fn replace_watch_rules(
+        &self,
+        network: NetworkId,
+        rules: &[WatchRule],
+    ) -> Result<(), StoreError> {
+        if rules.len() > MAX_WATCH_RULES {
+            return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+                "watch rule count",
+            )));
+        }
+        self.submit(|reply| Request::ReplaceWatchRules {
+            network,
+            rules: rules.to_vec(),
+            reply,
+        })
+        .await
     }
     pub async fn append_history(
         &self,
@@ -851,6 +881,16 @@ fn execute(connection: &mut Connection, request: Request) {
         } => answer!(reply, ops::set_buffer_retention(connection, buffer, policy)),
         Request::GetBufferRetention { buffer, reply } => {
             answer!(reply, ops::get_buffer_retention(connection, buffer))
+        }
+        Request::LoadWatchRules { network, reply } => {
+            answer!(reply, ops::load_watch_rules(connection, network))
+        }
+        Request::ReplaceWatchRules {
+            network,
+            rules,
+            reply,
+        } => {
+            answer!(reply, ops::replace_watch_rules(connection, network, &rules))
         }
         Request::AppendHistory { events, reply } => {
             answer!(reply, ops::append_history(connection, &events))

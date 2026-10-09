@@ -116,3 +116,14 @@ Cursors are unaffected. They stay per-`(ClientId, BufferId)` and private, they r
 Each desired channel may persist a detached relay mode (`none`, `mentions`, or `all`), an automatic reattach trigger (`off`, `message`, or `mention`), and a bounded inactivity detach duration. These settings affect only local presentation. Automatic timeout and reattach never issue upstream JOIN or PART commands; automatic reattach requires observed membership and uses the same truthful projection as the explicit command. Activity is evaluated from owner-parsed inbound channel PRIVMSG/NOTICE lines, using the negotiated IRC casemapping for nick boundaries. OTR payloads are opaque and cannot trigger mention behavior. A single generation-owned one-second timer scans at most the bounded desired-channel set and initializes deadlines from fresh monotonic time after reconnect.
 
 Detached relay modes pass only channel chat lines. They do not reveal detached membership, topic, mode, or other control state. The defaults remain `none`/`off`/disabled, and a timer is constrained to 1–86400 seconds.
+
+## Local watch notifications
+
+Watch rules are durable operator configuration; matching results and message bodies are
+not retained as notifications. The owner checks at most 128 literal rules once for each
+parsed inbound message, skips OTR payloads, emits no more than eight hits for one event,
+and coalesces each rule for two seconds. A local NOTICE contains only a process-unique
+sequence and rule id. It goes through each attached session's existing bounded output
+queue, is dropped without blocking IRC processing when that queue is full, and is never
+replayed after reconnect. Diagnostics expose emitted and dropped counts without terms,
+destinations, or bodies.

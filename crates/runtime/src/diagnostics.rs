@@ -117,6 +117,8 @@ pub struct NetworkDiagnostics {
     /// The only one of the three that means data was lost. Reported next to its
     /// siblings so "zero recorded" can be distinguished from "everything was dropped".
     pub history_dropped: u64,
+    pub watch_hits: u64,
+    pub watch_dropped: u64,
     pub upstream_rejected: u64,
     pub fanout_detached: u64,
     pub sessions_accepted: u64,
@@ -251,6 +253,8 @@ pub fn project_network(
         history_recorded: snapshot.history_recorded,
         history_skipped: snapshot.history_skipped,
         history_dropped: snapshot.history_dropped,
+        watch_hits: snapshot.watch_hits,
+        watch_dropped: snapshot.watch_dropped,
         upstream_rejected: snapshot.upstream_rejected,
         fanout_detached: snapshot.fanout_detached,
         sessions_accepted: snapshot.sessions_accepted,
@@ -464,7 +468,7 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
             &format!(
                 "visible={} detached={} overflow={} detached_overflow={} upstream_normal={} \
                  upstream_control={} desired_pending={} routes={} batches={} recorded={} \
-                 skipped={} dropped={} fanout_detached={} accepted={} ended={} rejected={} \
+                 skipped={} dropped={} watch_hits={} watch_dropped={} fanout_detached={} accepted={} ended={} rejected={} \
                  pending_joins={} pending_overflow={} rejected_joins={} rejected_overflow={} \
                  advertised={} advertised_overflow={}",
                 report.channels_visible,
@@ -479,6 +483,8 @@ pub fn render_network(report: &NetworkDiagnostics) -> Vec<DiagnosticLine> {
                 report.history_recorded,
                 report.history_skipped,
                 report.history_dropped,
+                report.watch_hits,
+                report.watch_dropped,
                 report.fanout_detached,
                 report.sessions_accepted,
                 report.sessions_ended,
@@ -690,6 +696,8 @@ mod tests {
                 history_recorded: 0,
                 history_skipped: 0,
                 history_dropped: 0,
+                watch_hits: 0,
+                watch_dropped: 0,
                 upstream_rejected: 0,
                 fanout_detached: 0,
                 sessions_accepted: 1,

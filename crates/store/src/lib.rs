@@ -37,7 +37,8 @@ pub use model::{
     MAX_BUFFERS_PER_NETWORK, MAX_CLIENTS, MAX_DESIRED_CHANNELS, MAX_HISTORY_BATCH,
     MAX_HISTORY_PAYLOAD_BYTES, MAX_HISTORY_QUERY_BYTES, MAX_HISTORY_QUERY_EVENTS, MAX_NETWORKS,
     MAX_RETENTION_DELETE, MAX_SEARCH_BUFFERS, MAX_SEARCH_FIELD_BYTES, MAX_SEARCH_RESULTS,
-    MAX_SEARCH_TERM_BYTES, MAX_SEARCH_TERMS, MAX_TARGET_BYTES,
+    MAX_SEARCH_TERM_BYTES, MAX_SEARCH_TERMS, MAX_TARGET_BYTES, MAX_WATCH_RULES,
+    MAX_WATCH_TERM_BYTES, WatchMatchKind, WatchRule,
 };
 // Registration actions, with the ceilings the store enforces on them. A stored action's
 // payload is a `StoredSecret` for the whole way through, so the durable vocabulary and the

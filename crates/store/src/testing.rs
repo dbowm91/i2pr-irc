@@ -25,7 +25,7 @@ use std::{
 /// The table *set* has been identical across every schema version so far; only the
 /// representation of `history_events.server_time` and `networks.display_name` changed,
 /// and only `desired_channels` gained a column.
-pub const EXPECTED_TABLES: [&str; 11] = [
+pub const EXPECTED_TABLES: [&str; 12] = [
     "buffer_privacy",
     "buffers",
     "client_cursors",
@@ -42,6 +42,7 @@ pub const EXPECTED_TABLES: [&str; 11] = [
     // Schema 7's registration actions. Bounded and allowlisted upstream of here; the store
     // only guarantees it can hold and return them in replay order.
     "registration_actions",
+    "watch_rules",
 ];
 
 /// Creates a database at schema version 1 and returns a raw connection to it.
@@ -265,6 +266,21 @@ pub fn create_v11_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 11)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 12, immediately before local watch rules.
+pub fn create_v12_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v12())
+        .expect("schema 12 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 12)
         .expect("user_version is writable");
     connection
 }

@@ -48,7 +48,7 @@ Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemo
 |---|---|---|---|
 | M011-A | 055 — per-buffer privacy, bounded ephemeral/no-history | closed | plans/implementation/irc-enhancements/055-m011a-buffer-retention-modes-and-schema.md |
 | M011-B | 056 — activity-based detached policy | closed | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
-| M011-C | 057 — local watch/highlight notifications | ready | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
+| M011-C | 057 — local watch/highlight notifications | active | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
 | M011-D | 058 — integrated privacy closure | proposed after 057 | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
 | M012-A | 059 — IRC command pacing and upstream outage gaps | proposed after M011 | plans/implementation/irc-enhancements/059-m012a-command-pacing-and-upstream-gap-ledger.md |
 | M012-B | 060 — optional upstream CHATHISTORY recovery | proposed; live server support research-gated | plans/implementation/irc-enhancements/060-m012b-conditional-upstream-chathistory-reconciliation.md |

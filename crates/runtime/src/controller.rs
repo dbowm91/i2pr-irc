@@ -186,6 +186,16 @@ pub enum ControlRequest {
         activity: i2pr_irc_store::ChannelActivityPolicy,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    WatchRules {
+        network: NetworkId,
+        rules: Option<Vec<i2pr_irc_store::WatchRule>>,
+        reply: oneshot::Sender<Result<Vec<i2pr_irc_store::WatchRule>, RuntimeError>>,
+    },
+    WatchRuleChange {
+        network: NetworkId,
+        change: WatchRuleChange,
+        reply: oneshot::Sender<Result<Vec<i2pr_irc_store::WatchRule>, RuntimeError>>,
+    },
     /// Create one Network, with the identity allocated by the controller.
     CreateNext {
         candidate: NetworkRecord,
@@ -279,6 +289,13 @@ pub enum ControlRequest {
     },
     /// Stop every Network and end the controller.
     Stop { reply: oneshot::Sender<()> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchRuleChange {
+    Add(i2pr_irc_store::WatchRule),
+    Delete(u32),
+    Clear,
 }
 
 /// A fully registered local session being handed to a Network owner.
@@ -505,6 +522,52 @@ impl RuntimeControlHandle {
             network,
             channel,
             activity,
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn watch_rules(
+        &self,
+        network: NetworkId,
+    ) -> Result<Vec<i2pr_irc_store::WatchRule>, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::WatchRules {
+            network,
+            rules: None,
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn set_watch_rules(
+        &self,
+        network: NetworkId,
+        rules: Vec<i2pr_irc_store::WatchRule>,
+    ) -> Result<Vec<i2pr_irc_store::WatchRule>, RuntimeError> {
+        if rules.len() > i2pr_irc_store::MAX_WATCH_RULES
+            || rules.iter().any(|rule| rule.validate().is_err())
+        {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::WatchRules {
+            network,
+            rules: Some(rules),
+            reply,
+        })?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn change_watch_rules(
+        &self,
+        network: NetworkId,
+        change: WatchRuleChange,
+    ) -> Result<Vec<i2pr_irc_store::WatchRule>, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send(ControlRequest::WatchRuleChange {
+            network,
+            change,
             reply,
         })?;
         response.await.unwrap_or(Err(RuntimeError::Stopped))
@@ -792,6 +855,27 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
             .await
             .map_err(map_store)?;
         Ok(())
+    }
+
+    async fn store_watch_rules(
+        &self,
+        network: NetworkId,
+        rules: Vec<i2pr_irc_store::WatchRule>,
+    ) -> Result<Vec<i2pr_irc_store::WatchRule>, RuntimeError> {
+        let store = self.catalog.store();
+        if let Err(error) = store.replace_watch_rules(network, &rules).await {
+            if error.commit_state() != i2pr_irc_store::CommitState::Unknown {
+                return Err(map_store(error));
+            }
+            let durable = store.load_watch_rules(network).await.map_err(map_store)?;
+            if durable != rules {
+                return Err(map_store(error));
+            }
+        }
+        if let Some(owner) = self.catalog.get(network) {
+            owner.set_watch_rules(rules).await?;
+        }
+        store.load_watch_rules(network).await.map_err(map_store)
     }
 
     /// Builds the durable configuration as a secret-free snapshot.
@@ -1168,6 +1252,82 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                     self.reread().await;
                 }
                 let _ = reply.send(outcome);
+            }
+            ControlRequest::WatchRules {
+                network,
+                rules,
+                reply,
+            } => {
+                let result = async {
+                    if !self.records.contains_key(&network) {
+                        return Err(RuntimeError::InvalidConfig);
+                    }
+                    if let Some(rules) = rules {
+                        self.store_watch_rules(network, rules).await
+                    } else {
+                        self.catalog
+                            .store()
+                            .load_watch_rules(network)
+                            .await
+                            .map_err(map_store)
+                    }
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            ControlRequest::WatchRuleChange {
+                network,
+                change,
+                reply,
+            } => {
+                let result = async {
+                    if !self.records.contains_key(&network) {
+                        return Err(RuntimeError::InvalidConfig);
+                    }
+                    let mut rules = self
+                        .catalog
+                        .store()
+                        .load_watch_rules(network)
+                        .await
+                        .map_err(|error| crate::catalog::classify(error.kind()))?;
+                    match change {
+                        WatchRuleChange::Add(mut rule) => {
+                            if rules.len() >= i2pr_irc_store::MAX_WATCH_RULES
+                                || rule.network != network
+                            {
+                                return Err(RuntimeError::InvalidConfig);
+                            }
+                            rule.id = (1..=i2pr_irc_store::MAX_WATCH_RULES as u32)
+                                .find(|id| rules.iter().all(|item| item.id != *id))
+                                .ok_or(RuntimeError::InvalidConfig)?;
+                            if let Some(target) = rule.target.as_deref() {
+                                let buffer = self
+                                    .catalog
+                                    .store()
+                                    .resolve_buffer(network, rule.kind, target)
+                                    .await
+                                    .map_err(map_store)?;
+                                rule.buffer = Some(buffer.buffer);
+                                rule.target = Some(buffer.target);
+                            } else {
+                                rule.buffer = None;
+                            }
+                            rule.validate().map_err(|_| RuntimeError::InvalidConfig)?;
+                            rules.push(rule);
+                        }
+                        WatchRuleChange::Delete(id) => {
+                            let old_len = rules.len();
+                            rules.retain(|rule| rule.id != id);
+                            if rules.len() == old_len {
+                                return Err(RuntimeError::InvalidConfig);
+                            }
+                        }
+                        WatchRuleChange::Clear => rules.clear(),
+                    }
+                    self.store_watch_rules(network, rules).await
+                }
+                .await;
+                let _ = reply.send(result);
             }
             ControlRequest::CreateNext { candidate, reply } => {
                 let _ = reply.send(self.create_next(candidate).await);

@@ -725,6 +725,80 @@ async fn a_detached_channel_stays_joined_upstream_and_keeps_collecting_history()
 }
 
 #[tokio::test]
+async fn local_watch_emits_redacted_bounded_hit_metadata_and_skips_otr() {
+    let (mut harness, _) = Harness::start(&attached_channels(&["#room"])).await;
+    let upstream = harness.bring_online().await;
+    let buffer = harness
+        .store
+        .1
+        .resolve_buffer(NetworkId(1), i2pr_irc_store::BufferKind::Channel, "#room")
+        .await
+        .expect("buffer resolves");
+    let rule = i2pr_irc_store::WatchRule {
+        id: 1,
+        network: NetworkId(1),
+        buffer: Some(buffer.buffer),
+        kind: i2pr_irc_store::BufferKind::Channel,
+        target: Some("#room".into()),
+        matcher: i2pr_irc_store::WatchMatchKind::Keyword,
+        term: "urgent".into(),
+    };
+    let rules = vec![rule];
+    harness
+        .store
+        .1
+        .replace_watch_rules(NetworkId(1), &rules)
+        .await
+        .expect("watch rule persists");
+    let (reply, response) = oneshot::channel();
+    harness
+        .commands
+        .send(SupervisorCommand::WatchRules { rules, reply })
+        .await
+        .expect("watch update queues");
+    response
+        .await
+        .expect("owner replies")
+        .expect("owner loads committed rules");
+    let mut client = harness.attach(1, &[]).await;
+    client.until("366 bot #room").await;
+
+    let mark = client.mark();
+    push_chat(harness.upstream(upstream), "#room", "urgent private body").await;
+    let notice = client.until("WATCH HIT").await;
+    let notice_line = notice
+        .lines()
+        .find(|line| line.contains("WATCH HIT"))
+        .expect("watch notice is present");
+    assert!(notice_line.contains("rule=1"));
+    assert!(
+        !notice_line.contains("urgent private body"),
+        "notification omits matched text"
+    );
+    assert!(
+        !notice_line.contains("#room"),
+        "notification omits buffer destination"
+    );
+    assert!(
+        !client.since(mark).contains("WATCH HIT seq=0"),
+        "sequence ids are nonzero"
+    );
+
+    let before_otr = client.mark();
+    harness
+        .upstream(upstream)
+        .write_all(b":alice!u@h PRIVMSG #room :?OTR: urgent\r\n")
+        .await
+        .expect("OTR fixture writes");
+    client.drain(Duration::from_millis(300)).await;
+    assert!(
+        !client.since(before_otr).contains("WATCH HIT"),
+        "opaque OTR content cannot trigger a watch"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn inactivity_detach_is_bounded_local_policy_and_never_parts_upstream() {
     let mut room = DesiredChannelRecord::at("#room", 0, false);
     room.activity.detach_after_secs = Some(1);

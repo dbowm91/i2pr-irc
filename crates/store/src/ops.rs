@@ -984,6 +984,137 @@ pub(crate) fn set_buffer_retention(
     Ok(())
 }
 
+pub(crate) fn load_watch_rules(
+    connection: &Connection,
+    network: NetworkId,
+) -> Result<Vec<WatchRule>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT rule_id, kind, buffer_id, target, matcher, term FROM watch_rules WHERE network_id=?1 ORDER BY rule_id"
+    ).map_err(|e| sql(e, CommitState::RolledBack))?;
+    let rows = statement
+        .query_map([to_sql_id(network.0)?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let mut rules = Vec::new();
+    for row in rows {
+        let (id, kind, buffer, target, matcher, term) =
+            row.map_err(|e| sql(e, CommitState::RolledBack))?;
+        let rule = WatchRule {
+            id: u32::try_from(id)
+                .map_err(|_| StoreError::new(StoreErrorKind::Corrupt("watch rule id")))?,
+            network,
+            buffer: buffer.map(from_sql_id).transpose()?.map(BufferId),
+            kind: match kind {
+                1 => BufferKind::Channel,
+                2 => BufferKind::Query,
+                _ => {
+                    return Err(StoreError::new(StoreErrorKind::Corrupt(
+                        "watch buffer kind",
+                    )));
+                }
+            },
+            target,
+            matcher: match matcher.as_str() {
+                "keyword" => WatchMatchKind::Keyword,
+                "sender" => WatchMatchKind::Sender,
+                _ => return Err(StoreError::new(StoreErrorKind::Corrupt("watch matcher"))),
+            },
+            term,
+        };
+        rule.validate()
+            .map_err(|reason| StoreError::new(StoreErrorKind::Corrupt(reason)))?;
+        if rules.len() >= MAX_WATCH_RULES {
+            return Err(StoreError::new(StoreErrorKind::Corrupt("watch rule count")));
+        }
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
+pub(crate) fn replace_watch_rules(
+    connection: &mut Connection,
+    network: NetworkId,
+    rules: &[WatchRule],
+) -> Result<(), StoreError> {
+    if rules.len() > MAX_WATCH_RULES
+        || rules
+            .iter()
+            .any(|rule| rule.network != network || rule.validate().is_err())
+    {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "watch rule bounds",
+        )));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if rules.iter().any(|rule| !ids.insert(rule.id)) {
+        return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+            "duplicate watch rule id",
+        )));
+    }
+    let tx = connection
+        .transaction()
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    let network_id = to_sql_id(network.0)?;
+    tx.execute("DELETE FROM watch_rules WHERE network_id=?1", [network_id])
+        .map_err(|e| sql(e, CommitState::RolledBack))?;
+    for rule in rules {
+        if rule.target.is_some() != rule.buffer.is_some() {
+            return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+                "watch buffer scope",
+            )));
+        }
+        if let Some(buffer) = rule.buffer {
+            let expected_buffer_kind = match rule.kind {
+                BufferKind::Channel => 0,
+                BufferKind::Query => 1,
+            };
+            let scope: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT kind,target FROM buffers WHERE buffer_id=?1 AND network_id=?2",
+                    params![to_sql_id(buffer.0)?, network_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| sql(e, CommitState::RolledBack))?;
+            let target_matches =
+                rule.target
+                    .as_ref()
+                    .zip(scope.as_ref())
+                    .is_some_and(|(target, (_, stored))| {
+                        Casemapping::Rfc1459.fold(target.as_bytes())
+                            == Casemapping::Rfc1459.fold(stored.as_bytes())
+                    });
+            if !scope.is_some_and(|(stored_kind, _)| stored_kind == expected_buffer_kind)
+                || !target_matches
+            {
+                return Err(StoreError::new(StoreErrorKind::InvalidRequest(
+                    "watch buffer scope",
+                )));
+            }
+        }
+        let kind = match rule.kind {
+            BufferKind::Channel => 1,
+            BufferKind::Query => 2,
+        };
+        let matcher = match rule.matcher {
+            WatchMatchKind::Keyword => "keyword",
+            WatchMatchKind::Sender => "sender",
+        };
+        let buffer_id = rule.buffer.map(|buffer| to_sql_id(buffer.0)).transpose()?;
+        tx.execute("INSERT INTO watch_rules(network_id,rule_id,kind,buffer_id,target,matcher,term) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![network_id, i64::from(rule.id), kind, buffer_id, rule.target, matcher, rule.term])
+            .map_err(|e| sql(e, CommitState::RolledBack))?;
+    }
+    tx.commit().map_err(|e| sql(e, CommitState::Unknown))
+}
+
 fn direction_code(kind: BufferKind) -> i64 {
     match kind {
         BufferKind::Channel => 0,

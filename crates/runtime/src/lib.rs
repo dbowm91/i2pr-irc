@@ -38,6 +38,7 @@ pub mod routing;
 pub mod search;
 pub mod session;
 pub mod state;
+mod watch_rules;
 
 pub use admission::{AdmissionOutcome, DownstreamAdmission, PreparedSession};
 pub use controller::{

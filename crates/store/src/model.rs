@@ -36,6 +36,10 @@ pub const MAX_BUFFER_RETENTION_AGE_SECS: u64 = 31_536_000;
 pub const MAX_BUFFER_RETENTION_EVENTS: u32 = 1_000_000;
 /// Maximum retained payload bytes permitted for a per-buffer persistent history override.
 pub const MAX_BUFFER_RETENTION_BYTES: u64 = 1_073_741_824;
+/// Maximum local watch rules one Network may hold.
+pub const MAX_WATCH_RULES: usize = 128;
+/// Maximum bytes in one literal watch term.
+pub const MAX_WATCH_TERM_BYTES: usize = 128;
 
 /// Ceiling on one retained upstream `msgid`.
 pub const MAX_HISTORY_MSGID_BYTES: usize = 64;
@@ -109,6 +113,63 @@ pub struct BufferRetentionPolicy {
     pub max_age_secs: Option<u64>,
     pub max_events: Option<u32>,
     pub max_payload_bytes: Option<u64>,
+}
+
+/// Match shape for a local notification rule. Patterns are literal strings; the
+/// runtime does not interpret user input as a regular expression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchMatchKind {
+    Keyword,
+    Sender,
+}
+
+/// Durable local-only rule. A missing target scopes it to all buffers on this
+/// Network; otherwise target is a channel or query name interpreted with IRC casemap.
+#[derive(Clone, Eq, PartialEq)]
+pub struct WatchRule {
+    pub id: u32,
+    pub network: NetworkId,
+    /// Stable privacy/history buffer scope. `None` means all buffers of `kind`.
+    pub buffer: Option<BufferId>,
+    pub kind: BufferKind,
+    pub target: Option<String>,
+    pub matcher: WatchMatchKind,
+    pub term: String,
+}
+
+impl std::fmt::Debug for WatchRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchRule")
+            .field("id", &self.id)
+            .field("network", &self.network)
+            .field("kind", &self.kind)
+            .field("buffer", &self.buffer)
+            .field("target", &"[redacted]")
+            .field("matcher", &self.matcher)
+            .field("term", &"[redacted]")
+            .finish()
+    }
+}
+
+impl WatchRule {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.id == 0
+            || self.id > MAX_WATCH_RULES as u32
+            || self.term.is_empty()
+            || self.term.len() > MAX_WATCH_TERM_BYTES
+            || !self.term.bytes().all(|b| !b.is_ascii_control())
+            || self.target.as_ref().is_some_and(|target| {
+                target.is_empty()
+                    || target.len() > MAX_TARGET_BYTES
+                    || target
+                        .bytes()
+                        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+            })
+        {
+            return Err("watch rule shape");
+        }
+        Ok(())
+    }
 }
 
 impl BufferRetentionPolicy {

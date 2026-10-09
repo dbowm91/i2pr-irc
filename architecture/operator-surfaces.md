@@ -107,6 +107,19 @@ attribute is refused. A timed detach changes only local presentation; it never s
 upstream PART. Automatic reattach uses the owner’s observed channel state and shares the
 same presentation policy across attached sessions.
 
+## Local watch rules
+
+`WATCH ADD <netid> <channel|query> <target|*> <keyword|sender> <term>` installs a durable,
+Network-scoped literal rule, with target-specific rules tied to a stable `BufferId`.
+`WATCH LIST <netid>`, `WATCH DELETE <netid> <id>`, and
+`WATCH CLEAR <netid>` inspect or change the set. Each Network is limited to 128 rules and
+each term to 128 bytes; there is no regex or script interpreter. Matching happens once on
+parsed inbound PRIVMSG/NOTICE events. OTR is skipped. A hit is sent only to attached local
+sessions as a NOTICE containing a process-unique sequence and rule id; it omits message text
+and destination and is not replayed after reconnect. Matching is coalesced per rule, output
+is best-effort through each bounded client queue, and `diag` reports emitted and dropped
+notification counts. No external notification path exists.
+
 ### Import boundary
 
 Import is **plan-then-apply, per Network**, and is deliberately not transactional across

@@ -92,6 +92,10 @@ pub enum SupervisorCommand {
         policy: i2pr_irc_store::BufferRetentionPolicy,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    WatchRules {
+        rules: Vec<i2pr_irc_store::WatchRule>,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     /// End this Network's upstream session and every attached session.
     Stop { reply: oneshot::Sender<()> },
 }
@@ -211,6 +215,17 @@ impl SupervisorHandle {
                 policy,
                 reply,
             })
+            .map_err(|_| RuntimeError::QueueOverloaded)?;
+        response.await.unwrap_or(Err(RuntimeError::Stopped))
+    }
+
+    pub async fn set_watch_rules(
+        &self,
+        rules: Vec<i2pr_irc_store::WatchRule>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .try_send(SupervisorCommand::WatchRules { rules, reply })
             .map_err(|_| RuntimeError::QueueOverloaded)?;
         response.await.unwrap_or(Err(RuntimeError::Stopped))
     }

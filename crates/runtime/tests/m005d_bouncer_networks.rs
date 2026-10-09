@@ -1071,6 +1071,37 @@ async fn the_local_service_administers_presence_and_channel_policy() {
     );
 
     client
+        .send("PRIVMSG BouncerServ :watch add 1 channel #room keyword urgent\r\n")
+        .await;
+    client.until("Updated watch rules").await;
+    let rules = runtime
+        .store
+        .1
+        .load_watch_rules(NetworkId(1))
+        .await
+        .expect("watch rules persist");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].term, "urgent");
+    client.send("PRIVMSG BouncerServ :watch list 1\r\n").await;
+    client
+        .until("watch id=1 channel #room keyword urgent")
+        .await;
+    let delete_mark = client.mark();
+    client
+        .send("PRIVMSG BouncerServ :watch delete 1 1\r\n")
+        .await;
+    client.await_new(delete_mark, "Updated watch rules").await;
+    assert!(
+        runtime
+            .store
+            .1
+            .load_watch_rules(NetworkId(1))
+            .await
+            .expect("watch rules reload")
+            .is_empty()
+    );
+
+    client
         .send("PRIVMSG BouncerServ :presence set 1 auto_away=on\r\n")
         .await;
     client.until("Updated presence policy").await;

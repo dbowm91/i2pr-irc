@@ -197,6 +197,13 @@ fields, allowing opaque OTR ciphertext to remain in history without a searchable
 row. Startup verifies that every marked event has exactly one FTS row and that no FTS row
 points at an event marked unindexed.
 
+Version 13 adds `watch_rules`, keyed by Network and bounded rule id. Target-specific rules
+reference a stable `BufferId`; a rule without a buffer applies to every buffer of its kind.
+Rules hold only the operator-selected literal matcher, kind, and scope; existing stores
+migrate with no rules. They are not history events, notification text, or message-derived
+search terms. Store validation caps each Network at 128 rules and each term at 128 bytes.
+Network and buffer deletion cascade to the associated rules.
+
 The runtime keeps ephemeral history in a process-local ring capped at 512 events, 1 MiB,
 and 128 events per buffer. Eviction zeroizes retained payload and derived search fields;
 process exit loses the ring. No-history avoids payload construction and durable writes.

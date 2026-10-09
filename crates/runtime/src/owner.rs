@@ -44,6 +44,18 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+static NEXT_LOCAL_NOTIFICATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_local_notification_id() -> Option<u64> {
+    NEXT_LOCAL_NOTIFICATION
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| current.checked_add(1),
+        )
+        .ok()
+}
 use tokio::{
     io::AsyncReadExt,
     sync::{mpsc, watch},
@@ -745,6 +757,9 @@ pub struct NetworkSnapshot {
     pub history_skipped: u64,
     /// Lines dropped because the ingestion queue was full.
     pub history_dropped: u64,
+    /// Local watch matches emitted or dropped because a bounded client queue refused them.
+    pub watch_hits: u64,
+    pub watch_dropped: u64,
     /// Live upstream frames refused by one attached client's own bounded normal queue.
     ///
     /// Each refusal means that client lost a frame and was therefore desynchronized, so
@@ -1327,6 +1342,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         // the birth record instead would silently drop it on the next reconnect.
         let desired = self.durable_desired_policy().await;
         let mut state = NetworkState::new(&self.context.record.nick, &desired);
+        let mut watch_rules = match self.context.store.load_watch_rules(self.network).await {
+            Ok(rules) => rules,
+            Err(_) => {
+                self.snapshot
+                    .send_modify(|snapshot| snapshot.last_error = Some("watch policy unavailable"));
+                Vec::new()
+            }
+        };
+        let mut watch_limiter = crate::watch_rules::WatchLimiter::default();
         // Presence policy is durable; the away state upstream currently holds is not.
         // A fresh generation starts with no upstream away state, so the current policy is
         // re-applied after registration rather than a stale observation being restored.
@@ -1855,6 +1879,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             &mut no_history_buffers,
                             &mut reconcile,
                             &mut activity_deadlines,
+                            &mut watch_rules,
                             advertised_downstream.iter().cloned().collect(),
                             used_fallback_nick,
                             &fallback,
@@ -2313,6 +2338,38 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 }),
                             }
                         }
+                        if (message.command.eq_ignore_ascii_case(b"PRIVMSG") || message.command.eq_ignore_ascii_case(b"NOTICE"))
+                            && !crate::journal::is_otr_message(&message)
+                            && message.prefix.as_deref().is_some_and(|prefix| {
+                                let sender = prefix.split(|byte| *byte == b'!').next().unwrap_or_default();
+                                !state.same_nick(&String::from_utf8_lossy(sender), &state.nick)
+                            })
+                            && let Some((kind, target)) = history_buffer_target(&message, &state.nick)
+                        {
+                            let buffer = match kind {
+                                BufferKind::Channel => buffers.get(&casemapped(target)).copied(),
+                                BufferKind::Query => query_buffers.get(&casemapped(target)).copied(),
+                            };
+                            let hits = watch_limiter.eligible(&watch_rules, kind, target, buffer, &message, state.casemapping, std::time::Instant::now());
+                            for rule_id in hits {
+                                if sessions.is_empty() {
+                                    self.snapshot.send_modify(|snapshot| snapshot.watch_dropped = snapshot.watch_dropped.saturating_add(1));
+                                    continue;
+                                }
+                                let Some(sequence) = next_local_notification_id() else {
+                                    self.snapshot.send_modify(|snapshot| snapshot.watch_dropped = snapshot.watch_dropped.saturating_add(sessions.len() as u64));
+                                    continue;
+                                };
+                                let line = format!(":BouncerServ NOTICE {} :WATCH HIT seq={} rule={}\r\n", state.nick, sequence, rule_id);
+                                for session in sessions.values() {
+                                    if session.handle().queue_normal(&line).is_err() {
+                                        self.snapshot.send_modify(|snapshot| snapshot.watch_dropped = snapshot.watch_dropped.saturating_add(1));
+                                    } else {
+                                        self.snapshot.send_modify(|snapshot| snapshot.watch_hits = snapshot.watch_hits.saturating_add(1));
+                                    }
+                                }
+                            }
+                        }
                         // A reattach whose membership was still absent is projected here,
                         // when the authoritative self JOIN finally confirms it, and not
                         // when it was requested. Projecting at request time would tell a
@@ -2410,6 +2467,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         no_history_buffers: &mut BTreeSet<BufferId>,
         reconcile: &mut DesiredReconcile,
         activity_deadlines: &mut BTreeMap<String, Instant>,
+        watch_rules: &mut Vec<i2pr_irc_store::WatchRule>,
         // What this generation advertises, for a session attaching right now. Passed in
         // rather than read from the snapshot: `watch` shares one lock between reads and
         // writes, and attaching writes to that same snapshot, so a borrow held across the
@@ -2608,6 +2666,25 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     }
                     Err(error) => Err(error),
                 };
+                let _ = reply.send(outcome);
+            }
+            SupervisorCommand::WatchRules { rules, reply } => {
+                let outcome = self
+                    .context
+                    .store
+                    .load_watch_rules(self.network)
+                    .await
+                    .map_err(|error| crate::catalog::classify(error.kind()))
+                    .and_then(|durable| {
+                        if durable == rules {
+                            Ok(())
+                        } else {
+                            Err(RuntimeError::InvalidConfig)
+                        }
+                    });
+                if outcome.is_ok() {
+                    *watch_rules = rules;
+                }
                 let _ = reply.send(outcome);
             }
             SupervisorCommand::Reconcile { reply } => {

@@ -328,6 +328,70 @@ impl ControlSurface {
                     )
                 }
             }
+            ServCommand::WatchList { network } => {
+                if !self.require_network(network, &verb).await {
+                    return;
+                }
+                match self.control.watch_rules(network).await {
+                    Ok(rules) => {
+                        if rules.is_empty() {
+                            self.notice("No watch rules");
+                        }
+                        for rule in rules {
+                            let kind = match rule.kind {
+                                i2pr_irc_store::BufferKind::Channel => "channel",
+                                i2pr_irc_store::BufferKind::Query => "query",
+                            };
+                            let matcher = match rule.matcher {
+                                i2pr_irc_store::WatchMatchKind::Keyword => "keyword",
+                                i2pr_irc_store::WatchMatchKind::Sender => "sender",
+                            };
+                            let target = rule.target.as_deref().unwrap_or("*");
+                            self.notice(&format!(
+                                "watch id={} {kind} {target} {matcher} {}",
+                                rule.id, rule.term
+                            ));
+                        }
+                    }
+                    Err(error) => self.fail(&verb, &map_control(error)),
+                }
+            }
+            ServCommand::WatchAdd { rule } => {
+                if self.require_network(rule.network, &verb).await {
+                    self.finish_watch_update(
+                        self.control
+                            .change_watch_rules(
+                                rule.network,
+                                crate::controller::WatchRuleChange::Add(rule),
+                            )
+                            .await,
+                        &verb,
+                    );
+                }
+            }
+            ServCommand::WatchDelete { network, id } => {
+                if self.require_network(network, &verb).await {
+                    self.finish_watch_update(
+                        self.control
+                            .change_watch_rules(
+                                network,
+                                crate::controller::WatchRuleChange::Delete(id),
+                            )
+                            .await,
+                        &verb,
+                    );
+                }
+            }
+            ServCommand::WatchClear { network } => {
+                if self.require_network(network, &verb).await {
+                    self.finish_watch_update(
+                        self.control
+                            .change_watch_rules(network, crate::controller::WatchRuleChange::Clear)
+                            .await,
+                        &verb,
+                    );
+                }
+            }
             ServCommand::HistoryStatus {
                 network,
                 kind,
@@ -639,6 +703,17 @@ impl ControlSurface {
         ok: &str,
     ) {
         self.finish_inner(outcome, subcommand, ok)
+    }
+
+    fn finish_watch_update(
+        &mut self,
+        outcome: Result<Vec<i2pr_irc_store::WatchRule>, crate::RuntimeError>,
+        verb: &str,
+    ) {
+        match outcome {
+            Ok(_) => self.notice("Updated watch rules"),
+            Err(error) => self.fail(verb, &map_control(error)),
+        }
     }
 
     fn finish_inner(

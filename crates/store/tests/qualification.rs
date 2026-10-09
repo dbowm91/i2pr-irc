@@ -11,8 +11,8 @@ use i2pr_irc_store::{
     MAX_SEARCH_RESULTS, MAX_SEARCH_TERMS, MsgidLookup, NetworkId, NetworkRecord, NewHistoryEvent,
     RegistrationActionKind, RegistrationActionPhase, RetentionRequest, SCHEMA_VERSION,
     STORE_QUEUE_CAPACITY, SearchFields, SearchQuery, SearchTerm, Store, StoreErrorKind,
-    StoreHandle, StoreHealth, StorePath, StoredRegistrationAction, StoredSecret, attached_channels,
-    fallback_display_name,
+    StoreHandle, StoreHealth, StorePath, StoredRegistrationAction, StoredSecret, WatchMatchKind,
+    WatchRule, attached_channels, fallback_display_name,
     testing::{self, EXPECTED_TABLES},
 };
 use i2pr_irc_wire::IrcTimestamp;
@@ -2019,6 +2019,55 @@ async fn schema_eleven_migration_defaults_activity_controls_off() {
 }
 
 #[tokio::test]
+async fn watch_rules_round_trip_and_v12_migration_starts_empty() {
+    let dir = testing::temp_dir("watchrules");
+    let path = dir.db("watchrules.sqlite3");
+    let predecessor = testing::create_v12_database(&path);
+    predecessor.execute_batch("INSERT INTO networks (network_id, endpoint, endpoint_kind, nick, username, realname, display_name) VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p', 1, 'bot', 'user', 'bouncer', 'lab');").expect("network fixture seeds");
+    drop(predecessor);
+    let store = store_at(&path);
+    let handle = store.handle();
+    assert!(
+        handle
+            .load_watch_rules(NetworkId(1))
+            .await
+            .expect("rules load")
+            .is_empty()
+    );
+    let buffer = handle
+        .resolve_buffer(NetworkId(1), BufferKind::Channel, "#room")
+        .await
+        .expect("scope buffer resolves");
+    let rule = WatchRule {
+        id: 1,
+        network: NetworkId(1),
+        buffer: Some(buffer.buffer),
+        kind: BufferKind::Channel,
+        target: Some("#room".into()),
+        matcher: WatchMatchKind::Keyword,
+        term: "urgent".into(),
+    };
+    handle
+        .replace_watch_rules(NetworkId(1), std::slice::from_ref(&rule))
+        .await
+        .expect("rule commits");
+    let debug = format!("{rule:?}");
+    assert!(debug.contains("[redacted]"));
+    assert!(
+        !debug.contains("urgent"),
+        "watch terms never enter debug output"
+    );
+    assert_eq!(
+        handle
+            .load_watch_rules(NetworkId(1))
+            .await
+            .expect("rules reload"),
+        vec![rule]
+    );
+    store.shutdown().expect("store shuts down");
+}
+
+#[tokio::test]
 async fn a_detach_matching_uses_the_rfc1459_fold() {
     let dir = testing::temp_dir("detachfold");
     let path = dir.db("detachfold.sqlite3");
@@ -3090,6 +3139,7 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         9 => drop(testing::create_v9_database(path)),
         10 => drop(testing::create_v10_database(path)),
         11 => drop(testing::create_v11_database(path)),
+        12 => drop(testing::create_v12_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }
