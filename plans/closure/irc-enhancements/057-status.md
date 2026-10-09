@@ -2,7 +2,7 @@
 
 Status: closed
 Implementation commit: `2f652b7` — `feat(runtime): add bounded local watch notifications`
-Closure commit: pending
+Closure commit: `602e162` — `docs(plans): close IRC watch plan 057`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
