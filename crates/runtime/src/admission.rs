@@ -131,6 +131,12 @@ impl PreparedSession {
     pub(crate) fn publish_negotiated(&self) {
         self.wiring.set_negotiated(&self.negotiated);
     }
+
+    /// Refuses a stale prepared identity on the same live socket and drains the final
+    /// protocol numeric before the writer task is closed.
+    pub(crate) async fn refuse(self, line: &str) {
+        self.wiring.respond_and_close(line).await;
+    }
 }
 
 /// Accepts exactly one local connection and decides where it goes.

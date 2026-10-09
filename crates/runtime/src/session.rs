@@ -834,6 +834,20 @@ impl<D: ByteStream + 'static> ClientWiring<D> {
         }
     }
 
+    /// Queues one final protocol response, releases the read side and senders, and lets
+    /// the owned writer drain before closing the stream.
+    pub(crate) async fn respond_and_close(self, line: &str) {
+        let Self {
+            reader,
+            handle,
+            writer,
+        } = self;
+        let _ = handle.queue_control(line);
+        drop(reader);
+        drop(handle);
+        writer.close_after_drain().await;
+    }
+
     /// Builds the canonical session reader from an authenticated registration
     /// checkpoint. Already answered CAP/auth lines are represented as state and never
     /// replayed; unread IRC frames are fed into the same bounded decoder used normally.
