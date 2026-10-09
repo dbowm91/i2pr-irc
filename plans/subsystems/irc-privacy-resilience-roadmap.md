@@ -1,5 +1,5 @@
 # IRC Privacy, Resilience and Compatibility Roadmap
-Status: M011–M013 registered planning track; Plan 055 is closed, Plan 056 is ready, and later plans remain dependency-gated.
+Status: M011–M013 registered planning track; Plans 055-056 are closed, Plan 057 is ready, and later plans remain dependency-gated.
 Research: plans/research/011-irc-privacy-resilience-authentication.md
 ADRs: ADR-0008 and ADR-0009; all prior accepted ADRs remain binding.
 Baseline: work/plans-050-054-m010-standalone (M010-E Plan 054 active).
@@ -12,8 +12,8 @@ M010 standalone qualification and R002 managed-app interfaces remain independent
 ## Dependency graph
 M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 active)
   -> M011-A / 055 buffer privacy + migrations [closed]
-  -> M011-B / 056 detached activity policy [ready]
-  -> M011-C / 057 local watch and notification [proposed after 056]
+  -> M011-B / 056 detached activity policy [closed]
+  -> M011-C / 057 local watch and notification [ready]
   -> M011-D / 058 integration/closure [proposed after 057]
   -> M012-A / 059 IRC pacing and upstream gap records [proposed after 058]
   -> M012-B / 060 conditional upstream history reconciliation [proposed after 059; server-capability gated]

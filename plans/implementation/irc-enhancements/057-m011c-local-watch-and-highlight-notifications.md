@@ -1,6 +1,6 @@
 # Plan 057 — M011-C — ZNC-Style Local Watch and Highlight Rules
 
-Status: proposed
+Status: ready
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -15,7 +15,7 @@ Offer local-only typed mention/keyword/sender watches usable by future i2pr cons
 
 ## Readiness and dependencies
 Plan 056 closed; Plan 055 privacy gating available.
-Only Plan 055 is currently marked ready. Promoting this plan to ready requires proof its named predecessor is closed and a fresh source/dependency check. Separate M010 live product-path blocker does not falsely mark these core-only designs closed.
+Plan 056 closed in implementation commit `2ebf576`. Fresh source check confirms owner-observed parsed channel messages, negotiated casemapping, OTR detection, per-buffer privacy policy, stable ClientId cursors, and authenticated bounded BouncerServ/session control paths are available. There is no existing event-driven watch service or notification queue; those are this plan's implementation scope. M010 live product-path qualification is independent and does not block this core-only work.
 
 ## Existing code/evidence and required invariant
 History FTS5 search is indexed; there is no event-driven rule service or local notification queue. Existing downstream sessions and BouncerServ are already authenticated.

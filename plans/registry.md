@@ -28,7 +28,7 @@ Canonical direction:
 |---|---|---|---|---|
 | Bouncer core | post-M009 complete, no active plan | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | M001-M009 remain historical product closures; Corrective 049 closed the post-M009 SAM framing defect and the registry/README/roadmap reconciliation. |
 | Standalone daemon/local access | M010 in progress; 050-053 closed; 054 active with live-service evidence blocker | plans/subsystems/standalone-daemon-roadmap.md | M010-E / Plan 054 | M010 closure requires controlled live i2pd-to-IRC product-path evidence; no R002 dependency. |
-| IRC privacy, resilience and authentication | M011 in progress; 055 closed, 056 ready, later plans dependency-gated | plans/subsystems/irc-privacy-resilience-roadmap.md | M011-B / Plan 056 | Plan 055 closure evidence is recorded; core work does not depend on managed-app R002. Optional TLS/EXTERNAL Plan 065 remains research-blocked; no clearnet override. |
+| IRC privacy, resilience and authentication | M011 in progress; 055-056 closed, 057 ready | plans/subsystems/irc-privacy-resilience-roadmap.md | M011-C / Plan 057 | Plans 055-056 closure evidence is recorded; core work does not depend on managed-app R002. Optional TLS/EXTERNAL Plan 065 remains research-blocked; no clearnet override. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
@@ -36,7 +36,7 @@ Canonical direction:
 | Plan | Status | Class | Roadmap | Handoff |
 |---|---|---|---|---|
 | Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
-| IRC M011-B / Plan 056 — Activity-Aware Detached Channels and Reattachment | active | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
+| IRC M011-C / Plan 057 — Local Watch and Highlight Notifications | active | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
 
 Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
 
@@ -47,8 +47,8 @@ Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemo
 | Milestone | Plan | Status | Handoff |
 |---|---|---|---|
 | M011-A | 055 — per-buffer privacy, bounded ephemeral/no-history | closed | plans/implementation/irc-enhancements/055-m011a-buffer-retention-modes-and-schema.md |
-| M011-B | 056 — activity-based detached policy | ready | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
-| M011-C | 057 — local watch/highlight notifications | proposed after 056 | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
+| M011-B | 056 — activity-based detached policy | closed | plans/implementation/irc-enhancements/056-m011b-detached-channel-activity-policy.md |
+| M011-C | 057 — local watch/highlight notifications | ready | plans/implementation/irc-enhancements/057-m011c-local-watch-and-highlight-notifications.md |
 | M011-D | 058 — integrated privacy closure | proposed after 057 | plans/implementation/irc-enhancements/058-m011d-privacy-feature-integration-and-closure.md |
 | M012-A | 059 — IRC command pacing and upstream outage gaps | proposed after M011 | plans/implementation/irc-enhancements/059-m012a-command-pacing-and-upstream-gap-ledger.md |
 | M012-B | 060 — optional upstream CHATHISTORY recovery | proposed; live server support research-gated | plans/implementation/irc-enhancements/060-m012b-conditional-upstream-chathistory-reconciliation.md |
@@ -59,7 +59,7 @@ Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemo
 | M013-C | 065 — optional inner TLS + SASL EXTERNAL | research-blocked until preflight | plans/implementation/irc-enhancements/065-m013c-i2p-tls-sasl-external.md |
 | M013-D | 066 — compatibility and authentication closure | proposed after 063-065 disposition | plans/implementation/irc-enhancements/066-m013d-compatibility-closure.md |
 
-Plan 055 is closed with evidence at `plans/closure/irc-enhancements/055-status.md`; Plan 056 is ready after a fresh dependency/source check. Plans 057-058 remain gated on their named predecessors. Plan 054 is independently active and remains blocked on external controlled live IRC evidence. The default profiles are plain IRC over typed I2P streams: IRC2P typically NickServ without SASL; ILITA operator-configured required SASL PLAIN. Current deployed mechanisms must be verified by authorized live CAP evidence. Optional EXTERNAL needs explicit authenticated TLS-over-I2P and client certificate; no clearnet connector or user override is authorized.
+Plans 055-056 are closed with evidence at `plans/closure/irc-enhancements/055-status.md` and `056-status.md`; Plan 057 is ready after fresh source/dependency review. Plan 058 remains gated on 057. Plan 054 is independently active and remains blocked on external controlled live IRC evidence. The default profiles are plain IRC over typed I2P streams: IRC2P typically NickServ without SASL; ILITA operator-configured required SASL PLAIN. Current deployed mechanisms must be verified by authorized live CAP evidence. Optional EXTERNAL needs explicit authenticated TLS-over-I2P and client certificate; no clearnet connector or user override is authorized.
 
 ## Recently closed implementation plans
 
