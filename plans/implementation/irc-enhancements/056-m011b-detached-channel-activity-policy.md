@@ -1,6 +1,6 @@
 # Plan 056 — M011-B — Activity-Aware Detached Channels and Reattachment
 
-Status: proposed
+Status: ready
 Date: 2026-10-09
 Class: capability + security invariant
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -14,8 +14,7 @@ Closure evidence location: plans/closure/irc-enhancements/056-status.md
 Add soju-inspired activity and notification-based detach/reattach while preserving upstream membership and per-client state fidelity.
 
 ## Readiness and dependencies
-Plan 055 closed; existing M005 detached-channel owner model remains authoritative.
-Only Plan 055 is currently marked ready. Promoting this plan to ready requires proof its named predecessor is closed and a fresh source/dependency check. Separate M010 live product-path blocker does not falsely mark these core-only designs closed.
+Plan 055 closed in implementation commit `eada883`; current-toolchain and Rust 1.88 full verification passed. Fresh source check confirms the existing M005 owner-owned detached flag and truthful visibility projection in `crates/runtime/src/owner.rs`, `ChannelPolicy`, and `crates/runtime/tests/m005b_detached_policy.rs`. Plan 056 is ready. Its implementation must preserve that model and add local activity policy only; no dependency on M010's external live-service evidence is asserted.
 
 ## Existing code/evidence and required invariant
 M005-B already has a durable detached flag with PART :detach semantics; passive/active downstream presence and fixed owner generation are implemented.

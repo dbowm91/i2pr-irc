@@ -1,6 +1,6 @@
 # Plan 055 — M011-A — Per-Buffer Retention, Ephemeral Storage, and No-History Policy
 
-Status: active
+Status: closed
 Date: 2026-10-09
 Class: invariant + capability
 Subsystem: plans/subsystems/irc-privacy-resilience-roadmap.md
@@ -21,7 +21,7 @@ Only Plan 055 is currently marked ready. Promoting this plan to ready requires p
 Current Store retains chat in SQLite+FTS5; history journal uses per-ClientId cursors; detached buffers are ingested; opaque OTR messages can be retained as ciphertext. No per-buffer retention exists.
 
 ## Implementation progress (2026-10-09)
-The v9-v11 schema, typed policy record, bounded policy validation, transactional stricter-mode purge marker, restart-resumed 4096-row purge batches, persistent age/count/byte enforcement, and durable append/query/FTS gates are implemented. The runtime provides a zeroizing process-local ephemeral ring and local `BouncerServ` history status/set controls. Schema v11 records search-index eligibility so OTR remains opaque without weakening index integrity checks. Tests cover no-history durable/FTS suppression, OTR opacity, ephemeral history/cursors/search and restart loss, persistent event/age ceilings, policy migration, and purge continuation. Implementation is in progress pending full current-toolchain and Rust 1.88 verification and formal closure evidence.
+The v9-v11 schema, typed policy record, bounded policy validation, transactional stricter-mode purge marker, restart-resumed 4096-row purge batches, persistent age/count/byte enforcement, and durable append/query/FTS gates are implemented. The runtime provides a zeroizing process-local ephemeral ring and local `BouncerServ` history status/set controls. Schema v11 records search-index eligibility so OTR remains opaque without weakening index integrity checks. Tests cover no-history durable/FTS suppression, OTR opacity, ephemeral history/cursors/search and restart loss, persistent event/age ceilings, policy migration, and purge continuation. Plan 055 closed after current-toolchain and Rust 1.88 full verification.
 Maintain one NetworkOwner per Network, bounded memory/queues/timers, SessionId/ClientId separation, stable upstream CAP request independent of attached downstream clients, generation-fenced reconnect, no replay of non-idempotent chat, and typed I2P-only upstream authority. Preserve downstream local Operator authentication and SQLCipher/OTR separation.
 
 ## Production scope and ordered work packages
