@@ -2,7 +2,7 @@
 
 Status: conditionally closed; deterministic product-path qualification passed; pinned Eggchaos and deployed-service qualification remain open evidence conditions
 Implementation commit: `f028a43` — `feat(runtime): add attested I2P endpoint failover`
-Closure commit: pending
+Closure commit: `34d3bb6` — `docs(plans): conditionally close M012 qualification and start M013-A`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
