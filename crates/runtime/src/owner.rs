@@ -2366,7 +2366,8 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                     session_tx,
                     sessions,
                     &self.snapshot,
-                );
+                )
+                .await;
                 if accepted.is_ok() {
                     // An adopted session registered during admission and may already have
                     // declared itself passive; its intent arrived through the ordinary
@@ -4174,7 +4175,7 @@ fn attach_session<D: ByteStream + 'static>(
 /// path rather than performed here. That is deliberate: there is exactly one
 /// implementation of the projection, so an adopted client and an attached one cannot
 /// diverge, and neither can be projected twice.
-fn adopt_prepared_session(
+async fn adopt_prepared_session(
     prepared: Box<crate::admission::PreparedSession>,
     expected_nick: &str,
     preferred_nick: &str,
@@ -4201,9 +4202,8 @@ fn adopt_prepared_session(
         // here. Silently closing would be indistinguishable from a network fault, and
         // would leave a client that reconnected on the same stale selection with no way
         // to tell that its configuration is what changed.
-        let _ = prepared.handle().queue_control(&format!(
-            ":bouncer 433 {claimed} :Nickname unavailable on this network\r\n"
-        ));
+        let line = format!(":bouncer 433 {claimed} :Nickname unavailable on this network\r\n");
+        prepared.refuse(&line).await;
         return Err(RuntimeError::InvalidConfig);
     }
     let mut prepared = prepared;

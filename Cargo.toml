@@ -8,6 +8,7 @@ members = [
     "crates/testkit",
     "crates/runtime",
     "crates/fuzz-smoke",
+    "crates/daemon",
 ]
 
 [workspace.package]
@@ -24,7 +25,11 @@ base64 = "0.22"
 # R001-B session identity. The only OS-random primitive in the workspace; see
 # crates/sam/Cargo.toml for the license and MSRV review.
 getrandom = "0.3"
+sha2 = "0.10"
+subtle = "2.6"
+nix = { version = "0.29", default-features = false, features = ["user"] }
 zeroize = "1"
+fs2 = "0.4"
 # M003 storage boundary. `bundled` compiles a pinned SQLite so supported binary
 # behavior does not depend on a host library, and `default-features = false` keeps
 # the build-script/network feature set off. See architecture/dependency-review.md.

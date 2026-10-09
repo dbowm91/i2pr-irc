@@ -187,7 +187,7 @@ const WRITER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 
 pub struct SessionWriter {
     exit: mpsc::Receiver<io::Result<()>>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
 }
 impl SessionWriter {
     /// Completes when the owned writer task ends.
@@ -195,9 +195,11 @@ impl SessionWriter {
         self.exit.recv().await.unwrap_or(Ok(()))
     }
     /// Aborts and joins the owned writer task so no client work outlives its session.
-    pub async fn shutdown(self) {
-        self.handle.abort();
-        let _ = self.handle.await;
+    pub async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     /// Lets queued frames reach the socket, then closes.
@@ -210,14 +212,25 @@ impl SessionWriter {
     ///
     /// The caller must have released the session handle first: the writer only finishes
     /// once both bounded queues are closed, and the handle is what holds their senders.
-    pub async fn close_after_drain(self) {
-        let Self { mut exit, handle } = self;
-        if crate::timeout_bounded(WRITER_DRAIN_DEADLINE, exit.recv())
+    pub async fn close_after_drain(mut self) {
+        if crate::timeout_bounded(WRITER_DRAIN_DEADLINE, self.exit.recv())
             .await
             .is_err()
         {
-            handle.abort();
+            if let Some(handle) = self.handle.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        } else if let Some(handle) = self.handle.take() {
             let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for SessionWriter {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
         }
     }
 }
@@ -272,7 +285,7 @@ pub fn spawn_session_writer<D: ByteStream + 'static>(
         normal_tx,
         SessionWriter {
             exit: exit_rx,
-            handle,
+            handle: Some(handle),
         },
     )
 }
@@ -308,7 +321,7 @@ pub fn spawn_raw_writer<D: ByteStream + 'static>(
         normal_tx,
         SessionWriter {
             exit: exit_rx,
-            handle,
+            handle: Some(handle),
         },
     )
 }

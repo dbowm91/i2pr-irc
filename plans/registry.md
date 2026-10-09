@@ -27,11 +27,18 @@ Canonical direction:
 | Subsystem | Status | Roadmap | Current milestone | Dependencies or blockers |
 |---|---|---|---|---|
 | Bouncer core | post-M009 complete, no active plan | plans/subsystems/bouncer-core-roadmap.md | No registered successor plan | M001-M009 remain historical product closures; Corrective 049 closed the post-M009 SAM framing defect and the registry/README/roadmap reconciliation. |
+| Standalone daemon/local access | M010 in progress; 050-053 closed; 054 active with live-service evidence blocker | plans/subsystems/standalone-daemon-roadmap.md | M010-E / Plan 054 | M010 closure requires controlled live i2pd-to-IRC product-path evidence; no R002 dependency. |
 | I2P router integration | R001 closed | plans/subsystems/i2p-router-integration-roadmap.md | R001 complete for this repository; R002 blocked upstream | Corrective 033 proved exact application-byte transport and SAM session reuse through the production SamProvider against i2pd 2.61.0. Broad SAM portability belongs to the dedicated SAM library project. R002 waits on stable public i2pr managed-app I2P-stream/local-listener/lifecycle contracts and its own prerequisites; R003 remains research-blocked. |
 
 ## Active and dependency-ready implementation plans
 
-No implementation plan is currently active or dependency-ready.
+| Plan | Status | Class | Roadmap | Handoff |
+|---|---|---|---|---|
+| Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
+
+Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
+
+Plans 050-053 are closed with evidence at `plans/closure/standalone/`. The daemon listener is enabled by the provisioned credentials and key; Plan 054 is active and gated on live product-path qualification.
 
 ## Recently closed implementation plans
 
@@ -95,11 +102,13 @@ No implementation plan is currently active or dependency-ready.
 
 M008 and M009 are closed. No Bouncer Core implementation plan is currently active or dependency-ready.
 
+M010 standalone daemon/local listener/bootstrap and basic secure key provisioning are registered (Plans 050-054). Plans 050-053 are closed; Plan 054 remains active pending its controlled live product-path evidence. Full release packaging, service installers, keyring/HSM integration and optional real-client OTR qualification beyond recorded available evidence remain later decisions.
+
 Later product lines intentionally remain unplanned:
 
-- standalone daemon/local listener/bootstrap and packaging;
-- executable-specific store-key provisioning (environment/file/keyring/HSM);
-- external real-client OTR interoperability through the future production listener;
+- installer/service/package publication and distribution hardening;
+- OS keyring/HSM or other advanced store-key provisioning;
+- optional further real-client OTR interoperability through the production listener;
 - per-buffer no-history/privacy-retention policy;
 - built-in IRC client cryptographic endpoint support, including any OTRv4 evaluation;
 - Router R002 — i2pr managed-app adapter, blocked on stable public app stream/listener/lifecycle contracts;
@@ -117,6 +126,7 @@ Broad SAM portability matrices are not an open milestone in this repository; the
 | plans/adrs/ADR-0004-network-scoped-provider-and-owned-sam31-client.md | accepted | R001 uses NetworkId-scoped provider semantics and one long-lived transient owned SAM 3.1 STREAM session per active Network; unrelated Networks do not share one I2P Destination by default. |
 | plans/adrs/ADR-0005-explicit-i2p-provider-scope-release.md | accepted | I2pStreamProvider gains explicit idempotent NetworkId scope release so long-lived router sessions survive IRC reconnects but are torn down on durable Network deletion/process shutdown. |
 | plans/adrs/ADR-0006-encryption-layering-store-key-and-otr-endpoint.md | accepted | Durable privacy uses optional whole-database SQLCipher with an injected process-level key; OTR remains endpoint-to-endpoint client crypto and the bouncer carries ciphertext opaquely without keys/session state. |
+| plans/adrs/ADR-0007-local-authentication-and-standalone-process-boundary.md | accepted | The standalone daemon is an explicit local-only socket authority; Operator auth precedes trusted ClientId/admission; CAP/PASS/SASL registration state passes once; process/key ownership is independent of core/router state. |
 
 ## Research authority
 
@@ -129,6 +139,7 @@ Current foundation research:
 - plans/research/007-r001-owned-sam31-client-and-provider-scope.md
 - plans/research/008-m006-m007-irc-interoperability-and-identity-resilience.md
 - plans/research/009-m008-m009-privacy-encryption-and-otr.md
+- plans/research/010-m010-standalone-daemon-local-access-and-bootstrap.md
 
 Important retained conclusions:
 
@@ -153,4 +164,4 @@ Important retained conclusions:
 
 Corrective 049 is closed; see `plans/closure/bouncer-core/049-status.md`. It fixed a real SAM client framing defect (a reply terminator split across TCP reads was dropped, stalling the phase to its deadline) and reconciled the registry, README, bouncer roadmap, and long-term roadmap with the actual closed state through M009 and R001.
 
-No successor feature milestone is registered yet. Standalone daemon/listener/bootstrap work remains the likely next productization line, but it requires its own research/planning gate. R002 remains independently blocked on upstream i2pr managed-app contracts.
+M010 is registered as a standalone-productization workstream after Research 010 and accepted ADR-0007. Plans 050-053 are closed; Plan 054 is the **sole active** handoff and awaits controlled live i2pd-to-IRC product-path qualification. M001-M009, C049 and R001 remain closed. R002 remains independently blocked on upstream i2pr managed-app contracts.

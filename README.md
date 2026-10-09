@@ -1,6 +1,6 @@
 # i2pr-irc
 
-i2pr-irc is a Rust IRC bouncer core for I2P, delivered as library crates.
+i2pr-irc is a Rust IRC bouncer for I2P, with a Rust library core and a process bootstrap.
 
 The product boundary is deliberately narrow: upstream IRC traffic is I2P-only. The bouncer does not provide a clearnet IRC connector, system-DNS fallback, generic proxying, DCC, or an HTTP side channel. Its first priority is correct IRC/IRCv3 bouncer behavior under unstable, high-latency stream conditions. Router integration follows through explicit I2P stream-provider interfaces.
 
@@ -29,12 +29,19 @@ Research lives under plans/research/. Subsystem roadmaps live under plans/subsys
 - Optional whole-database SQLCipher encrypted Store under one injected process-level key, with source-preserving migration and rotation (M008).
 - OTRv3-transparent opaque transport (M009): the bouncer carries OTR query/AKE/data/fragment payloads byte-exactly, holds no OTR keys/session state/plaintext, keeps OTR-bearing chat non-replayable, and retains ciphertext only.
 
-### Not yet a finished standalone product
+### Standalone daemon
 
-- No production executable crate and no production local TCP/Unix listener/bootstrap path.
-- No production store-key provisioning UX (environment/file/keyring/HSM).
-- No packaging, service, or install layer.
-- No real-client OTR interoperability qualification through a product listener; that waits on the future production listener.
+On supported Unix systems, create a private directory (mode 0700), then initialize and save the one-time Operator token securely:
+
+```sh
+mkdir -m 700 "$HOME/.config/i2pr-irc"
+cargo run -p i2pr-irc-daemon -- init --config "$HOME/.config/i2pr-irc/daemon.conf"
+cargo run -p i2pr-irc-daemon -- --config "$HOME/.config/i2pr-irc/daemon.conf" run
+```
+
+Initialization creates an encrypted SQLCipher store by default, an independent random store key, and a random 256-bit Operator token. The token is shown once. Configure an ordinary IRC client for `127.0.0.1:6667`, with password `default:<token>`; profile labels such as `laptop:<token>` create independent durable history identities under the same Operator credential. SASL PLAIN is also supported for local authentication. Use `i2pr-irc status --config <path>` for redacted state details. Plaintext storage requires the explicit `init --config <path> --plaintext` option. Back up the state directory and config together; losing `state/store.key` makes encrypted history unrecoverable. Token rotation/recovery is not provided yet: if the token is lost, retain the data directory and seek an explicit recovery procedure rather than deleting or recreating it. An `.init-incomplete` marker means initialization stopped before completion; preserve the directory for manual recovery. Do not place the token or key in shell history, source control, or routine diagnostics.
+
+The daemon is local-only and upstream IRC remains I2P-only through SAM. Secure init and startup currently support Unix private file modes; other platforms fail explicitly until ACL protection is qualified. Packaging/service installation, keyring/HSM integration, and real-router product-path qualification remain tracked separately in `plans/registry.md` and the standalone roadmap.
 
 Router R002 (i2pr managed-app adapter) remains blocked on stable public i2pr managed-app stream/listener/lifecycle contracts.
 
