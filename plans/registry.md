@@ -37,6 +37,7 @@ Canonical direction:
 |---|---|---|---|---|
 | Standalone M010-E / Plan 054 — Standalone Product Integration and M010 Closure | active | qualification + milestone closure | plans/subsystems/standalone-daemon-roadmap.md | plans/implementation/standalone/054-m010e-product-integration-and-closure.md |
 | IRC M012-A / Plan 059 — IRC Command Pacing and Connection-Gap Evidence | closed | invariant + capability | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/059-m012a-command-pacing-and-upstream-gap-ledger.md |
+| IRC M012-B / Plan 060 — Optional Upstream CHATHISTORY Catch-Up | closed; production feature deferred by official draft warning | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/060-m012b-conditional-upstream-chathistory-reconciliation.md |
 | IRC M012-C / Plan 061 — Verified Same-Network I2P Endpoint Failover | ready | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/implementation/irc-enhancements/061-m012c-verified-network-equivalent-i2p-failover.md |
 
 Plan 054 is active after evidence-based closure of Plan 053; final live controlled IRC over i2pd qualification remains operationally blocked. See its named blocker and do not claim M010 closure without product-path evidence.
@@ -71,6 +72,7 @@ Plans 055-060 are closed with evidence at their named closure records; Plan 060'
 | IRC M011-C / Plan 057 — Local Watch and Highlight Notifications | closed | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/057-status.md |
 | IRC M011-D / Plan 058 — Integrated Privacy Policy Qualification and M011 Closure | closed | qualification + milestone closure | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/058-status.md |
 | IRC M012-A / Plan 059 — IRC Command Pacing and Connection-Gap Evidence | closed | invariant + capability | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/059-status.md |
+| IRC M012-B / Plan 060 — Optional Upstream CHATHISTORY Catch-Up | closed with production feature deferred | capability + security invariant | plans/subsystems/irc-privacy-resilience-roadmap.md | plans/closure/irc-enhancements/060-status.md |
 | Bouncer Core Corrective 049 — Post-M009 Verification and Documentation Reconciliation | closed | verification reliability + planning/documentation reconciliation | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/049-status.md |
 | Bouncer Core M009-B / Plan 048 — Integrated OTR Privacy Qualification and M009 Closure | closed | privacy qualification + milestone closure | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/048-status.md |
 | Bouncer Core Corrective 042 — Post-M007 MONITOR and Adverse-Qualification Corrective | closed | protocol correctness + qualification corrective | plans/subsystems/bouncer-core-roadmap.md | plans/closure/bouncer-core/042-status.md |
