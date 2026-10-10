@@ -1,6 +1,6 @@
 # Plan 066 — M013-D IRC Interoperability and Authentication Closure
 
-Status: proposed — depends on Plans 063–064 closure and Plan 065 shipped-or-deferred disposition.
+Status: closed — M013 implementation and deferred dispositions are recorded.
 Date: 2026-10-09
 Authority: Research 011, ADR-0009 and IRC enhancement roadmap.
 

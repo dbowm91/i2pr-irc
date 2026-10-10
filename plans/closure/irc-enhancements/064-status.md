@@ -2,7 +2,7 @@
 
 Status: closed; CHGHOST, event playback, and message redaction deferred
 Implementation commit: none; no feature implementation was accepted
-Closure commit: pending
+Closure commit: `ac4e3e4` — `docs(plans): close Plan 064 and start TLS preflight`
 Date: 2026-10-10
 
 ## Requirement-to-evidence matrix

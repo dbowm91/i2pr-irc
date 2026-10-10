@@ -1,5 +1,5 @@
 # IRC Privacy, Resilience and Compatibility Roadmap
-Status: M011 closed; M012 conditionally closed pending pinned Eggchaos qualification; M013-A/B closed; M013-C research preflight in progress.
+Status: M011 closed; M012 conditionally closed pending pinned Eggchaos qualification; M013 closed with implementation and deferral dispositions.
 Research: plans/research/011-irc-privacy-resilience-authentication.md
 ADRs: ADR-0008 and ADR-0009; all prior accepted ADRs remain binding.
 Baseline: work/plans-050-054-m010-standalone (M010-E Plan 054 active).
@@ -21,8 +21,8 @@ M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 act
   -> M012-D / 062 resilience closure [conditionally closed; pinned Eggchaos evidence pending]
   -> M013-A / 063 named network auth profiles [closed]
   -> M013-B / 064 IRCv3 member/redaction/event-playback decision and bounded implementation [closed; all deferred]
-  -> M013-C / 065 optional TLS-over-I2P and SASL EXTERNAL [research preflight active; implementation gated]
-  -> M013-D / 066 interoperability closure [proposed after conditional 065 disposition]
+  -> M013-C / 065 optional TLS-over-I2P and SASL EXTERNAL [closed; deferred pending endpoint and trust/credential contracts]
+  -> M013-D / 066 interoperability closure [closed; no M013 successor currently registered]
 
 ## Milestone exits
 M011: privacy mode controls every durable/in-memory ingestion and query path, including FTS/OTR/detached, with migration, resource and multi-client tests; notifications remain local, bounded and off by default.
