@@ -2,7 +2,7 @@
 
 Status: closed with research deferral; no TLS-over-I2P or SASL EXTERNAL implementation shipped
 Implementation commit: none
-Closure commit: pending
+Closure commit: `a0327dc` — `docs(plans): close M013 compatibility line`
 Date: 2026-10-10
 
 ## Requirement-to-evidence matrix

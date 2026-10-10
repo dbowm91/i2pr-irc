@@ -2,7 +2,7 @@
 
 Status: closed; controlled IRC-over-I2P authentication profiles implemented, optional/draft features accurately deferred
 Implementation commits: `319ca65` — Plan 063 authentication profiles; no implementation for deferred plans 064/065
-Closure commit: pending
+Closure commit: `a0327dc` — `docs(plans): close M013 compatibility line`
 Date: 2026-10-10
 
 ## Requirement-to-evidence matrix
