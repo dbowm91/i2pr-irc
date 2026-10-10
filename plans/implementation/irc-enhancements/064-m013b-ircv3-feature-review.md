@@ -1,6 +1,6 @@
 # Plan 064 — M013-B IRCv3 CHGHOST, Event Playback and Redaction Disposition
 
-Status: proposed; depends on Plan 063 closure and current spec-version review.
+Status: active; Plan 063 is closed and current IRCv3 specifications have been reviewed.
 Date: 2026-10-09
 Primary class: protocol compatibility invariant + conditional capability.
 Authority: Research 011, ADR-0008/0009, `architecture/member-state.md`, `architecture/chathistory.md`.

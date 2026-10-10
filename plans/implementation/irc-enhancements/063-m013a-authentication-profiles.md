@@ -1,6 +1,6 @@
 # Plan 063 — M013-A IRC2P and ILITA Authentication Profiles
 
-Status: active; Plan 062 is conditionally closed with its external Eggchaos evidence condition documented.
+Status: closed; Plan 062 is conditionally closed with its external Eggchaos evidence condition documented.
 Date: 2026-10-09
 Primary class: compatibility capability and authentication invariant.
 Authority: Research 011, ADR-0009, existing registration/M007 security contracts.
