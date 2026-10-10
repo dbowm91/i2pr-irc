@@ -1,6 +1,6 @@
 # Plan 065 — M013-C Optional TLS-over-I2P and SASL EXTERNAL
 
-Status: research-blocked until preflight and Plan 064 closure. No enabled implementation is authorized yet.
+Status: active for bounded research preflight after Plan 064 closure; implementation remains gated. No enabled implementation is authorized yet.
 Date: 2026-10-09
 Authority: Research 011, ADR-0009 and ADR-0001.
 

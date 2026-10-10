@@ -2,7 +2,7 @@
 
 Status: closed; controlled profile contract implemented; deployed IRC2P/ILITA interoperability remains unclaimed
 Implementation commit: `319ca65` — `feat(runtime): add explicit upstream auth profiles`
-Closure commit: pending
+Closure commit: `f90e378` — `docs(plans): close Plan 063 and start M013-B`
 Date: 2026-10-10
 
 ## Requirement-to-evidence matrix
