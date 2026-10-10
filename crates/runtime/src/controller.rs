@@ -912,8 +912,11 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
                 network: record.network,
                 display_name: record.display_name.clone(),
                 endpoint: record.endpoint.clone(),
+                transport_profile: record.transport_profile,
+                auth_profile: record.auth_profile,
                 failover_group: record.failover_group.clone(),
                 retain_existing_failover: false,
+                retain_existing_profiles: false,
                 nick: record.nick.clone(),
                 username: record.username.clone(),
                 realname: record.realname.clone(),
@@ -939,6 +942,30 @@ impl<P: I2pStreamProvider + Send + Sync + 'static> RuntimeController<P> {
         let existing: Vec<NetworkRecord> = self.records.values().cloned().collect();
         let plan = config_snapshot::plan(&snapshot, &existing);
         let total = plan.steps.len();
+        // Validate every planned durable record before the first owner restarts. This is
+        // required for profile imports: a snapshot names SASL PLAIN but deliberately has
+        // no password, so a new Network without an existing credential must stop before
+        // any earlier Network in the same snapshot is mutated.
+        for step in &plan.steps {
+            match step {
+                ImportStep::Conflict(network) => {
+                    return ApplyOutcome {
+                        applied: 0,
+                        remaining: total,
+                        stopped_at: Some(*network),
+                    };
+                }
+                ImportStep::Create(record) | ImportStep::Update(record) => {
+                    if record.validate().is_err() {
+                        return ApplyOutcome {
+                            applied: 0,
+                            remaining: total,
+                            stopped_at: Some(record.network),
+                        };
+                    }
+                }
+            }
+        }
         let mut applied = 0usize;
         let mut stopped_at = None;
         for step in plan.steps {

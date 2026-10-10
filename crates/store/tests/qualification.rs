@@ -82,6 +82,8 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
         network: NetworkId(network),
         display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         nick: "bot".into(),
         username: "user".into(),
@@ -1022,6 +1024,32 @@ async fn an_attested_failover_group_is_bounded_and_survives_reopen() {
     store.shutdown().expect("store shuts down");
 }
 
+#[tokio::test]
+async fn explicit_auth_profile_round_trips_without_exporting_or_reusing_credentials() {
+    let dir = testing::temp_dir("auth-profile-roundtrip");
+    let path = dir.db("profiles.sqlite3");
+    let mut network = record(1, &[]);
+    network.auth_profile = i2pr_irc_store::UpstreamAuthProfile::NickServ;
+    store_at(&path)
+        .handle()
+        .save_network(&network)
+        .await
+        .expect("NickServ profile saves");
+
+    let store = store_at(&path);
+    let loaded = store.handle().load_networks().await.expect("profile loads");
+    assert_eq!(
+        loaded[0].auth_profile,
+        i2pr_irc_store::UpstreamAuthProfile::NickServ
+    );
+    assert_eq!(
+        loaded[0].transport_profile,
+        i2pr_irc_store::IrcTransportProfile::PlainI2p
+    );
+    assert!(loaded[0].sasl.is_none());
+    store.shutdown().expect("store shuts down");
+}
+
 #[test]
 fn a_display_name_that_could_alter_reply_parsing_is_refused() {
     let mut record = record(1, &[]);
@@ -1395,6 +1423,7 @@ async fn secrets_never_appear_in_diagnostics() {
     let path = dir.db("secret.sqlite3");
     let store = store_at(&path);
     let mut with_secret = record(1, &[]);
+    with_secret.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
     with_secret.sasl = Some(("bot".into(), StoredSecret::new("s3cr3t-value".into())));
     store
         .handle()
@@ -3248,6 +3277,7 @@ fn predecessor_fixture(path: &std::path::Path, version: i64) {
         12 => drop(testing::create_v12_database(path)),
         13 => drop(testing::create_v13_database(path)),
         14 => drop(testing::create_v14_database(path)),
+        15 => drop(testing::create_v15_database(path)),
         other => panic!("no fixture for schema {other}"),
     };
 }
@@ -3294,6 +3324,56 @@ async fn every_supported_predecessor_schema_opens_and_reaches_the_current_versio
         }
         store.shutdown().expect("store shuts down");
     }
+}
+
+#[tokio::test]
+async fn schema_15_migration_preserves_effective_auth_modes_and_defaults_transport_to_plain_i2p() {
+    let dir = testing::temp_dir("auth-profile-migration");
+    let path = dir.db("auth.sqlite3");
+    let legacy = testing::create_v15_database(&path);
+    legacy
+        .execute_batch(
+            "INSERT INTO networks
+               (network_id, endpoint, endpoint_kind, nick, username, realname, display_name, auto_away, keep_nick)
+             VALUES
+               (1, 'irc-one.i2p', 0, 'one', 'user', 'real', 'one', 0, 0),
+               (2, 'irc-two.i2p', 0, 'two', 'user', 'real', 'two', 0, 0),
+               (3, 'irc-three.i2p', 0, 'three', 'user', 'real', 'three', 0, 0);
+             INSERT INTO network_secrets (network_id, sasl_username, sasl_password)
+               VALUES (1, 'legacy-user', x'6c65676163792d70617373');
+             INSERT INTO registration_actions (network_id, position, kind, target, payload, phase)
+               VALUES (2, 0, 'message', 'NickServ', 'IDENTIFY [redacted fixture]', 'post-join');",
+        )
+        .expect("legacy auth evidence is seeded");
+    drop(legacy);
+
+    let store = store_at(&path);
+    let records = store
+        .handle()
+        .load_networks()
+        .await
+        .expect("migrated networks load");
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records[0].auth_profile,
+        i2pr_irc_store::UpstreamAuthProfile::SaslPlain
+    );
+    assert_eq!(
+        records[0].sasl.as_ref().map(|(user, _)| user.as_str()),
+        Some("legacy-user")
+    );
+    assert_eq!(
+        records[1].auth_profile,
+        i2pr_irc_store::UpstreamAuthProfile::NickServ
+    );
+    assert_eq!(
+        records[2].auth_profile,
+        i2pr_irc_store::UpstreamAuthProfile::None
+    );
+    assert!(records.iter().all(|record| {
+        record.transport_profile == i2pr_irc_store::IrcTransportProfile::PlainI2p
+    }));
+    store.shutdown().expect("store shuts down");
 }
 
 /// A schema 4 database -- the last one M004 shipped -- reaches schema 7 with its Network

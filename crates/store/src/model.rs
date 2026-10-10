@@ -371,6 +371,10 @@ pub struct NetworkRecord {
     /// never derived from the endpoint or from any local path.
     pub display_name: String,
     pub endpoint: I2pEndpoint,
+    /// Upstream IRC transport layered over the I2P provider stream.
+    pub transport_profile: IrcTransportProfile,
+    /// Explicit per-Network authentication policy.
+    pub auth_profile: UpstreamAuthProfile,
     /// Operator-approved alternate endpoints for the same logical IRC Network.
     /// A non-empty group is never inferred from endpoint names and must carry both
     /// explicit trust attestations below.
@@ -393,6 +397,71 @@ pub struct NetworkRecord {
     /// Disabled by default for the same reason: reclaim writes `NICK` traffic upstream
     /// forever, and that traffic must not begin without being asked for.
     pub keep_nick: bool,
+}
+
+/// Inner IRC transport profile. TLS is reserved for a later capability plan and is
+/// rejected by `NetworkRecord::validate` until that work is qualified.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IrcTransportProfile {
+    #[default]
+    PlainI2p,
+    TlsOverI2p,
+}
+
+impl IrcTransportProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlainI2p => "plain-i2p",
+            Self::TlsOverI2p => "tls-over-i2p",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "plain-i2p" => Ok(Self::PlainI2p),
+            "tls-over-i2p" => Ok(Self::TlsOverI2p),
+            _ => Err(StoreError::new(StoreErrorKind::Corrupt(
+                "IRC transport profile",
+            ))),
+        }
+    }
+}
+
+/// Authentication policy is independent of downstream ClientId and transport.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UpstreamAuthProfile {
+    #[default]
+    None,
+    NickServ,
+    SaslPlain,
+    SaslExternal,
+}
+
+impl UpstreamAuthProfile {
+    pub const fn requires_sasl(self) -> bool {
+        matches!(self, Self::SaslPlain)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::NickServ => "nickserv",
+            Self::SaslPlain => "sasl-plain",
+            Self::SaslExternal => "sasl-external",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "none" => Ok(Self::None),
+            "nickserv" => Ok(Self::NickServ),
+            "sasl-plain" => Ok(Self::SaslPlain),
+            "sasl-external" => Ok(Self::SaslExternal),
+            _ => Err(StoreError::new(StoreErrorKind::Corrupt(
+                "upstream auth profile",
+            ))),
+        }
+    }
 }
 
 /// Bounded alternate I2P endpoints with explicit operator trust scope.
@@ -459,6 +528,17 @@ impl NetworkRecord {
     /// Applies the same domain constraints as fresh configuration. Corrupt durable
     /// state is rejected rather than repaired into a plausible-looking default.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.transport_profile != IrcTransportProfile::PlainI2p {
+            return Err("unsupported IRC transport profile");
+        }
+        if self.auth_profile == UpstreamAuthProfile::SaslExternal {
+            return Err("unsupported upstream auth profile");
+        }
+        match (self.auth_profile, self.sasl.is_some()) {
+            (UpstreamAuthProfile::SaslPlain, true)
+            | (UpstreamAuthProfile::None | UpstreamAuthProfile::NickServ, false) => {}
+            _ => return Err("auth profile credential mismatch"),
+        }
         if !valid_display_name(&self.display_name) {
             return Err("display name");
         }
@@ -825,6 +905,8 @@ mod tests {
             network: NetworkId(1),
             display_name: fallback_display_name(NetworkId(1)),
             endpoint: I2pEndpoint::parse("irc.example.i2p").unwrap(),
+            transport_profile: IrcTransportProfile::PlainI2p,
+            auth_profile: UpstreamAuthProfile::None,
             failover_group: None,
             nick: "bot".into(),
             username: "user".into(),
@@ -841,7 +923,29 @@ mod tests {
         assert_eq!(record().validate(), Ok(()));
         let mut with_secret = record();
         with_secret.sasl = Some(("bot".into(), StoredSecret::new("hunter2".into())));
+        with_secret.auth_profile = UpstreamAuthProfile::SaslPlain;
         assert_eq!(with_secret.validate(), Ok(()));
+    }
+
+    #[test]
+    fn unsupported_transport_and_auth_credential_mismatches_fail_before_dial() {
+        let mut unsupported = record();
+        unsupported.transport_profile = IrcTransportProfile::TlsOverI2p;
+        assert_eq!(
+            unsupported.validate(),
+            Err("unsupported IRC transport profile")
+        );
+
+        let mut missing = record();
+        missing.auth_profile = UpstreamAuthProfile::SaslPlain;
+        assert_eq!(missing.validate(), Err("auth profile credential mismatch"));
+
+        let mut unexpected = record();
+        unexpected.sasl = Some(("user".into(), StoredSecret::new("secret".into())));
+        assert_eq!(
+            unexpected.validate(),
+            Err("auth profile credential mismatch")
+        );
     }
 
     #[test]
@@ -966,6 +1070,7 @@ mod tests {
         assert_eq!(secret.expose(), "hunter2");
         // A durable record's Debug output must not leak the password either.
         let mut subject = record();
+        subject.auth_profile = UpstreamAuthProfile::SaslPlain;
         subject.sasl = Some(("bot".into(), secret));
         assert!(!format!("{subject:?}").contains("hunter2"));
     }

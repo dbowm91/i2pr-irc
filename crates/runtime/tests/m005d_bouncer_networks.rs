@@ -39,6 +39,8 @@ fn record(network: u64, nick: &str) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse(&b32()).expect("a test destination"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         nick: nick.to_owned(),
         username: "user".to_owned(),
@@ -450,6 +452,7 @@ async fn an_unbound_session_can_discover_every_network() {
 async fn a_network_listing_never_carries_an_endpoint_or_an_identity() {
     let runtime = Runtime::start().await;
     let mut candidate = record(1, "secretnick");
+    candidate.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
     candidate.sasl = Some((
         "sasluser".to_owned(),
         i2pr_irc_store::StoredSecret::new("hunter2".to_owned()),
@@ -1190,6 +1193,7 @@ async fn a_credential_never_appears_in_a_service_reply() {
     client.until("Updated credential").await;
     client.send("PRIVMSG BouncerServ :sasl status 1\r\n").await;
     client.until("sasl set bob").await;
+    assert!(client.seen.contains("profile=sasl-plain"));
     client
         .send("PRIVMSG BouncerServ :sasl set 1 user=bob\r\n")
         .await;
@@ -1201,6 +1205,45 @@ async fn a_credential_never_appears_in_a_service_reply() {
         "the credential comes back from no reply, no status, and no refusal: {}",
         client.seen
     );
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn auth_profile_changes_are_explicit_credential_scoped_and_restart_the_network() {
+    let runtime = Runtime::start().await;
+    runtime.create(1).await;
+    let mut client = admit_unbound(&runtime, SessionId(101));
+    register_plain(&mut client).await;
+
+    client
+        .send("PRIVMSG BouncerServ :auth set 1 mode=sasl-plain\r\n")
+        .await;
+    client.until("FAIL BOUNCER AUTH").await;
+    client
+        .send("PRIVMSG BouncerServ :auth set 1 mode=nickserv\r\n")
+        .await;
+    client.until("Updated authentication profile").await;
+    client.send("PRIVMSG BouncerServ :auth status 1\r\n").await;
+    client
+        .until("auth profile=nickserv transport=plain-i2p sasl_user=unset")
+        .await;
+
+    client
+        .send("PRIVMSG BouncerServ :sasl set 1 user=alice pass=private-value\r\n")
+        .await;
+    client.until("Updated credential").await;
+    let record = runtime
+        .control
+        .network_record(NetworkId(1))
+        .await
+        .expect("record reads")
+        .expect("network exists");
+    assert_eq!(
+        record.auth_profile,
+        i2pr_irc_store::UpstreamAuthProfile::SaslPlain
+    );
+    assert!(record.sasl.is_some());
+    assert!(!client.seen.contains("private-value"));
     runtime.stop().await;
 }
 

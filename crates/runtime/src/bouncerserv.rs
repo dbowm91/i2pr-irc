@@ -170,6 +170,15 @@ pub enum ServCommand {
     SaslReset {
         network: NetworkId,
     },
+    /// Report the selected authentication and transport profiles without exposing secrets.
+    AuthProfileStatus {
+        network: NetworkId,
+    },
+    /// Select one explicitly supported authentication profile.
+    AuthProfileSet {
+        network: NetworkId,
+        profile: i2pr_irc_store::UpstreamAuthProfile,
+    },
     /// Report the bounded process-wide diagnostics, with every live Network.
     Diag,
     /// Report one Network's bounded diagnostics.
@@ -264,6 +273,12 @@ impl std::fmt::Debug for ServCommand {
                 network, username, ..
             } => return write!(f, "SaslSet({network:?}, {username:?})"),
             Self::SaslReset { network } => return write!(f, "SaslReset({network:?})"),
+            Self::AuthProfileStatus { network } => {
+                return write!(f, "AuthProfileStatus({network:?})");
+            }
+            Self::AuthProfileSet { network, profile } => {
+                return write!(f, "AuthProfileSet({network:?}, {profile:?})");
+            }
             Self::Diag => return write!(f, "Diag"),
             Self::DiagNetwork { network } => return write!(f, "DiagNetwork({network:?})"),
             Self::ConfigExport => return write!(f, "ConfigExport"),
@@ -310,6 +325,7 @@ pub const HELP_TEXT: &str = concat!(
     " | sasl status <netid>",
     " | sasl set <netid> user=<username> pass=<password>",
     " | sasl reset <netid>",
+    " | auth status <netid> | auth set <netid> mode=<none|nickserv|sasl-plain>",
     " | diag",
     " | diag network <netid>",
     " | config export",
@@ -646,6 +662,22 @@ pub fn parse(text: &str) -> Result<ServCommand, BouncerError> {
                     username: username.ok_or(BouncerError::Usage)?,
                     password: password.ok_or(BouncerError::Usage)?,
                 })
+            }
+            other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
+        },
+        "AUTH" => match word(1).to_ascii_uppercase().as_str() {
+            "STATUS" => Ok(ServCommand::AuthProfileStatus { network: netid(2)? }),
+            "SET" => {
+                let network = netid(2)?;
+                if words.len() != 4 {
+                    return Err(BouncerError::Usage);
+                }
+                let value = words[3]
+                    .strip_prefix("mode=")
+                    .ok_or_else(|| BouncerError::UnknownAttribute(words[3].to_owned()))?;
+                let profile = i2pr_irc_store::UpstreamAuthProfile::parse(value)
+                    .map_err(|_| BouncerError::ValueOutOfRange)?;
+                Ok(ServCommand::AuthProfileSet { network, profile })
             }
             other => Err(BouncerError::UnknownSubcommand(other.to_owned())),
         },

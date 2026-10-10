@@ -39,6 +39,8 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse(&b32()).expect("a test destination"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         nick: "bot".to_owned(),
         username: "user".to_owned(),
@@ -156,6 +158,7 @@ impl Runtime {
     /// read a diagnostic that must not contain it.
     async fn bring_online_credentialed(&mut self, network: u64, channels: &[&str]) -> usize {
         let mut candidate = record(network, channels);
+        candidate.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
         candidate.sasl = Some((
             "bob".to_owned(),
             i2pr_irc_store::StoredSecret::new("hunter2".to_owned()),
@@ -990,8 +993,12 @@ async fn a_configuration_export_carries_no_credential() {
     assert!(!exported.contains("hunter2"), "{exported}");
     assert!(!exported.contains("bob"), "{exported}");
     assert!(
-        !exported.contains("sasl"),
-        "not even the name of a field that could hold one: {exported}"
+        exported.contains("auth=sasl-plain"),
+        "the safe profile is exported"
+    );
+    assert!(
+        !exported.contains("sasl_user"),
+        "the credential username is omitted"
     );
     runtime.stop().await;
 }
@@ -1047,8 +1054,11 @@ async fn an_import_applies_a_snapshot_one_network_at_a_time_and_reports_progress
             network: NetworkId(7),
             display_name: "restored".to_owned(),
             endpoint: i2pr_irc_core::I2pEndpoint::parse(&b32()).expect("a destination"),
+            transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+            auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
             failover_group: None,
             retain_existing_failover: false,
+            retain_existing_profiles: false,
             nick: "bot".to_owned(),
             username: "user".to_owned(),
             realname: "bouncer".to_owned(),
@@ -1100,8 +1110,11 @@ async fn an_import_that_names_a_different_network_under_one_identity_stops_witho
         network: NetworkId(1),
         display_name: "a-different-network".to_owned(),
         endpoint: i2pr_irc_core::I2pEndpoint::parse(&b32()).expect("a destination"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         retain_existing_failover: false,
+        retain_existing_profiles: false,
         nick: "bot".to_owned(),
         username: "user".to_owned(),
         realname: "bouncer".to_owned(),
@@ -1117,8 +1130,11 @@ async fn an_import_that_names_a_different_network_under_one_identity_stops_witho
         network: NetworkId(2),
         display_name: "second".to_owned(),
         endpoint: entry.endpoint.clone(),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         retain_existing_failover: false,
+        retain_existing_profiles: false,
         nick: "bot".to_owned(),
         username: "user".to_owned(),
         realname: "bouncer".to_owned(),
@@ -1181,6 +1197,39 @@ async fn an_import_does_not_erase_a_stored_credential() {
     runtime.stop().await;
 }
 
+#[tokio::test]
+async fn an_sasl_profile_snapshot_without_a_network_credential_is_refused_before_any_write() {
+    let mut runtime = Runtime::start().await;
+    runtime.bring_online_credentialed(1, &["#room"]).await;
+    let before = runtime.control.export_config().await.expect("an export");
+    let mut snapshot = before.clone();
+    let mut new_network = snapshot.networks[0].clone();
+    new_network.network = NetworkId(7);
+    new_network.display_name = "new-network".to_owned();
+    new_network.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
+    new_network.endpoint = i2pr_irc_core::I2pEndpoint::parse(&b32()).expect("a destination");
+    new_network.retain_existing_profiles = false;
+    snapshot.networks.push(new_network);
+
+    let outcome = runtime
+        .control
+        .import_config(snapshot)
+        .await
+        .expect("the preflight returns an outcome");
+    assert_eq!(outcome.applied, 0, "profile refusal precedes every write");
+    assert_eq!(outcome.stopped_at, Some(NetworkId(7)));
+    assert!(!outcome.complete());
+    assert_eq!(
+        runtime
+            .control
+            .export_config()
+            .await
+            .expect("unchanged export"),
+        before
+    );
+    runtime.stop().await;
+}
+
 // ----------------------------------------------- registration action tests
 
 #[tokio::test]
@@ -1216,6 +1265,7 @@ async fn action_phases_bracket_join_and_recovery_follows_a_fallback_nick() {
     let mut runtime = Runtime::start().await;
     let mut configured = record(1, &["#room"]);
     configured.keep_nick = true;
+    configured.auth_profile = i2pr_irc_store::UpstreamAuthProfile::NickServ;
     runtime
         .control
         .create(configured)
@@ -1242,15 +1292,18 @@ async fn action_phases_bracket_join_and_recovery_follows_a_fallback_nick() {
     let (mut upstream, controller) = runtime.provider.closable_peer().await;
     read_until(&mut upstream, b"USER user 0 * :bouncer\r\n").await;
     upstream
-        .write_all(b":srv CAP * LS :\r\n")
+        .write_all(b":srv 421 bot CAP :Unknown command\r\n")
         .await
-        .expect("minimal server finishes CAP LS");
-    read_until(&mut upstream, b"CAP END\r\n").await;
+        .expect("the no-CAP NickServ profile remains supported");
     upstream
         .write_all(b":srv 433 bot bot :nickname in use\r\n")
         .await
         .expect("preferred nick collides");
     let fallback = read_until(&mut upstream, b"NICK bot_").await;
+    assert!(
+        !fallback.contains("CAP END"),
+        "an IRC2P-style no-SASL profile does not send CAP END to a no-CAP server: {fallback}"
+    );
     assert!(fallback.contains("NICK bot_"));
     let fallback_nick = fallback
         .trim_end_matches("\r\n")

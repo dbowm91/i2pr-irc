@@ -36,6 +36,8 @@ fn record(network: u64, nick: &str, channels: &[&str]) -> NetworkRecord {
         network: NetworkId(network),
         display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         nick: nick.into(),
         username: "user".into(),
@@ -676,6 +678,7 @@ async fn no_host_environment_value_reaches_the_wire_or_a_diagnostic() {
 async fn a_sasl_secret_never_reaches_a_diagnostic() {
     let (_store, handle) = store();
     let mut with_secret = record(1, "bot", &[]);
+    with_secret.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
     with_secret.sasl = Some((
         "bot".into(),
         i2pr_irc_store::StoredSecret::new("s3cr3t-value".into()),

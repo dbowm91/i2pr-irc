@@ -73,8 +73,8 @@ bouncer can read back what it wrote.
 
 ```
 #i2pr-bouncer-config
-version 4
-network netid=1 name=lab host=…b32.i2p nick=bot username=user realname=bouncer auto_away=off keep_nick=off actions=1 action_phases=0,1,0
+version 5
+network netid=1 name=lab host=…b32.i2p nick=bot username=user realname=bouncer transport=plain-i2p auth=none auto_away=off keep_nick=off actions=1 action_phases=0,1,0
 failover equivalent=operator credentials=operator
 alternate host=irc-alternate.i2p
 channel target=#one position=0 detached=off relay_detached=none reattach_on=off detach_after_secs=off
@@ -102,11 +102,23 @@ because exports must fit one IRC frame; `.i2p` names and base32 forms are accept
 represent it. Version 3 introduced channel activity attributes, and version 1-2 channel
 rows remain accepted with disabled activity defaults.
 
+Version 5 adds explicit `transport=plain-i2p` and `auth=none|nickserv|sasl-plain`
+profile values. TLS-over-I2P is not accepted by this version. Versions 1-4 preserve the
+existing transport and authentication profiles on updates; snapshots never contain a
+SASL password. Applying `sasl-plain` to an existing Network preserves that Network's
+credential, while a new credential must be entered with the separate SASL command.
+
 `FAILOVER SET <netid> equivalent=yes credentials=yes <alternate.i2p>` begins an explicitly
 attested group, `FAILOVER ADD <netid> <alternate.i2p>` adds up to seven alternates, and
 `FAILOVER CLEAR <netid>` returns to one endpoint. Each change commits through the controller
 and restarts that Network owner. No alternate is inferred from an address suffix or public
 server list.
+
+`AUTH STATUS <netid>` reports the selected profile, transport and configured SASL username.
+`AUTH SET <netid> mode=none|nickserv|sasl-plain` changes the durable authentication
+profile and replaces that Network's owner generation. `sasl-plain` is refused without a
+Network-scoped credential; `SASL SET` stores the credential and selects `sasl-plain`, while
+`SASL RESET` clears it and returns to `none` when required.
 
 ## Detached channel activity controls
 

@@ -1042,6 +1042,10 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         snapshot: watch::Sender<NetworkSnapshot>,
         policy: Arc<dyn ChannelPolicy>,
     ) -> Result<Self, RuntimeError> {
+        context
+            .record
+            .validate()
+            .map_err(|_| RuntimeError::InvalidConfig)?;
         snapshot.send_modify(|state| {
             state.network = Some(context.network);
             state.phase = Some(Phase::Idle);
@@ -1507,7 +1511,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
         let mut sasl_plain_offered = false;
         let mut requested = false;
         let mut sasl_active = false;
-        let mut sasl_authenticated = self.context.record.sasl.is_none();
+        let mut sasl_authenticated = !self.context.record.auth_profile.requires_sasl();
         let mut optional_decided = false;
         let mut used_fallback_nick = false;
         let registration = async {
@@ -1567,15 +1571,16 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             });
                             let continuation = params.get(2).is_some_and(|p| p == "*");
                             if !requested && !continuation {
-                                if self.context.record.sasl.is_some()
+                                if self.context.record.auth_profile.requires_sasl()
                                     && (!upstream_caps.was_offered("sasl") || !sasl_plain_offered)
                                 {
                                     return Err(RuntimeError::Registration);
                                 }
                                 let optional = upstream_caps.request_set();
                                 optional_decided =
-                                    self.context.record.sasl.is_none() && optional.is_empty();
-                                if self.context.record.sasl.is_some() {
+                                    !self.context.record.auth_profile.requires_sasl()
+                                        && optional.is_empty();
+                                if self.context.record.auth_profile.requires_sasl() {
                                     // SASL is required policy. Keep its ACK/NAK independent
                                     // from the opportunistic capability set so an optional
                                     // refusal cannot silently downgrade authentication.
@@ -1584,7 +1589,9 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                     send(&mut uw, &format!("CAP REQ :{}\r\n", optional.join(" ")))
                                         .await?;
                                 }
-                                if self.context.record.sasl.is_none() && optional_decided {
+                                if !self.context.record.auth_profile.requires_sasl()
+                                    && optional_decided
+                                {
                                     send(&mut uw, "CAP END\r\n").await?;
                                     cap_finished = true;
                                 }
@@ -1613,7 +1620,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                             .next()
                                             .is_some_and(|n| n.eq_ignore_ascii_case("sasl"))
                                     });
-                            if self.context.record.sasl.is_some() && !sasl_active {
+                            if self.context.record.auth_profile.requires_sasl() && !sasl_active {
                                 if !acked_sasl {
                                     return Err(RuntimeError::Registration);
                                 }
@@ -1632,7 +1639,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                             // Optional requests are sent only after the required SASL
                             // request is acknowledged, so a NAK before that ACK is a
                             // refusal of required authentication.
-                            if self.context.record.sasl.is_some() && !sasl_active {
+                            if self.context.record.auth_profile.requires_sasl() && !sasl_active {
                                 return Err(RuntimeError::Registration);
                             }
                             optional_decided = true;
@@ -1717,13 +1724,15 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                         }
                         "432" => return Err(RuntimeError::Registration),
                         "001" => {
-                            if self.context.record.sasl.is_some() && !sasl_authenticated {
+                            if self.context.record.auth_profile.requires_sasl()
+                                && !sasl_authenticated
+                            {
                                 return Err(RuntimeError::Registration);
                             }
                             welcomed = true;
                             if cap_state != RegistrationCapState::Supported {
                                 cap_state = RegistrationCapState::Unsupported;
-                                if self.context.record.sasl.is_some() {
+                                if self.context.record.auth_profile.requires_sasl() {
                                     return Err(RuntimeError::Registration);
                                 }
                                 // A classic server has completed registration without
@@ -1736,7 +1745,7 @@ impl<P: I2pStreamProvider> NetworkOwner<P> {
                                 .get(1)
                                 .is_some_and(|parameter| parameter.eq_ignore_ascii_case("CAP")) =>
                         {
-                            if self.context.record.sasl.is_some() {
+                            if self.context.record.auth_profile.requires_sasl() {
                                 return Err(RuntimeError::Registration);
                             }
                             cap_state = RegistrationCapState::Unsupported;

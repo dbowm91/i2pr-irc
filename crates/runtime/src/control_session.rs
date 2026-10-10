@@ -524,7 +524,13 @@ impl ControlSurface {
                     .as_ref()
                     .map(|(user, _)| user.as_str())
                     .unwrap_or("");
-                self.notice(format!("sasl {configured} {who}").trim_end());
+                self.notice(
+                    format!(
+                        "sasl {configured} {who} profile={}",
+                        record.auth_profile.as_str()
+                    )
+                    .trim_end(),
+                );
             }
             ServCommand::SaslSet {
                 network,
@@ -534,6 +540,7 @@ impl ControlSurface {
                 let Some(mut record) = self.record(network, &verb).await else {
                     return;
                 };
+                record.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
                 record.sasl = Some((username, password.into_stored()));
                 // `password` is zeroized when this arm ends. It is never formatted,
                 // never logged, and never becomes part of a refusal — a refused `SASL SET`
@@ -545,7 +552,42 @@ impl ControlSurface {
                     return;
                 };
                 record.sasl = None;
+                if record.auth_profile.requires_sasl() {
+                    record.auth_profile = i2pr_irc_store::UpstreamAuthProfile::None;
+                }
                 self.finish_unit(self.control.change(record).await, "", "Cleared credential")
+            }
+            ServCommand::AuthProfileStatus { network } => {
+                let Some(record) = self.record(network, &verb).await else {
+                    return;
+                };
+                let user = record
+                    .sasl
+                    .as_ref()
+                    .map(|(username, _)| username.as_str())
+                    .unwrap_or("unset");
+                self.notice(&format!(
+                    "auth profile={} transport={} sasl_user={user}",
+                    record.auth_profile.as_str(),
+                    record.transport_profile.as_str(),
+                ));
+            }
+            ServCommand::AuthProfileSet { network, profile } => {
+                let Some(mut record) = self.record(network, &verb).await else {
+                    return;
+                };
+                if profile == i2pr_irc_store::UpstreamAuthProfile::SaslExternal
+                    || profile.requires_sasl() != record.sasl.is_some()
+                {
+                    self.fail(&verb, &BouncerError::ValueOutOfRange);
+                    return;
+                }
+                record.auth_profile = profile;
+                self.finish_unit(
+                    self.control.change(record).await,
+                    &verb,
+                    "Updated authentication profile",
+                );
             }
             ServCommand::Diag => self.report_diagnostics(None).await,
             ServCommand::DiagNetwork { network } => self.report_diagnostics(Some(network)).await,
@@ -845,6 +887,8 @@ fn new_record(fields: bouncer_networks::NetworkFields) -> Result<NetworkRecord, 
             .name
             .unwrap_or_else(|| i2pr_irc_store::fallback_display_name(NetworkId(0))),
         endpoint,
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         nick: fields.nickname.unwrap_or_else(|| "bouncer".to_owned()),
         username: fields.username.unwrap_or_else(|| "bouncer".to_owned()),

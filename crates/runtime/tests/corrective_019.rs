@@ -63,6 +63,12 @@ fn record(network: u64, nick: &str, sasl: Option<(&str, &str)>) -> NetworkRecord
         network: NetworkId(network),
         display_name: fallback_display_name(NetworkId(network)),
         endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: if sasl.is_some() {
+            i2pr_irc_store::UpstreamAuthProfile::SaslPlain
+        } else {
+            i2pr_irc_store::UpstreamAuthProfile::None
+        },
         failover_group: None,
         nick: nick.into(),
         username: "user".into(),
@@ -390,34 +396,36 @@ async fn a_sasl_credential_reaches_no_diagnostic_and_no_downstream_byte() {
 /// A refused credential is terminal and bounded, not a retry loop.
 #[tokio::test]
 async fn a_refused_sasl_credential_is_a_terminal_registration_error() {
-    let (_store, handle) = store();
-    let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
-    harness.take_generation().await;
-    let upstream = harness.upstream();
-    read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
-    upstream
-        .write_all(b":srv CAP * LS * :message-tags\r\n:srv CAP * LS :sasl=PLAIN\r\n")
-        .await
-        .unwrap();
-    read_until(upstream, b"CAP REQ").await;
-    upstream
-        .write_all(b":srv CAP * ACK :sasl=PLAIN\r\n")
-        .await
-        .unwrap();
-    read_until(upstream, b"AUTHENTICATE PLAIN\r\n").await;
-    upstream.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
-    let payload = format!("AUTHENTICATE {}\r\n", sasl_payload());
-    read_until(upstream, payload.as_bytes()).await;
-    upstream
-        .write_all(b":srv 904 bot :SASL authentication failed\r\n")
-        .await
-        .unwrap();
+    for numeric in ["904", "905", "906", "907"] {
+        let (_store, handle) = store();
+        let mut harness = Harness::start(handle, Some((SASL_USER, SASL_PASSWORD))).await;
+        harness.take_generation().await;
+        let upstream = harness.upstream();
+        read_until(upstream, b"USER user 0 * :bouncer\r\n").await;
+        upstream
+            .write_all(b":srv CAP * LS * :message-tags\r\n:srv CAP * LS :sasl=PLAIN\r\n")
+            .await
+            .unwrap();
+        read_until(upstream, b"CAP REQ").await;
+        upstream
+            .write_all(b":srv CAP * ACK :sasl=PLAIN\r\n")
+            .await
+            .unwrap();
+        read_until(upstream, b"AUTHENTICATE PLAIN\r\n").await;
+        upstream.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+        let payload = format!("AUTHENTICATE {}\r\n", sasl_payload());
+        read_until(upstream, payload.as_bytes()).await;
+        upstream
+            .write_all(format!(":srv {numeric} bot :SASL authentication failed\r\n").as_bytes())
+            .await
+            .unwrap();
 
-    let outcome = harness.await_ending().await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Registration)),
-        "a refused credential must be a terminal registration error, saw {outcome:?}"
-    );
+        let outcome = harness.await_ending().await;
+        assert!(
+            matches!(outcome, Err(RuntimeError::Registration)),
+            "numeric {numeric} must refuse the generation, saw {outcome:?}"
+        );
+    }
 }
 
 /// A Network configured for SASL must refuse to register against a server that never

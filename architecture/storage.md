@@ -27,11 +27,11 @@ Every mutation reports an explicit [`CommitState`]. A caller that loses its resp
 
 Shutdown sets a closing flag, wakes the worker through a dedicated capacity-1 channel (so a stop can never wait on a full request queue), drains work already accepted, and joins the thread. The wakeup is necessary because the request channel stays connected while other `StoreHandle` clones exist.
 
-## Schema version 15
+## Schema version 16
 
 The schema is defined in `schema.rs` as SQL, not as a serialized Rust value graph, so neither draft IRCv3 syntax nor internal Rust representation can dictate a migration. It is composed at runtime from the versioned `networks` body, the shared unchanged tables, the versioned `history_events` body, and a shared tail, because `concat!` cannot reference a const and each unchanged table must have exactly one definition.
 
-`SCHEMA_VERSION` is 15. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every supported older database migrates forward in place rather than being refused.
+`SCHEMA_VERSION` is 16. `MIN_SUPPORTED_SCHEMA_VERSION` is still 1, so every supported older database migrates forward in place rather than being refused.
 
 | Table | Purpose |
 |---|---|
@@ -48,6 +48,12 @@ The schema is defined in `schema.rs` as SQL, not as a serialized Rust value grap
 | `connection_gaps` | latest bounded sequence of observation-gap dispositions and monotonic durations |
 | `network_failover` | explicit operator trust and credential-scope attestations for one endpoint group |
 | `network_failover_endpoints` | up to seven ordered typed I2P alternates per Network |
+| `network_auth_profiles` | independently typed transport and authentication policy per Network |
+
+Schema 16 defaults legacy transport to `plain-i2p`. A stored SASL credential selects
+required `sasl-plain`; without one, a configured message action to NickServ selects
+`nickserv`, and other legacy Networks select `none`. The row is foreign-key scoped to
+the durable `NetworkId`; an unsupported TLS profile is refused before owner construction.
 
 `history_search` is a virtual table, so its `…_data`, `…_idx`, `…_docsize`, `…_content`
 and `…_config` shadow tables are excluded from the promised set: they are SQLite's own

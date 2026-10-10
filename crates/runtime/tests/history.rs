@@ -49,6 +49,8 @@ async fn journal_for(
             network: NetworkId(1),
             display_name: fallback_display_name(NetworkId(1)),
             endpoint: I2pEndpoint::parse("irc.example.i2p").expect("endpoint parses"),
+            transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+            auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
             failover_group: None,
             nick: "bot".into(),
             username: "user".into(),

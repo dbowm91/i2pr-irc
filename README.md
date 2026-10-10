@@ -29,6 +29,7 @@ Research lives under plans/research/. Subsystem roadmaps live under plans/subsys
 - Optional whole-database SQLCipher encrypted Store under one injected process-level key, with source-preserving migration and rotation (M008).
 - OTRv3-transparent opaque transport (M009): the bouncer carries OTR query/AKE/data/fragment payloads byte-exactly, holds no OTR keys/session state/plaintext, keeps OTR-bearing chat non-replayable, and retains ciphertext only.
 - Optional same-Network I2P endpoint failover is implemented under Plan 061. It requires explicit local Operator attestations for network equivalence and credential scope; no IRC2P/ILITA deployment equivalence is inferred. Upstream CHATHISTORY recovery remains deferred while its official draft warns against production use.
+- Per-Network upstream profiles are implemented under Plan 063: plain IRC over the typed I2P stream with explicit `none`, NickServ, or required SASL PLAIN authentication. TLS-over-I2P and SASL EXTERNAL remain rejected pending Plan 065; profiles never infer deployed service support from destination names.
 
 ### Standalone daemon
 

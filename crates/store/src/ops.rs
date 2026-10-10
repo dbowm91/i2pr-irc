@@ -42,9 +42,11 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
     let mut statement = connection
         .prepare(
             "SELECT n.network_id, n.endpoint, n.nick, n.username, n.realname, n.display_name,
-                    n.auto_away, n.keep_nick, s.sasl_username, s.sasl_password
+                    n.auto_away, n.keep_nick, s.sasl_username, s.sasl_password,
+                    p.transport, p.auth
              FROM networks n
              LEFT JOIN network_secrets s ON s.network_id = n.network_id
+             LEFT JOIN network_auth_profiles p ON p.network_id = n.network_id
              ORDER BY n.network_id",
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;
@@ -65,6 +67,8 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             let keep_nick: i64 = row.get(7)?;
             let sasl_username: Option<String> = row.get(8)?;
             let sasl_password: Option<Vec<u8>> = row.get(9)?;
+            let transport: Option<String> = row.get(10)?;
+            let auth: Option<String> = row.get(11)?;
             Ok((
                 network,
                 endpoint,
@@ -76,6 +80,8 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
                 keep_nick,
                 sasl_username,
                 sasl_password,
+                transport,
+                auth,
             ))
         })
         .map_err(|error| sql(error, CommitState::RolledBack))?;
@@ -92,6 +98,8 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             keep_nick,
             sasl_username,
             sasl_password,
+            transport,
+            auth,
         ) = row.map_err(|error| sql(error, CommitState::RolledBack))?;
         let auto_away = policy_flag(auto_away, "auto away flag")?;
         let keep_nick = policy_flag(keep_nick, "keep nick flag")?;
@@ -121,9 +129,19 @@ pub(crate) fn load_networks(connection: &Connection) -> Result<Vec<NetworkRecord
             }
         };
         let network_id = NetworkId(from_sql_id(network)?);
+        let transport_profile =
+            IrcTransportProfile::parse(transport.as_deref().ok_or_else(|| {
+                StoreError::new(StoreErrorKind::Corrupt("missing auth profile"))
+            })?)?;
+        let auth_profile =
+            UpstreamAuthProfile::parse(auth.as_deref().ok_or_else(|| {
+                StoreError::new(StoreErrorKind::Corrupt("missing auth profile"))
+            })?)?;
         let record = NetworkRecord {
             network: network_id,
             endpoint,
+            transport_profile,
+            auth_profile,
             failover_group: load_failover_group(connection, network_id)?,
             nick,
             username,
@@ -350,6 +368,19 @@ pub(crate) fn save_network(
                 record.display_name,
                 i64::from(record.auto_away),
                 i64::from(record.keep_nick),
+            ],
+        )
+        .map_err(|error| sql(error, CommitState::RolledBack))?;
+    transaction
+        .execute(
+            "INSERT INTO network_auth_profiles (network_id, transport, auth)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(network_id) DO UPDATE SET
+                transport=excluded.transport, auth=excluded.auth",
+            params![
+                network,
+                record.transport_profile.as_str(),
+                record.auth_profile.as_str()
             ],
         )
         .map_err(|error| sql(error, CommitState::RolledBack))?;

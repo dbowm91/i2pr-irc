@@ -26,11 +26,11 @@ pub use model::{
     BufferKind, BufferRecord, BufferRetentionPolicy, ChannelActivityPolicy, ClientRecord,
     ConnectionGap, ConnectionGapDisposition, DesiredChannelRecord, EventDirection,
     FailoverEndpointGroup, HistoryAppendResult, HistoryAround, HistoryEvent, HistoryPrivacyPolicy,
-    HistoryQuery, HistoryQueryBound, MAX_DISPLAY_NAME_BYTES, MAX_NETWORK_ENDPOINTS, MsgidLookup,
-    NearestEvent, NetworkRecord, NetworkSummary, NewHistoryEvent, ReattachOn, RecentTarget,
-    RelayDetached, RetentionReport, RetentionRequest, SavedNetwork, SearchFields, SearchHit,
-    SearchQuery, SearchTerm, StoreHealth, StorePath, StoredSecret, attached_channels,
-    fallback_display_name,
+    HistoryQuery, HistoryQueryBound, IrcTransportProfile, MAX_DISPLAY_NAME_BYTES,
+    MAX_NETWORK_ENDPOINTS, MsgidLookup, NearestEvent, NetworkRecord, NetworkSummary,
+    NewHistoryEvent, ReattachOn, RecentTarget, RelayDetached, RetentionReport, RetentionRequest,
+    SavedNetwork, SearchFields, SearchHit, SearchQuery, SearchTerm, StoreHealth, StorePath,
+    StoredSecret, UpstreamAuthProfile, attached_channels, fallback_display_name,
 };
 // The explicit storage ceilings, re-exported so a caller bounds its own behavior with
 // the same numbers the store enforces instead of duplicating (and drifting from) them.

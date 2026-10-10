@@ -24,7 +24,7 @@ use std::{
 ///
 /// The table *set* has been identical across every schema version so far; later schema
 /// steps add bounded tables without changing existing event identity.
-pub const EXPECTED_TABLES: [&str; 15] = [
+pub const EXPECTED_TABLES: [&str; 16] = [
     "buffer_privacy",
     "buffers",
     "client_cursors",
@@ -36,6 +36,7 @@ pub const EXPECTED_TABLES: [&str; 15] = [
     // excluded by `table_names`, so listing them here would tie the promised schema to a
     // SQLite build detail.
     "history_search",
+    "network_auth_profiles",
     "network_failover",
     "network_failover_endpoints",
     "network_secrets",
@@ -313,6 +314,21 @@ pub fn create_v14_database(path: &Path) -> Connection {
         .expect("application_id is writable");
     connection
         .pragma_update(None, "user_version", 14)
+        .expect("user_version is writable");
+    connection
+}
+
+/// Creates a database at schema version 15, immediately before auth profiles.
+pub fn create_v15_database(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("database file is creatable");
+    connection
+        .execute_batch(&schema::schema_v15())
+        .expect("schema 15 applies");
+    connection
+        .pragma_update(None, "application_id", crate::APPLICATION_ID)
+        .expect("application_id is writable");
+    connection
+        .pragma_update(None, "user_version", 15)
         .expect("user_version is writable");
     connection
 }

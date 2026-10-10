@@ -6,13 +6,34 @@ Each `NetworkOwner` negotiates upstream IRC capabilities once per connection gen
 
 Registration starts in `Negotiating`. A valid `CAP LS`, `CAP ACK`, or `CAP NAK` proves the server supports CAP. A `421` naming the `CAP` command, or a `001` received before any valid CAP response, marks CAP `Unsupported` for that generation.
 
-When CAP is unsupported and no SASL credential is configured, the welcome completes registration. The owner does not send `CAP END` to a server that never demonstrated CAP support. A malformed CAP message follows the normal bounded protocol error path; it is not treated as proof that CAP is unsupported.
+When CAP is unsupported and the Network is not using the required `sasl-plain` profile, the welcome completes registration. The owner does not send `CAP END` to a server that never demonstrated CAP support. A malformed CAP message follows the normal bounded protocol error path; it is not treated as proof that CAP is unsupported.
+
+## Per-Network profiles
+
+Each durable Network carries independent typed `transport_profile` and `auth_profile`
+values. `plain-i2p` is the only usable transport in this build. `tls-over-i2p` is a
+reserved enum/storage spelling and is rejected during record validation before an owner
+can dial; it is not an automatic upgrade path.
+
+Authentication is explicitly `none`, `nickserv`, or `sasl-plain`. `none` and
+`nickserv` do not require SASL; NickServ service credentials remain in that Network's
+bounded registration-action set. `sasl-plain` requires a credential on the same durable
+Network and uses the fail-closed negotiation below. It cannot silently change to
+NickServ or no authentication after a SASL failure. Profile changes are persisted before
+the existing controller replaces the live owner generation.
+
+Schema 16 migrates prior rows to `plain-i2p`; a stored SASL credential selects
+`sasl-plain`, otherwise a configured message action to NickServ selects `nickserv`, and
+the remainder select `none`. Configuration snapshot v5 carries only the non-secret
+profiles. Snapshot versions 1-4 preserve existing profile state on updates. SASL profile
+imports never carry a password; the existing per-Network credential is preserved on
+update and a new credential must be entered separately.
 
 ## Authentication policy
 
-Without configured SASL, registration proceeds with full CAP, partial CAP, or no CAP. Optional capabilities are requested as one bounded opportunistic set. A NAK disables those optional semantics for the generation and does not make registration fail.
+With `none` or `nickserv`, registration proceeds with full CAP, partial CAP, or no CAP. Optional capabilities are requested as one bounded opportunistic set. A NAK disables those optional semantics for the generation and does not make registration fail.
 
-With configured SASL, registration fails closed if CAP is unsupported, SASL is absent, an explicit SASL mechanism list excludes PLAIN, SASL is NAKed, authentication returns 904/905/906/907, or `001` arrives before authentication succeeds. The required `sasl` request is separate from the optional capability request so an optional refusal cannot downgrade authentication. A bare `sasl` offer has unknown mechanisms under IRCv3 SASL 3.2, so the owner attempts the configured PLAIN flow; an explicit mechanism list must include PLAIN.
+With the explicit `sasl-plain` profile, registration fails closed if CAP is unsupported, SASL is absent, an explicit SASL mechanism list excludes PLAIN, SASL is NAKed, authentication returns 904/905/906/907, or `001` arrives before authentication succeeds. The required `sasl` request is separate from the optional capability request so an optional refusal cannot downgrade authentication. A bare `sasl` offer has unknown mechanisms under IRCv3 SASL 3.2, so the owner attempts the configured PLAIN flow; an explicit mechanism list must include PLAIN.
 
 SASL payloads remain secret-classified and are never added to logs or diagnostics. SASL credentials are not reused for service commands.
 

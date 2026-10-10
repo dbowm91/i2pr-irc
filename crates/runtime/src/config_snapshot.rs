@@ -39,17 +39,18 @@
 use crate::bouncer_networks::{self, BouncerError};
 use i2pr_irc_core::{I2pEndpoint, NetworkId};
 use i2pr_irc_store::{
-    DesiredChannelRecord, FailoverEndpointGroup, MAX_DISPLAY_NAME_BYTES, NetworkRecord,
-    StoredSecret,
+    DesiredChannelRecord, FailoverEndpointGroup, IrcTransportProfile, MAX_DISPLAY_NAME_BYTES,
+    NetworkRecord, StoredSecret, UpstreamAuthProfile,
 };
 
 /// The only snapshot version this build writes or accepts.
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
 /// Version 1 carried only a total action count; its actions use the migrated PostJoin phase.
 const LEGACY_SNAPSHOT_VERSION: u32 = 1;
 /// Version 2 introduced explicit action phase counts and defaults activity policy to off.
 const PREVIOUS_SNAPSHOT_V2: u32 = 2;
-const PREVIOUS_SNAPSHOT_VERSION: u32 = 3;
+const PREVIOUS_SNAPSHOT_V3: u32 = 3;
+const PREVIOUS_SNAPSHOT_VERSION: u32 = 4;
 
 /// The first line of every snapshot, and the marker a parser requires before anything else.
 ///
@@ -125,10 +126,15 @@ pub struct SnapshotNetwork {
     pub network: NetworkId,
     pub display_name: String,
     pub endpoint: I2pEndpoint,
+    pub transport_profile: IrcTransportProfile,
+    pub auth_profile: UpstreamAuthProfile,
     pub failover_group: Option<FailoverEndpointGroup>,
     /// Legacy snapshots do not represent failover settings. In that case, keep the
     /// already stored setting when applying an update.
     pub retain_existing_failover: bool,
+    /// Versions 1-4 do not contain authentication profiles. Preserve existing policy
+    /// on updates; new records from those versions use the plain/no-auth defaults.
+    pub retain_existing_profiles: bool,
     pub nick: String,
     pub username: String,
     pub realname: String,
@@ -180,13 +186,15 @@ fn render_network(entry: &SnapshotNetwork) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "network netid={} name={} host={} nick={} username={} realname={} \
-         auto_away={} keep_nick={} actions={} action_phases={},{},{}\n",
+         transport={} auth={} auto_away={} keep_nick={} actions={} action_phases={},{},{}\n",
         bouncer_networks::render_netid(entry.network),
         entry.display_name,
         entry.endpoint.as_str(),
         entry.nick,
         entry.username,
         entry.realname,
+        entry.transport_profile.as_str(),
+        entry.auth_profile.as_str(),
         on_off(entry.auto_away),
         on_off(entry.keep_nick),
         entry.action_count,
@@ -252,6 +260,7 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         version,
         SNAPSHOT_VERSION
             | PREVIOUS_SNAPSHOT_VERSION
+            | PREVIOUS_SNAPSHOT_V3
             | PREVIOUS_SNAPSHOT_V2
             | LEGACY_SNAPSHOT_VERSION
     ) {
@@ -301,7 +310,7 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 let Some(index) = current else {
                     return Err(ConfigError::OrphanChannel);
                 };
-                if version != SNAPSHOT_VERSION || !failover_declared.insert(index) {
+                if version < PREVIOUS_SNAPSHOT_VERSION || !failover_declared.insert(index) {
                     return Err(ConfigError::InvalidValue("failover"));
                 }
                 if fields.len() == 2 && fields[1] == "mode=disabled" {
@@ -357,7 +366,7 @@ pub fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
             other => return Err(ConfigError::UnknownAttribute(other.to_owned())),
         }
     }
-    if version == SNAPSHOT_VERSION && failover_declared.len() != snapshot.networks.len() {
+    if version >= PREVIOUS_SNAPSHOT_VERSION && failover_declared.len() != snapshot.networks.len() {
         return Err(ConfigError::InvalidValue("missing failover policy"));
     }
     for index in failover_declared {
@@ -423,6 +432,8 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
     let mut nick = None;
     let mut username = None;
     let mut realname = None;
+    let mut transport = None;
+    let mut auth = None;
     let mut auto_away = None;
     let mut keep_nick = None;
     let mut actions = None;
@@ -446,6 +457,8 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
             "nick" => nick = Some(value),
             "username" => username = Some(value),
             "realname" => realname = Some(value),
+            "transport" => transport = Some(value),
+            "auth" => auth = Some(value),
             "auto_away" => auto_away = Some(parse_on_off(value)?),
             "keep_nick" => keep_nick = Some(parse_on_off(value)?),
             "actions" => actions = Some(parse_bounded_u32("actions", value)?),
@@ -487,7 +500,13 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
     let action_phase_counts = match (version, action_phases) {
         (_, Some(counts)) => counts,
         (LEGACY_SNAPSHOT_VERSION, None) => [0, action_count, 0],
-        (PREVIOUS_SNAPSHOT_V2 | PREVIOUS_SNAPSHOT_VERSION | SNAPSHOT_VERSION, None) => {
+        (
+            PREVIOUS_SNAPSHOT_V2
+            | PREVIOUS_SNAPSHOT_V3
+            | PREVIOUS_SNAPSHOT_VERSION
+            | SNAPSHOT_VERSION,
+            None,
+        ) => {
             return Err(ConfigError::MissingAttribute("action_phases"));
         }
         _ => return Err(ConfigError::UnsupportedVersion(version)),
@@ -495,6 +514,26 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
     if action_phase_counts.iter().copied().sum::<u32>() != action_count {
         return Err(ConfigError::InvalidValue("action_phases"));
     }
+    let (transport_profile, auth_profile) = if version == SNAPSHOT_VERSION {
+        let transport = transport.ok_or(ConfigError::MissingAttribute("transport"))?;
+        let auth = auth.ok_or(ConfigError::MissingAttribute("auth"))?;
+        let transport_profile = IrcTransportProfile::parse(transport)
+            .map_err(|_| ConfigError::InvalidValue("transport"))?;
+        let auth_profile =
+            UpstreamAuthProfile::parse(auth).map_err(|_| ConfigError::InvalidValue("auth"))?;
+        if transport_profile != IrcTransportProfile::PlainI2p {
+            return Err(ConfigError::InvalidValue("unsupported transport"));
+        }
+        if auth_profile == UpstreamAuthProfile::SaslExternal {
+            return Err(ConfigError::InvalidValue("unsupported auth profile"));
+        }
+        (transport_profile, auth_profile)
+    } else {
+        if transport.is_some() || auth.is_some() {
+            return Err(ConfigError::InvalidValue("profile version"));
+        }
+        (IrcTransportProfile::PlainI2p, UpstreamAuthProfile::None)
+    };
     Ok(SnapshotNetwork {
         network: bouncer_networks::parse_netid(
             netid.ok_or(ConfigError::MissingAttribute("netid"))?,
@@ -502,8 +541,11 @@ fn parse_network(fields: &[&str], version: u32) -> Result<SnapshotNetwork, Confi
         .map_err(|_| ConfigError::InvalidValue("netid"))?,
         display_name: display_name.to_owned(),
         endpoint,
+        transport_profile,
+        auth_profile,
         failover_group: None,
-        retain_existing_failover: version != SNAPSHOT_VERSION,
+        retain_existing_failover: version < PREVIOUS_SNAPSHOT_VERSION,
+        retain_existing_profiles: version != SNAPSHOT_VERSION,
         nick,
         username,
         realname,
@@ -665,6 +707,14 @@ pub fn plan(snapshot: &ConfigSnapshot, existing: &[NetworkRecord]) -> ImportPlan
                     } else {
                         entry.failover_group.clone()
                     },
+                    if entry.retain_existing_profiles {
+                        Some((
+                            existing_record.transport_profile,
+                            existing_record.auth_profile,
+                        ))
+                    } else {
+                        None
+                    },
                 )));
             }
             None => {
@@ -691,7 +741,7 @@ impl SnapshotNetwork {
     /// import can never carry one *in*. Use [`Self::to_record_with`] to preserve a stored
     /// credential across an update.
     pub fn to_record(&self) -> NetworkRecord {
-        self.to_record_with(None, self.failover_group.clone())
+        self.to_record_with(None, self.failover_group.clone(), None)
     }
 
     /// The durable record for this entry, carrying `credential` through unchanged.
@@ -703,11 +753,16 @@ impl SnapshotNetwork {
         &self,
         credential: Option<(String, StoredSecret)>,
         failover_group: Option<FailoverEndpointGroup>,
+        existing_profiles: Option<(IrcTransportProfile, UpstreamAuthProfile)>,
     ) -> NetworkRecord {
+        let (transport_profile, auth_profile) =
+            existing_profiles.unwrap_or((self.transport_profile, self.auth_profile));
         NetworkRecord {
             network: self.network,
             display_name: self.display_name.clone(),
             endpoint: self.endpoint.clone(),
+            transport_profile,
+            auth_profile,
             failover_group,
             nick: self.nick.clone(),
             username: self.username.clone(),
@@ -764,6 +819,9 @@ mod tests {
                     network: NetworkId(2),
                     display_name: "second".to_owned(),
                     endpoint: I2pEndpoint::parse(&b32('c')).expect("a destination"),
+                    transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+                    auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
+                    retain_existing_profiles: false,
                     failover_group: None,
                     retain_existing_failover: false,
                     nick: "two".to_owned(),
@@ -784,6 +842,9 @@ mod tests {
                     network: NetworkId(1),
                     display_name: "first".to_owned(),
                     endpoint: I2pEndpoint::parse(&b32('a')).expect("a destination"),
+                    transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+                    auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
+                    retain_existing_profiles: false,
                     failover_group: None,
                     retain_existing_failover: false,
                     nick: "one".to_owned(),
@@ -833,6 +894,7 @@ mod tests {
     fn legacy_snapshot_action_count_defaults_to_post_join() {
         let text = render(&sample())
             .replace(&format!("version {SNAPSHOT_VERSION}"), "version 1")
+            .replace(" transport=plain-i2p auth=none", "")
             .replace(" action_phases=1,1,0", "");
         let text = text
             .lines()
@@ -897,6 +959,21 @@ mod tests {
             &format!("version {future}"),
         );
         assert_eq!(parse(&text), Err(ConfigError::UnsupportedVersion(future)));
+    }
+
+    #[test]
+    fn tls_and_sasl_external_profiles_are_refused_until_their_qualification_plan() {
+        let text = render(&sample());
+        let tls = text.replace("transport=plain-i2p", "transport=tls-over-i2p");
+        assert_eq!(
+            parse(&tls),
+            Err(ConfigError::InvalidValue("unsupported transport"))
+        );
+        let external = text.replace("auth=none", "auth=sasl-external");
+        assert_eq!(
+            parse(&external),
+            Err(ConfigError::InvalidValue("unsupported auth profile"))
+        );
     }
 
     #[test]
@@ -1101,12 +1178,18 @@ mod tests {
             operator_attests_equivalence: true,
             credentials_authorized: true,
         });
+        primary.sasl = Some((
+            "operator-user".to_owned(),
+            StoredSecret::new("secret".to_owned()),
+        ));
+        primary.auth_profile = UpstreamAuthProfile::SaslPlain;
         let previous = rendered
             .lines()
             .filter(|line| !line.starts_with("failover ") && !line.starts_with("alternate "))
             .collect::<Vec<_>>()
             .join("\n")
-            .replace("version 4", "version 3");
+            .replace(&format!("version {SNAPSHOT_VERSION}"), "version 3")
+            .replace(" transport=plain-i2p auth=none", "");
         let parsed_previous = parse(&previous).expect("previous version parses");
         assert!(parsed_previous.networks[0].retain_existing_failover);
         let update = plan(&parsed_previous, std::slice::from_ref(&primary));
@@ -1114,6 +1197,44 @@ mod tests {
             panic!("expected update")
         };
         assert_eq!(updated.failover_group, primary.failover_group);
+        assert_eq!(updated.auth_profile, UpstreamAuthProfile::SaslPlain);
+        assert_eq!(updated.sasl, primary.sasl);
+    }
+
+    #[test]
+    fn profile_snapshot_round_trips_and_pre_profile_import_preserves_existing_authentication() {
+        let mut snapshot = sample();
+        snapshot.networks[0].auth_profile = UpstreamAuthProfile::NickServ;
+        let rendered = render(&snapshot);
+        assert!(rendered.contains("transport=plain-i2p auth=nickserv"));
+        let parsed = parse(&rendered).expect("the typed profile parses");
+        assert_eq!(
+            parsed.networks[1].auth_profile,
+            UpstreamAuthProfile::NickServ
+        );
+        assert_eq!(
+            parsed.networks[1].transport_profile,
+            IrcTransportProfile::PlainI2p
+        );
+
+        let old = rendered
+            .replace(&format!("version {SNAPSHOT_VERSION}"), "version 4")
+            .replace(" transport=plain-i2p auth=nickserv", "")
+            .replace(" transport=plain-i2p auth=none", "");
+        let old = parse(&old).expect("version 4 remains supported");
+        assert!(old.networks[0].retain_existing_profiles);
+        let mut existing = entry(1).to_record();
+        existing.sasl = Some((
+            "configured-user".to_owned(),
+            StoredSecret::new("kept".to_owned()),
+        ));
+        existing.auth_profile = UpstreamAuthProfile::SaslPlain;
+        let plan = plan(&old, std::slice::from_ref(&existing));
+        let ImportStep::Update(updated) = &plan.steps[0] else {
+            panic!("expected an update")
+        };
+        assert_eq!(updated.auth_profile, UpstreamAuthProfile::SaslPlain);
+        assert_eq!(updated.sasl, existing.sasl);
     }
 
     #[test]

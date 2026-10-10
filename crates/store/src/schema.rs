@@ -1,4 +1,4 @@
-//! Schema versions 1 through 15 and their transactional migration harness.
+//! Schema versions 1 through 16 and their transactional migration harness.
 //!
 //! The schema is written in SQL rather than as a serialized Rust value graph: draft
 //! IRCv3 syntax and internal Rust representation must both be free to change without
@@ -24,8 +24,10 @@ use rusqlite::Connection;
 /// version 11 records whether each event has a derived FTS row; version 12 adds bounded
 /// detached-channel activity policies, disabled for existing rows by default; version 13
 /// adds literal local watch rules; version 14 adds bounded connection-gap dispositions;
-/// version 15 adds optional, explicitly attested same-Network failover groups.
-pub const SCHEMA_VERSION: i64 = 15;
+/// version 15 adds optional, explicitly attested same-Network failover groups; version
+/// 16 adds explicit transport and authentication profiles, migrated from existing
+/// credentials and NickServ service actions.
+pub const SCHEMA_VERSION: i64 = 16;
 /// Oldest schema version this build can migrate forward from.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 /// Application identity stored in SQLite's `application_id` header. A database
@@ -455,6 +457,18 @@ pub(crate) fn schema_v15() -> String {
     format!("{}{}", schema_v14(), NETWORK_FAILOVER_V15)
 }
 
+pub(crate) fn schema_v16() -> String {
+    format!("{}{}", schema_v15(), AUTH_PROFILES_V16)
+}
+
+const AUTH_PROFILES_V16: &str = r#"
+CREATE TABLE network_auth_profiles (
+    network_id      INTEGER PRIMARY KEY REFERENCES networks(network_id) ON DELETE CASCADE,
+    transport       TEXT NOT NULL CHECK (transport IN ('plain-i2p','tls-over-i2p')),
+    auth            TEXT NOT NULL CHECK (auth IN ('none','nickserv','sasl-plain','sasl-external'))
+) STRICT;
+"#;
+
 const NETWORK_FAILOVER_V15: &str = r#"
 CREATE TABLE network_failover (
     network_id              INTEGER PRIMARY KEY REFERENCES networks(network_id) ON DELETE CASCADE,
@@ -699,7 +713,7 @@ pub(crate) fn open_and_migrate(
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             verify_search_support(&transaction)?;
             transaction
-                .execute_batch(&schema_v15())
+                .execute_batch(&schema_v16())
                 .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
@@ -784,6 +798,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "connection_gaps",
     "network_failover",
     "network_failover_endpoints",
+    "network_auth_profiles",
 ];
 
 /// Indexes this build promises, beyond the presence of their table.
@@ -857,6 +872,8 @@ const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("desired_channels", "relay_detached"),
     ("desired_channels", "reattach_on"),
     ("desired_channels", "detach_after_secs"),
+    ("network_auth_profiles", "transport"),
+    ("network_auth_profiles", "auth"),
 ];
 
 /// Confirms every promised column is present on its table.
@@ -903,6 +920,7 @@ fn migrate_forward(transaction: &rusqlite::Transaction<'_>, from: i64) -> Result
             12 => migrate_12_to_13(transaction)?,
             13 => migrate_13_to_14(transaction)?,
             14 => migrate_14_to_15(transaction)?,
+            15 => migrate_15_to_16(transaction)?,
             _ => return Err(StoreError::new(StoreErrorKind::SchemaTooNew)),
         }
         version += 1;
@@ -953,6 +971,30 @@ fn migrate_13_to_14(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
 fn migrate_14_to_15(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(NETWORK_FAILOVER_V15)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    Ok(())
+}
+
+fn migrate_15_to_16(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(AUTH_PROFILES_V16)
+        .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
+    tx.execute(
+        "INSERT INTO network_auth_profiles (network_id, transport, auth)
+         SELECT n.network_id, 'plain-i2p',
+                CASE
+                  WHEN s.network_id IS NOT NULL THEN 'sasl-plain'
+                  WHEN EXISTS (
+                    SELECT 1 FROM registration_actions a
+                    WHERE a.network_id=n.network_id
+                      AND a.kind='message' AND lower(a.target)='nickserv'
+                  ) THEN 'nickserv'
+                  ELSE 'none'
+                END
+         FROM networks n LEFT JOIN network_secrets s ON s.network_id=n.network_id",
+        [],
+    )
+    .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| StoreError::new(StoreErrorKind::Open))?;
     Ok(())

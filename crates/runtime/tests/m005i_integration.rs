@@ -47,6 +47,8 @@ fn record(network: u64, channels: &[&str]) -> NetworkRecord {
         network: NetworkId(network),
         display_name: format!("net-{network}"),
         endpoint: I2pEndpoint::parse(&b32()).expect("a test destination"),
+        transport_profile: i2pr_irc_store::IrcTransportProfile::PlainI2p,
+        auth_profile: i2pr_irc_store::UpstreamAuthProfile::None,
         failover_group: None,
         nick: "bot".to_owned(),
         username: "user".to_owned(),
@@ -968,6 +970,7 @@ async fn no_operator_surface_can_be_made_to_print_a_stored_credential() {
 
     let mut runtime = Runtime::start().await;
     let mut credentialed = record(1, &["#room"]);
+    credentialed.auth_profile = i2pr_irc_store::UpstreamAuthProfile::SaslPlain;
     credentialed.sasl = Some((
         "bob".to_owned(),
         i2pr_irc_store::StoredSecret::new(SECRET.to_owned()),
