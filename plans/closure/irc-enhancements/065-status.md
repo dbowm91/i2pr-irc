@@ -21,4 +21,4 @@ Implementation is deferred until an operator-controlled I2P test service and an 
 
 ## Registry and roadmap disposition
 
-Plan 065 is closed with a research deferral. Plan 066 is unblocked to record the completed M013 implementation and deferral matrix without claiming TLS/EXTERNAL support. Reopen this work as a new plan when the named endpoint and credential/trust prerequisites are available. Plan 054 and Plan 062's independent evidence conditions remain unchanged.
+Plan 065 is closed with a research deferral. Plan 066 is unblocked to record the completed M013 implementation and deferral matrix without claiming TLS/EXTERNAL support. Reopen this work as a new plan when the named endpoint and credential/trust prerequisites are available. Plan 054 remains independently active; Plan 062's pinned product-path campaign has since passed, while deployed-service evidence remains unclaimed.

@@ -4,7 +4,7 @@ Date: 2026-10-09
 Authority: Research 011, ADR-0008/0009 and IRC enhancement roadmap.
 Baseline: M010 Plan 054 independently active; maintain I2P-only typed I2pStreamProvider, per-Network owner and no generic DNS/TCP/HTTP or proxy path.
 
-Status: conditionally closed; deterministic qualification passed, while pinned Eggchaos and deployed-service evidence remain unclaimed (Plans 059-061 are closed; Plan 060 production catch-up is deferred on the official draft's warning).
+Status: closed; deterministic and pinned Eggchaos product-path qualification passed. Deployed-service evidence remains separate (Plans 059-061 are closed; Plan 060 production catch-up is deferred on the official draft's warning).
 Objective: qualify post-registration IRC pacing, gap evidence, conditional upstream CHATHISTORY and approved I2P endpoint failover together.
 Work packages:
 1. Run deterministic and Eggchaos campaigns: mass reconnect, fifty-channel restore, router blackout, partial IRC registrations, missed upstream messages, unsupported CHATHISTORY, upstream state/auth changes.

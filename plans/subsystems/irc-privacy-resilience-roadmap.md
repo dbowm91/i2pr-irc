@@ -1,5 +1,5 @@
 # IRC Privacy, Resilience and Compatibility Roadmap
-Status: M011 closed; M012 conditionally closed pending pinned Eggchaos qualification; M013 closed with implementation and deferral dispositions.
+Status: M011-M013 closed with implementation, qualification and deferral dispositions.
 Research: plans/research/011-irc-privacy-resilience-authentication.md
 ADRs: ADR-0008 and ADR-0009; all prior accepted ADRs remain binding.
 Baseline: work/plans-050-054-m010-standalone (M010-E Plan 054 active).
@@ -18,7 +18,7 @@ M010 library baseline (M001–M009/R001 and M010 Plans 050–053 closed; 054 act
   -> M012-A / 059 IRC pacing and upstream gap records [closed]
   -> M012-B / 060 conditional upstream history reconciliation [closed; production implementation deferred by draft warning]
   -> M012-C / 061 verified same-network I2P endpoint failover [closed; operator attestation required]
-  -> M012-D / 062 resilience closure [conditionally closed; pinned Eggchaos evidence pending]
+  -> M012-D / 062 resilience closure [closed; pinned Eggchaos product-path campaign passed; deployed-service evidence separate]
   -> M013-A / 063 named network auth profiles [closed]
   -> M013-B / 064 IRCv3 member/redaction/event-playback decision and bounded implementation [closed; all deferred]
   -> M013-C / 065 optional TLS-over-I2P and SASL EXTERNAL [closed; deferred pending endpoint and trust/credential contracts]

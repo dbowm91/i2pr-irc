@@ -21,4 +21,4 @@ The three deferrals avoid false membership, fabricated history, and misleading d
 
 ## Registry and roadmap disposition
 
-Plan 064 is closed with a DEFER disposition for all three features. Plan 065 is unblocked for its bounded research preflight only; the plan itself continues to prohibit implementation until authenticated TLS-inside-I2P and client-certificate qualification is feasible. Plan 066 remains proposed pending Plan 065's shipped-or-deferred result. Plan 054 and Plan 062's separate live/external evidence conditions are unchanged.
+Plan 064 is closed with a DEFER disposition for all three features. Plan 065 is unblocked for its bounded research preflight only; the plan itself continues to prohibit implementation until authenticated TLS-inside-I2P and client-certificate qualification is feasible. Plan 066 remains proposed pending Plan 065's shipped-or-deferred result. Plan 054's live-service evidence remains independent; Plan 062's pinned product-path campaign has since passed, with deployed-service evidence still separate.
