@@ -2,6 +2,7 @@
 
 Status: closed; deterministic and pinned Eggchaos product-path qualification passed; deployed-service evidence remains separate
 Implementation commit: `f028a43` — `feat(runtime): add attested I2P endpoint failover`
+Closure commit: `0c8051e` — `docs(plans): close Plan 062 Eggchaos qualification`
 Date: 2026-10-09
 
 ## Requirement-to-evidence matrix
